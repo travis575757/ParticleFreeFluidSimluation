@@ -210,6 +210,7 @@ function buildPanel() {
   P.checkbox('separate', 'Separating solid boundaries [CM11a]', !!p.separate, (v) => setParam('separate', v ? 1 : 0),
     'Liquid may peel off walls instead of sticking to them.');
   P.slider('vc', 'V-cycles / step', { min: 1, max: 8, step: 1, value: p.vcycles }, (v) => setParam('vcycles', v));
+  P.note(`At least ${p.vcyclesBodies} while rigid bodies are in the liquid.`);
 
   P.section('Keys', { collapsible: true, open: false });
   const keys = P.note('');

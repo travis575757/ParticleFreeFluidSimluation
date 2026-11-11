@@ -110,10 +110,16 @@ Chrome 154, RTX 3090, default settings unless stated.
 * Plain semi-Lagrangian advection on the same dam break: 10 % of the mass left after 10 s.
 * Volume of the 0.5 iso-contour stays within roughly 95–107 % once splashes settle, with dips
   while liquid is spread thinner than a cell (as in the paper's Fig. 10).
+* Floating bodies in contact (`tests/contact2d.html`, six arrangements from two touching balls
+  to five bodies dropped on top of each other, three slightly different pool depths each,
+  128²): between 90 s and 120 s the fastest body moves at 0.05–0.13 m/s (0.02–0.04 cells per
+  step), depending on the arrangement. Runs that differ only in the pool depth differ by up
+  to a factor of five in the bodies' kinetic energy, so single runs say little.
 
 Reproduce with the pages in `tests/` through `node tools/run.mjs <page>` (`still2d.html` runs
 any 2D scene for a long time and reports rest, residuals and rigid body motion, `body2d.html`
-drops one body into a pool, `glinfo.html` prints the browser's WebGL2 limits and whether
+drops one body into a pool, `contact2d.html` floats bodies that touch each other and reports
+whether they settle, `glinfo.html` prints the browser's WebGL2 limits and whether
 float read-back is exact) and with `node tools/interact.mjs 2d|3d`, which drives the real
 apps with synthetic mouse input. Both tools take `--browser chrome|firefox|librewolf`;
 `npm test` runs the interaction checks in Chrome, `npm run test:firefox` and
@@ -216,13 +222,28 @@ velocity next to the body are summed by additive blending into one texel per bod
 back through a pixel-pack buffer and a fence, without stalling the GPU. Buoyancy is not a
 separate formula: it is what the hydrostatic part of the pressure integrates to.
 
-The force arrives one step late, and an explicit, lagged pressure force is unstable for
-bodies lighter than the liquid they displace. It is therefore conditioned before use:
+The force arrives one step late: what is measured after a step is the liquid's answer to the
+acceleration A the body had in that step, f = s − m A, where s is the force on a body that
+does not accelerate (buoyancy, waves) and m its added mass, the liquid it has to accelerate
+with it, in units of its own mass. Applying f as measured treats the added mass explicitly,
+which diverges as soon as m > 1: a light body, a body next to a wall or to another body,
+bodies that cover the surface. It is therefore conditioned before use:
 
-* a low-pass filter (half of the new value per step);
-* an added-mass term treated implicitly, a = (g + a_p + r a_prev) / (1 + r) with
-  r = 1.5 · max(wet, 0.3) / density, which stands in for the liquid the body has to
-  accelerate with it;
+* **Added mass, identified while running.** s is recovered as f + r A and the equation of
+  motion (1 + r) a = g + s is solved for the new acceleration. With r = m this is exact; an r
+  that is too large delays the liquid's answer and feeds a bobbing body, one that is too
+  small overshoots. m depends on the direction and on everything around the body, so r is
+  estimated per axis (and once for the rotation) by recursive least squares from the second
+  differences of f and A over the last three steps (s changes smoothly from step to step,
+  m A does not), forgetting 2 % per step (0.5 % next to another solid), starting from
+  0.5 · max(wet, 0.3) / density. A is the acceleration the body really had, contacts and
+  drag included.
+* **No smoothing.** A low-pass filter on the force delays the restoring force, and a delayed
+  restoring force adds energy to every oscillation.
+* **Four V-cycles** instead of two while a body that feels the liquid is wet. What an
+  unconverged pressure solve leaves out of the liquid's answer arrives one step later, and
+  bodies wedged against each other, where the multigrid converges slowest, turn that delay
+  into a hopping motion with a period of four steps.
 * a cap at 3 g / min(density, 1), with the torque scaled by the same factor, so that a late
   impact spike cannot catapult a light body;
 * next to another solid (within 1.5 cells) the liquid may stop a body's approach and carry
@@ -256,16 +277,24 @@ points can interpenetrate slightly before the contact is seen.
   has no GPU timer queries for WebGL2, so the step time read-out stays empty there.
 * Density below 0.5 ("mist") has no dynamics of its own: as in the paper it moves with velocity
   extrapolated from the nearest liquid, so spray can hang in the air until sharpening gathers it.
-* Two V-cycles per step leave a pressure residual around 1e-2 during violent motion; raise
-  *V-cycles / step* for a tighter solve.
+* Two V-cycles per step (four while rigid bodies are in the liquid) leave a pressure residual
+  around 1e-2 during violent motion; raise *V-cycles / step* for a tighter solve.
 * At 384² a pool at rest starts a slow long slosh after about a minute (±1.4 cells of 153
   after 120 s). The pressure residual sits at 1.6e-3 from the first step there and more
   V-cycles do not lower it, which points at 32-bit float precision of the pressure solve.
-* Rigid bodies are coupled explicitly (see above). Floating bodies keep bobbing on the slosh
-  they caused for a long time, since nothing in the inviscid solver damps it (about ±2 cells
-  a minute after four bodies were dropped into the 128² pool), and a body lying on the floor
-  can jitter by less than a tenth of a cell. Removing this needs the bodies inside the
-  pressure solve.
+* Rigid bodies are coupled explicitly (see above) and floating bodies do not come to complete
+  rest. Two minutes after four bodies were dropped into the 128² pool they still move by
+  ±0.1 to ±0.5 cells (slowly decaying), in 3D at 64 cells by about ±1 cell, and bodies packed
+  against each other keep creeping at up to 0.04 cells per step. Three things feed this:
+  nothing in the inviscid solver damps the slosh the bodies caused; the paper's solid model
+  moves liquid that a solid displaces out of its cells and expels it with the ρ′ > 1
+  divergence over the following steps, which a body that feels the pressure receives as a
+  force ripple once per grid cell it travels (`tests/contact2d.html?case=single&piston=0.1,60`:
+  ±0.35 of the body's weight, gone with λ = 0, which instead leaves the displaced liquid
+  compressed, while a small λ calms a single body and destabilises packed ones); and the volume correction, whose
+  contraction of diluted liquid pulls on the surface (the larger share in 3D). Removing it
+  needs density advection that is consistent with moving solids in cut cells, or the bodies
+  inside the pressure solve as in [BBB07].
 * Fast impacts on solids momentarily produce ρ′ well above 1 (the paper mentions the same); it
   is expelled over the following steps.
 

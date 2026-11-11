@@ -42,6 +42,7 @@ export const DEFAULT_PARAMS = {
   compressMax: 0.25,     // extension: eta_c
   separate: 1,           // separating solid boundary condition [CM11a]
   vcycles: 2,
+  vcyclesBodies: 4,      // at least this many while rigid bodies feel the liquid (see FluidSim.twoWay)
   preSweeps: 2,
   postSweeps: 2,
   coarseSweeps: 12,
@@ -111,6 +112,11 @@ export class FluidSim {
     this.time = 0;
     this.frame = 0;
     this.solids = [];
+    // Set by the owner while rigid bodies are driven by the measured liquid forces. The liquid's
+    // answer to a body's motion has to be in the pressure of the same step: what an unconverged
+    // solve leaves out arrives a step late, and bodies that touch each other or a wall (where
+    // the multigrid converges slowest) turn that delay into a hopping motion that never dies.
+    this.twoWay = false;
     this.mouse = { pos: [0, 0, 0], vel: [0, 0, 0], dir: [0, 0, 0], radius: 0, strength: 0 };
     this._buildPrograms();
     this._buildGrid(nx, ny, dim === 2 ? 1 : nz);
@@ -389,7 +395,8 @@ export class FluidSim {
       uSrcScale: p.lambda / dt, uSrcMax: p.eta / dt, uSinkScale: p.compress / dt, uSinkMax: p.compressMax / dt,
       uSeparate: p.separate,
     });
-    for (let i = 0; i < p.vcycles; i++) this._vcycle(0);
+    const cycles = this.twoWay ? Math.max(p.vcycles, p.vcyclesBodies) : p.vcycles;
+    for (let i = 0; i < cycles; i++) this._vcycle(0);
     glc.draw(P.project, T.vel[1],
       { G: L0.grid, uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uP: L0.p[0], uInvThetaMax: invThetaMax });
     this._swap(T.vel);

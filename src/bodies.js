@@ -56,6 +56,23 @@ export function quatToWorldToLocal(q) {
   return [ex[0], ey[0], ez[0], ex[1], ey[1], ez[1], ex[2], ey[2], ez[2]];
 }
 
+/** Tunable constants of the body solver (tests override them through tests/contact2d.html?b.<name>=). */
+export const BODY_PARAMS = {
+  near: 1.5,          // [cells] a liquid film thinner than this between two solids is under-resolved
+  friction: 0.4,
+  bounceSpeed: 8,     // approach speeds below this [cells/s] do not bounce (resting contact)
+  correction: 0.8,    // share of a penetration that is removed per step
+  iterations: 10,     // sequential impulse sweeps
+  addedMass: 0.5,     // first guess of the added mass, in units of the displaced liquid mass
+  addedMassMax: 200,  // upper bound of the identified added mass ratio
+  identifyNoise: 0.05,   // [g] accelerations below this say nothing about the added mass
+  forget: 0.98,       // per-step decay of what has been learnt about the added mass ...
+  forgetNear: 0.995,  // ... and next to another solid, where it changes slowly
+  dragForm: 0.6,      // quadratic drag coefficient (per body length travelled relative to the liquid)
+  dragLinear: 0.6,    // [1/s] linear drag of a fully wetted body of the liquid's density
+  dragSpin: 2,        // [1/s] damping of the spin of a fully wetted body
+};
+
 export class Body {
   /**
    * @param {object} o  { shape:'ball'|'box', pos, radius | half, round, density (relative to the liquid),
@@ -78,9 +95,12 @@ export class Body {
     this.scripted = false;        // position driven by a scene script (kinematic obstacle)
     this.target = null;
     this.restitution = o.restitution ?? 0.25;
-    this.force = [0, 0, 0];        // filtered pressure acceleration from the liquid
+    this.force = [0, 0, 0];        // pressure acceleration from the liquid, as last measured
     this.torque = [0, 0, 0];
-    this.accPrev = [0, 0, 0];
+    this.forceAcc = [0, 0, 0];     // the body's own acceleration during the step that was measured
+    this.forceSpin = [0, 0, 0];    // ... and its angular acceleration
+    this.forceSeq = 0;             // counts the measurements
+    this.am = null;                // added mass identification (see stepBodies)
     // volume (cells^dim) and inertia per unit mass
     if (this.shape === 'ball') {
       this.volume = dim === 2 ? Math.PI * this.radius ** 2 : (4 / 3) * Math.PI * this.radius ** 3;
@@ -198,7 +218,8 @@ export class Container {
  */
 export function stepBodies(bodies, statics, o) {
   const { dt, gravity } = o;
-  const Ca = o.addedMass ?? 1.5;
+  const P = BODY_PARAMS;
+  const glen = len(gravity);
   for (const b of bodies) {
     // velocity before this step's forces: decides whether a contact is an impact or resting
     b.velPre = [...b.vel];
@@ -212,20 +233,58 @@ export function stepBodies(bodies, statics, o) {
       if (len(v) > lim) v = mul(v, lim / len(v));
       b.vel = v;
       b.omega = mul(b.omega, 0.9);
-      b.accPrev = [0, 0, 0];
+      b.am = null;
       continue;
     }
-    // a = (g + a_pressure + Ca r a_prev) / (1 + Ca r): implicit treatment of the added mass that
-    // the (lagged) pressure force already contains
-    const r = (Ca * Math.max(b.wet ?? 0, 0.3)) / b.density;
+    // The liquid force f was measured after the last liquid step, i.e. it is the liquid's answer
+    // to the acceleration A the body had in that step: f = s - m A, where s is what the liquid
+    // would exert on a body that does not accelerate (buoyancy, waves) and m its added mass in
+    // units of the body's mass. Applying f as it is treats the added mass explicitly, which
+    // diverges as soon as m > 1 (a light body, a body close to a wall or to another body, bodies
+    // that cover the surface). Instead s is recovered as f + r A and the equation of motion
+    // (1 + r) a = g + s is solved for a. With r = m this is exact; r too large delays the
+    // liquid's answer (and pumps energy into a bobbing body), r too small overshoots.
+    // m depends on the direction and on everything around the body, so it is identified while
+    // running, per axis, from how the measured force answers changes of the acceleration:
+    // second differences, because s changes smoothly from step to step and m A does not.
+    const r0 = (P.addedMass * Math.max(b.wet ?? 0, 0.3)) / b.density;
+    const alphaP = b.invInertia(b.torque);
+    const am = (b.am ??= { N: [0, 0, 0], D: [0, 0, 0], Nr: 0, Dr: 0, hist: [], seq: -1 });
+    if (am.seq !== b.forceSeq) {
+      am.seq = b.forceSeq;
+      am.hist.push({ f: [...b.force], a: [...b.forceAcc], t: alphaP, w: [...b.forceSpin] });
+      if (am.hist.length > 3) am.hist.shift();
+      const keep = (b.near || []).length ? P.forgetNear : P.forget;
+      for (let k = 0; k < 3; k++) { am.N[k] *= keep; am.D[k] *= keep; }
+      am.Nr *= keep; am.Dr *= keep;
+      if (am.hist.length === 3) {
+        const [h0, h1, h2] = am.hist;
+        const d2 = (key, k) => h2[key][k] - 2 * h1[key][k] + h0[key][k];
+        for (let k = 0; k < 3; k++) {
+          const df = d2('f', k), da = d2('a', k);
+          am.N[k] -= df * da;
+          am.D[k] += da * da;
+          am.Nr -= d2('t', k) * d2('w', k);
+          am.Dr += d2('w', k) ** 2;
+        }
+      }
+    }
+    const eps = (P.identifyNoise * glen) ** 2;
+    const epsR = eps / Math.max(b.extent, 1) ** 2;
+    const clampR = (v) => Math.min(Math.max(v, 0.25 * r0), P.addedMassMax);
+    const r = [0, 1, 2].map((k) => clampR((am.N[k] + eps * r0) / (am.D[k] + eps)));
+    const rr = clampR((am.Nr + epsR * r0) / (am.Dr + epsR));
+    b.addedMass = r;             // for diagnostics
+    b.addedInertia = rr;
+    // s: the liquid force on the body if it did not accelerate
+    const af = [0, 1, 2].map((k) => b.force[k] + r[k] * b.forceAcc[k]);
+    let at = [0, 1, 2].map((k) => alphaP[k] + rr * b.forceSpin[k]);
     // impact spikes arrive late (the force is read back asynchronously); cap them at a few
     // times the largest buoyancy the body can feel so light bodies do not get catapulted
-    const glen = len(gravity);
     const cap = (3 * glen) / Math.min(b.density, 1);
-    const fl = len(b.force);
-    const fs = fl > cap ? cap / fl : 1;
-    const af = mul(b.force, fs);
-    let ts = fs;               // the torque is scaled with the force it comes from
+    const fl = len(af);
+    let ts = 1;                  // the torque is scaled with the force it comes from
+    if (fl > cap) { ts = cap / fl; for (let k = 0; k < 3; k++) af[k] *= ts; }
     // A film of liquid squeezed between the body and a solid it is about to touch is stiff, and
     // the force it exerts arrives one step late: by then the contact has stopped the body and
     // the force throws it back instead of cushioning it. Next to a solid the liquid may
@@ -240,21 +299,20 @@ export function stepBodies(bodies, statics, o) {
       }
     }
     const acc = [0, 0, 0];
-    for (let k = 0; k < 3; k++) acc[k] = (gravity[k] + af[k] + r * b.accPrev[k]) / (1 + r);
+    for (let k = 0; k < 3; k++) acc[k] = (gravity[k] + af[k]) / (1 + r[k]);
     if (b.dim === 2) acc[2] = 0;
-    b.accPrev = acc;
     b.vel = add(b.vel, mul(acc, dt));
     // The solver is inviscid, so nothing else resists a body moving through the liquid:
     // quadratic form drag plus a little linear damping, relative to the surrounding liquid
     // (implicit update, unconditionally stable).
     const vf = b.fluidVel || [0, 0, 0];
     const vr = sub(b.vel, vf);
-    const kd = ((b.wet ?? 0) * (0.6 * len(vr) / Math.max(b.extent, 1) + 0.6)) / b.density;
+    const kd = ((b.wet ?? 0) * (P.dragForm * len(vr) / Math.max(b.extent, 1) + P.dragLinear)) / b.density;
     b.vel = add(vf, mul(vr, 1 / (1 + dt * kd)));
     if (b.dim === 2) b.vel[2] = 0;
-    b.omega = add(b.omega, mul(b.invInertia(b.torque), ts * dt / (1 + r)));
+    b.omega = add(b.omega, mul(at, (ts * dt) / (1 + rr)));
     // mild damping of the spin inside liquid (the inviscid solver exerts no shear)
-    const damp = Math.exp(-dt * (0.2 + 2.0 * (b.wet ?? 0)));
+    const damp = Math.exp(-dt * (0.2 + P.dragSpin * (b.wet ?? 0)));
     b.omega = mul(b.omega, damp);
     const vmax = 0.45 / dt * Math.max(1, b.extent);   // keep fast bodies from tunnelling
     const sp = len(b.vel);
@@ -272,9 +330,6 @@ function preVelocity(o, p) {
   return add(o.velPre, cross(o.omegaPre, r));
 }
 
-const NEAR = 1.5;            // [cells] a liquid film thinner than this between two solids is under-resolved
-const FRICTION = 0.4;
-const BOUNCE_SPEED = 8;      // approach speeds below this [cells/s] do not bounce (resting contact)
 
 /**
  * Contacts between the bodies' surface sample points and the other solids, solved with
@@ -286,7 +341,7 @@ function resolveContacts(bodies, statics) {
   const contacts = [];
   for (let i = 0; i < bodies.length; i++) {
     const a = bodies[i];
-    a.near = [];               // normals of the solids within NEAR cells, for the next step
+    a.near = [];               // normals of the solids within BODY_PARAMS.near cells, for the next step
     if (a.kinematic) continue;
     const others = [...statics, ...bodies.filter((_, j) => j !== i)];
     for (const o2 of others) {
@@ -298,7 +353,7 @@ function resolveContacts(bodies, statics) {
       // position: separate along the normal of the deepest point
       let deepest = 0;
       let hit = null;
-      let closest = NEAR;
+      let closest = BODY_PARAMS.near;
       let closestPoint = null;
       for (const p of a.samplePoints()) {
         const d = o2.sd(p);
@@ -308,7 +363,7 @@ function resolveContacts(bodies, statics) {
       if (closestPoint) a.near.push(o2.normal(closestPoint));
       if (!hit) continue;
       const nd = o2.normal(hit);                 // points out of o2, i.e. the way `a` must move
-      const corr = -deepest * 0.8;
+      const corr = -deepest * BODY_PARAMS.correction;
       a.pos = add(a.pos, mul(nd, (corr * wA) / (wA + wB)));
       if (!fixedB) o2.pos = sub(o2.pos, mul(nd, (corr * wB) / (wA + wB)));
       // velocity: one constraint per sample point that is (still) touching
@@ -328,7 +383,7 @@ function resolveContacts(bodies, statics) {
         // picks up g dt (and more when the liquid presses on it) every step and must not bounce
         const vn0 = dot(sub(preVelocity(a, p), preVelocity(o2, p)), n);
         const e = Math.min(a.restitution, isBody ? o2.restitution : a.restitution);
-        contacts.push({ a, b: o2, fixedB, wA, wB, p, n, k, target: vn0 < -BOUNCE_SPEED ? -e * vn0 : 0, lambda: 0, jt: [0, 0, 0] });
+        contacts.push({ a, b: o2, fixedB, wA, wB, p, n, k, target: vn0 < -BODY_PARAMS.bounceSpeed ? -e * vn0 : 0, lambda: 0, jt: [0, 0, 0] });
       }
     }
   }
@@ -336,7 +391,7 @@ function resolveContacts(bodies, statics) {
     c.a.applyImpulse(mul(J, c.wA), c.p);
     if (!c.fixedB) c.b.applyImpulse(mul(J, -c.wB), c.p);
   };
-  for (let iter = 0; iter < 10; iter++) {
+  for (let iter = 0; iter < BODY_PARAMS.iterations; iter++) {
     for (const c of contacts) {
       let vrel = sub(c.a.velocityAt(c.p), c.b.velocityAt(c.p));
       const vn = dot(vrel, c.n);
@@ -347,7 +402,7 @@ function resolveContacts(bodies, statics) {
       vrel = sub(c.a.velocityAt(c.p), c.b.velocityAt(c.p));
       const vt = sub(vrel, mul(c.n, dot(vrel, c.n)));
       let jt = sub(c.jt, mul(vt, 1 / c.k));
-      const max = FRICTION * c.lambda;
+      const max = BODY_PARAMS.friction * c.lambda;
       const l = len(jt);
       if (l > max) jt = mul(jt, max / (l || 1));
       apply(c, sub(jt, c.jt));

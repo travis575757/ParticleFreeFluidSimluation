@@ -91,6 +91,7 @@ export class Runner {
       sim.editLiquid([e.prim(t1)], 1);
     }
 
+    sim.twoWay = this.glc.readback !== 'scrambled' && this.bodies.some((b) => !b.kinematic && (b.wet ?? 1) > 0);
     sim.step();
     this.time = t1;
     if (!this._checked) { this._checked = true; this.glc.checkErrors(`the first step on a ${sim.grid.n.slice(0, dim).join('x')} grid`); }
@@ -103,6 +104,12 @@ export class Runner {
     const dyn = this.bodies.filter((b) => !b.kinematic);
     // without usable read-back the bodies only feel gravity and contacts
     if (!dyn.length || this.glc.readback === 'scrambled') return Promise.resolve();
+    // the acceleration each body had in the step the liquid has just answered (forces, drag
+    // and contacts): the measured force is the reaction to it
+    const moved = dyn.map((b) => [0, 1].map((w) => {
+      const now = w ? b.omega : b.vel, pre = (w ? b.omegaPre : b.velPre) || now;
+      return [(now[0] - pre[0]) / dt, (now[1] - pre[1]) / dt, (now[2] - pre[2]) / dt];
+    }));
     return this.sim.measureBodyForces(dyn.map((b) => b.prim())).then((res) => {
       if (!res) return;
       dyn.forEach((b, i) => {
@@ -110,11 +117,12 @@ export class Runner {
         const k = 1 / (b.density * dt * b.volume);
         const f = res[i].force.map((v) => v * k);
         const tq = res[i].torque.map((v) => v * k);
-        // low-pass: the pressure reacts to the body's own motion with a delay
-        for (let c = 0; c < 3; c++) {
-          b.force[c] += 0.5 * (f[c] - b.force[c]);
-          b.torque[c] += 0.5 * (tq[c] - b.torque[c]);
-        }
+        // taken as measured: smoothing would delay the liquid's answer, and a delayed
+        // restoring force feeds a bobbing body instead of slowing it
+        b.force = f;
+        b.torque = tq;
+        [b.forceAcc, b.forceSpin] = moved[i];
+        b.forceSeq++;
         b.wet = res[i].wet;
         b.fluidVel = res[i].fluidVel;
       });

@@ -1,0 +1,212 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>floating bodies in contact (2D)</title>
+<style>body{margin:0;background:#111} canvas{display:block}</style>
+<canvas id="c" width="640" height="640"></canvas>
+<script type="module">
+// Floating rigid bodies that touch each other (or the walls) in a pool that starts at rest:
+// does the system settle, or does the contact keep feeding motion into bodies and liquid?
+//   ?case=raft|jam|pair|pile|drop|single   or   ?bodies=shape:x:y:a:b:density:angle;...  (tank
+//   units; a ball uses a = radius; y may be "float" or "above")   &level=0.34 (pool depth)   &n=128&steps=3600&every=300
+//   &p.<param>=.. solver parameters   &b.<name>=.. rigid body parameters (BODY_PARAMS in bodies.js)
+// Each line covers the steps since the previous one: largest body speed and spin, the bodies'
+// mean kinetic energy, the largest liquid speed, the smallest gap between two solids and the
+// share of steps spent in contact.
+//   &trace=i0,i1[,body]  per-step force, acceleration, velocity, position, identified added mass
+//   &who=K               per body, the maxima over the last K steps
+//   &map=1               where the liquid still moves at the end
+//   &piston=v,n[,vx]     instead of all the above: body 0 is pushed through the liquid at a
+//                        constant velocity [cells/step] and the force on it is printed per step
+import { GLContext } from '../src/gl.js';
+import { Runner } from '../src/runner.js';
+import { buildScene } from '../src/scenes2d.js';
+import { Renderer2D } from '../src/render2d.js';
+import { BODY_PARAMS, Container } from '../src/bodies.js';
+
+const q = new URLSearchParams(location.search);
+const N = Number(q.get('n') || 128);
+const steps = Number(q.get('steps') || 3600);
+const every = Number(q.get('every') || 300);
+const level = Number(q.get('level') || 0.34);
+const overrides = {};
+for (const [k, v] of q) {
+  if (k.startsWith('p.')) overrides[k.slice(2)] = Number(v);
+  if (k.startsWith('b.')) BODY_PARAMS[k.slice(2)] = Number(v);
+}
+// Bodies given with y = "float" are placed where they float at rest: a fraction `density` of
+// their height under water, the water level raised by what all of them displace.
+const CASES = {
+  // a small block riding on a floating raft (the raft carries both)
+  raft: ['box:0.5:float:0.2:0.05:0.5:0', 'box:0.5:above:0.05:0.04:0.8:0'],
+  // three boxes that cover most of the surface: they rub against each other and the walls
+  jam: [0.17, 0.5, 0.83].map((x) => `box:${x}:float:0.15:0.05:0.5:0`),
+  // two balls side by side, touching
+  pair: ['ball:0.43:float:0.07:0:0.5:0', 'ball:0.57:float:0.07:0:0.5:0'],
+  // a ball dropped onto two floating boxes
+  pile: ['box:0.36:float:0.12:0.05:0.5:0', 'box:0.64:float:0.12:0.05:0.5:0', `ball:0.5:${level + 0.25}:0.06:0:0.6:0`],
+  // five bodies dropped into the pool one above the other
+  drop: ['box:0.3:0.5:0.08:0.05:0.45:0.3', 'ball:0.5:0.6:0.06:0:0.7:0', 'box:0.68:0.5:0.06:0.06:0.6:-0.4', 'ball:0.42:0.8:0.05:0:0.3:0', 'box:0.6:0.85:0.07:0.04:0.5:0.2'],
+  // reference without contact
+  single: ['box:0.5:float:0.16:0.05:0.5:0'],
+};
+const raw = (q.get('bodies') ? q.get('bodies').split(';') : CASES[q.get('case') || 'raft']).map((t) => t.split(':'));
+const height = (t) => (t[0] === 'ball' ? Number(t[3]) : Number(t[4]));            // half height
+const area = (t) => (t[0] === 'ball' ? Math.PI * Number(t[3]) ** 2 : 4 * Number(t[3]) * Number(t[4]));
+// floating bodies carry the ones marked "above" (those sit on the first floating body)
+const load = raw.filter((t) => t[2] === 'above').reduce((m, t) => m + area(t) * Number(t[5]), 0);
+const floaters = raw.filter((t) => t[2] === 'float');
+const sunk = floaters.reduce((m, t) => m + area(t) * Number(t[5]), 0) + load;      // displaced area
+const surface = level + sunk;                                                       // tank is 1 wide
+for (const t of raw) {
+  if (t[2] === 'float') {
+    const extra = t === floaters[0] ? load : 0;
+    const draft = (area(t) * Number(t[5]) + extra) / area(t);                       // submerged share
+    t[2] = surface + height(t) * (1 - 2 * draft);
+  }
+}
+for (const t of raw) if (t[2] === 'above') t[2] = Number(floaters[0][2]) + height(floaters[0]) + height(t);
+const spec = raw.map(([shape, x, y, a, b, density, angle]) => (shape === 'ball'
+  ? { shape, c: [Number(x), Number(y)], r: Number(a), density: Number(density) }
+  : { shape, c: [Number(x), Number(y)], half: [Number(a), Number(b)], density: Number(density), angle: Number(angle || 0) }));
+
+try {
+  const glc = new GLContext(document.getElementById('c'), { preserveDrawingBuffer: true });
+  const scene = buildScene({ liquid: [{ type: 'box', c: [0.5, level / 2], half: [0.5, level / 2] }], bodies: spec }, N);
+  const runner = new Runner(glc, 2, scene, overrides);
+  const sim = runner.sim;
+  const h = sim.params.h;
+  const dt = sim.params.dt;
+  const wall = new Container(2, runner.container);
+  // smallest distance between two solids, over the bodies' contact sample points
+  const gap = () => {
+    let g = Infinity;
+    for (const a of runner.bodies) for (const o of [wall, ...runner.bodies]) {
+      if (o === a) continue;
+      for (const p of a.samplePoints()) g = Math.min(g, o.sd(p));
+    }
+    return g;
+  };
+  console.log(`grid ${sim.grid.n[0]}x${sim.grid.n[1]}  dt ${dt.toFixed(5)}  bodies ${spec.map((s) => `${s.shape} d${s.density}`).join(', ')}  ${JSON.stringify(overrides)}  body params ${JSON.stringify(BODY_PARAMS)}`);
+  if (q.get('piston')) {
+    // &piston=v,n[,vx]: body 0 is moved at a constant velocity (cells/step) for n steps and then
+    // held, and the liquid force on it is printed per step in units of its weight. A smooth
+    // curve (buoyancy growing with depth) is the right answer; everything else is noise the
+    // two-way coupling has to live with.
+    const [pv, pn, pvx] = q.get('piston').split(',').map(Number);
+    const b = runner.bodies[0];
+    const G = -runner.gravityCells[1];
+    b.kinematic = true;
+    let prev = null, rough = 0, cnt = 0;
+    const out = [];
+    for (let i = 1; i <= pn + 40; i++) {
+      const moving = i > 10 && i <= 10 + pn;
+      b.vel = moving ? [(pvx || 0) / dt, -pv / dt, 0] : [0, 0, 0];
+      b.omega = [0, 0, 0];
+      runner.step();
+      const res = await sim.measureBodyForces([b.prim()]);
+      const k = 1 / (b.density * dt * b.volume * G);
+      const f = [res[0].force[0] * k, res[0].force[1] * k];
+      if (moving && i > 14) { if (prev !== null) { rough += Math.abs(f[1] - prev); cnt++; } prev = f[1]; }
+      out.push(`${i}:${f[1].toFixed(2)}`);
+    }
+    console.log(`piston v ${pv} c/step: mean |dF/g| per step ${(rough / cnt).toFixed(3)}`);
+    for (let k = 0; k < out.length; k += 20) console.log('  ' + out.slice(k, k + 20).join(' '));
+    window.__done = true;
+    throw new Error('done');
+  }
+  let acc = { v: 0, w: 0, gap: Infinity, touch: 0, n: 0, ke: 0 };
+  for (let i = 1; i <= steps; i++) {
+    runner.step();
+    await runner.forcesReady;
+    for (const b of runner.bodies) {
+      const v2 = b.vel[0] ** 2 + b.vel[1] ** 2;
+      acc.v = Math.max(acc.v, Math.sqrt(v2) * h);
+      acc.w = Math.max(acc.w, Math.abs(b.omega[2]));
+      acc.ke += 0.5 * b.density * b.volume * (v2 + b.inertia[2] * b.omega[2] ** 2) * h * h;   // per unit liquid density and depth
+    }
+    if (q.get('trace')) {
+      // &trace=i0,i1[,body]: per step, in units of g: liquid force (as used), the body's actual
+      // acceleration over the step, and the same for the spin [rad/s^2]
+      const [i0, i1, k] = q.get('trace').split(',').map(Number);
+      const b = runner.bodies[k || 0];
+      const G = -runner.gravityCells[1];
+      b._v0 ??= [0, 0]; b._w0 ??= 0;
+      if (i >= i0 && i <= i1) console.log(`  step ${i}  F/g ${(b.force[0] / G).toFixed(3)} ${(b.force[1] / G).toFixed(3)}  a/g ${((b.vel[0] - b._v0[0]) / dt / G).toFixed(3)} ${((b.vel[1] - b._v0[1]) / dt / G).toFixed(3)}` +
+        `  torque ${b.invInertia(b.torque)[2].toFixed(2)}  alpha ${((b.omega[2] - b._w0) / dt).toFixed(2)}  v ${(b.vel[0] * h).toFixed(4)} ${(b.vel[1] * h).toFixed(4)} m/s  w ${b.omega[2].toFixed(4)}` +
+        `  pos ${((b.pos[0] - scene.margin) / scene.L).toFixed(4)} ${((b.pos[1] - scene.margin) / scene.L).toFixed(4)} ${(b.angle ?? 0).toFixed(4)}  wet ${(b.wet ?? 0).toFixed(3)}  near ${(b.near || []).length}` +
+        `  added mass ${(b.addedMass || []).slice(0, 2).map((v) => v.toFixed(2)).join(' ')} rot ${(b.addedInertia ?? 0).toFixed(2)}`);
+      b._v0 = [b.vel[0], b.vel[1]]; b._w0 = b.omega[2];
+    }
+    if (q.get('who') && i > steps - Number(q.get('who'))) {
+      // &who=K: over the last K steps, per body: largest speed, spin, and largest liquid force,
+      // acceleration and identified added mass
+      const G = -runner.gravityCells[1];
+      window.__who ??= runner.bodies.map(() => ({ v: 0, w: 0, f: 0, a: 0, r: 0, rr: 0, near: 0 }));
+      runner.bodies.forEach((b, k) => {
+        const o = window.__who[k];
+        o.v = Math.max(o.v, Math.hypot(b.vel[0], b.vel[1]) * h); o.w = Math.max(o.w, Math.abs(b.omega[2]));
+        o.f = Math.max(o.f, Math.hypot(b.force[0], b.force[1]) / G); o.a = Math.max(o.a, Math.hypot(b.forceAcc[0], b.forceAcc[1]) / G);
+        o.r = Math.max(o.r, ...(b.addedMass || [0]).slice(0, 2)); o.rr = Math.max(o.rr, b.addedInertia ?? 0); o.near = Math.max(o.near, (b.near || []).length);
+      });
+      if (i === steps) window.__who.forEach((o, k) => console.log(`  body ${k} (${spec[k].shape} d${spec[k].density}): speed <= ${o.v.toFixed(3)} m/s  spin <= ${o.w.toFixed(3)}  F/g <= ${o.f.toFixed(2)}  a/g <= ${o.a.toFixed(3)}  added mass <= ${o.r.toFixed(1)} rot ${o.rr.toFixed(1)}  near ${o.near}`));
+    }
+    const g = gap();
+    acc.gap = Math.min(acc.gap, g);
+    if (g < 0.05) acc.touch++;
+    acc.n++;
+    if (i % every === 0 || i === steps) {
+      const s = sim.measureSync();
+      console.log(`t ${String((i * dt).toFixed(1)).padStart(6)} s  bodies: speed <= ${acc.v.toFixed(4)} m/s  spin <= ${acc.w.toFixed(3)} rad/s  mean KE ${(acc.ke / acc.n).toExponential(2)}` +
+        `   liquid: speed ${(s.maxSpeed * h).toFixed(4)} m/s  res ${s.residual.toExponential(1)}  mass ${((s.massRatio - 1) * 1e6).toFixed(0)} ppm` +
+        `   gap >= ${acc.gap.toFixed(2)} cells, in contact ${(100 * acc.touch / acc.n).toFixed(0)} %` +
+        `   y ${runner.bodies.map((b) => ((b.pos[1] - scene.margin) / scene.L).toFixed(3)).join(' ')}`);
+      acc = { v: 0, w: 0, gap: Infinity, touch: 0, n: 0, ke: 0 };
+    }
+  }
+  if (q.get('map')) {
+    // &map=1: where the liquid still moves. One character per block of cells: the largest face
+    // speed of its liquid cells in units of 0.05 m/s (9 = 0.45 m/s or more, '.' = no liquid),
+    // then the same for how far below 1 the liquid density of the block's emptiest liquid cell is
+    // (units of 0.05), then a window of both fields around the fastest cell.
+    const g = sim.grid;
+    const rd = (t) => ({ d: glc.read(t), ch: t.channels });
+    const vel = rd(sim.vel), liq = rd(sim.liq);
+    const at = (f, x, y, c) => f.d[(y * g.w + x) * f.ch + c];
+    const speed = (x, y) => Math.max(Math.abs(at(vel, x, y, 0)), Math.abs(at(vel, x, y, 1))) * h;
+    const wetCell = (x, y) => at(liq, x, y, 0) < 0;
+    const B = Math.max(1, Math.round(g.n[0] / 32));
+    let best = [0, 0, 0];
+    const rows = [[], []];
+    for (let by = Math.ceil(g.n[1] / B) - 1; by >= 0; by--) {
+      let a = '', d = '';
+      for (let bx = 0; bx < Math.ceil(g.n[0] / B); bx++) {
+        let v = -1, def = -1;
+        for (let y = by * B; y < Math.min(g.n[1], (by + 1) * B); y++) for (let x = bx * B; x < Math.min(g.n[0], (bx + 1) * B); x++) {
+          if (!wetCell(x, y)) continue;
+          const sp = speed(x, y);
+          v = Math.max(v, sp);
+          def = Math.max(def, 0.5 + at(liq, x, y, 0));      // 1 - rho'
+          if (sp > best[2]) best = [x, y, sp];
+        }
+        a += v < 0 ? '.' : String(Math.min(9, Math.floor(v / 0.05)));
+        d += def < 0 ? '.' : String(Math.min(9, Math.max(0, Math.floor(def / 0.05))));
+      }
+      rows[0].push(a); rows[1].push(d);
+    }
+    console.log(`-- liquid speed per ${B}x${B} block [0.05 m/s]            -- density deficit 1 - rho' [0.05]`);
+    rows[0].forEach((a, i) => console.log(`${a}    ${rows[1][i]}`));
+    console.log(`fastest liquid cell ${best[0]},${best[1]}: ${best[2].toFixed(3)} m/s; bodies at ${runner.bodies.map((b) => `${b.pos[0].toFixed(1)},${b.pos[1].toFixed(1)}`).join(' ')}`);
+    for (let y = Math.min(g.n[1] - 1, best[1] + 4); y >= Math.max(0, best[1] - 4); y--) {
+      let ln = '';
+      for (let x = Math.max(0, best[0] - 5); x <= Math.min(g.n[0] - 1, best[0] + 5); x++) ln += `${(at(vel, x, y, 0) * h).toFixed(2).padStart(6)},${(at(vel, x, y, 1) * h).toFixed(2).padStart(5)}|${(0.5 - at(liq, x, y, 0)).toFixed(2)}`;
+      console.log(ln);
+    }
+  }
+  new Renderer2D(glc).render(runner, { view: q.get('view') || 'liquid', postProcess: false });
+  window.runner = runner;
+  window.__done = true;
+} catch (e) {
+  if (e.message !== 'done') console.log(String(e.stack || e));
+  if (e.message !== 'done') window.__error = String(e.message || e);
+}
+</script>
