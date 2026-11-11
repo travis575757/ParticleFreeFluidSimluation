@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>body coupling test</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+import { GLContext } from '../src/gl.js';
+import { Runner } from '../src/runner.js';
+import { buildScene } from '../src/scenes2d.js';
+const q = new URLSearchParams(location.search);
+const N = Number(q.get('n') || 128);
+const density = Number(q.get('density') || 0.5);
+const shape = q.get('shape') || 'ball';
+const drop = Number(q.get('drop') || 0.6);
+try {
+  const glc = new GLContext(document.getElementById('c'));
+  const desc = { liquid: [{ type: 'box', c: [0.5, 0.2], half: [0.5, 0.2] }],
+    bodies: [shape === 'ball' ? { shape: 'ball', c: [0.5, drop], r: 0.07, density } : { shape: 'box', c: [0.5, drop], half: [0.09, 0.05], density, angle: 0.2 }] };
+  const runner = new Runner(glc, 2, buildScene(desc, N), {});
+  const b = runner.bodies[0];
+  const L = runner.scene.L, m = runner.scene.margin;
+  let line = '';
+  let ymax = -1e9, ymin = 1e9, vmax = 0;
+  for (let i = 1; i <= Number(q.get('steps') || 600); i++) {
+    runner.step();
+    await new Promise((r) => setTimeout(r, 0));
+    const y = (b.pos[1] - m) / L;
+    if (i > 300) { ymax = Math.max(ymax, y); ymin = Math.min(ymin, y); }
+    vmax = Math.max(vmax, Math.hypot(b.vel[0], b.vel[1]) * runner.sim.params.dt);
+    if (i % 30 === 0) line += ` ${y.toFixed(3)}`;
+  }
+  const s = runner.sim.measureSync();
+  console.log(`density ${density} ${shape}: y(t) every 0.5s:${line}`);
+  console.log(`   after 5s: y in [${ymin.toFixed(3)}, ${ymax.toFixed(3)}] (pool surface 0.40, radius 0.07) wet ${(b.wet ?? 0).toFixed(2)} max body CFL ${vmax.toFixed(2)} mass ${(s.massRatio * 100).toFixed(4)}% vol ${(s.volumeRatio * 100).toFixed(1)}%`);
+  window.__done = true;
+} catch (e) { console.log(String(e.stack || e)); window.__error = String(e.message || e); }
+</script>

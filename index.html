@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mass-Conserving Eulerian Liquid Simulation</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M8 1C5 6 3 8 3 10.5a5 5 0 0010 0C13 8 11 6 8 1z%27 fill=%27%2339c5cf%27/%3E%3C/svg%3E">
+<style>
+  :root { --bg: #080b12; --panel: #0f141f; --line: #222b3b; --text: #d9e0ea; --muted: #8a96a8; --accent: #39c5cf; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 56px 20px 80px; }
+  h1 { font-size: 30px; line-height: 1.2; margin: 0 0 10px; letter-spacing: -0.01em; text-wrap: balance; }
+  h2 { font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 44px 0 12px; }
+  p { margin: 0 0 12px; max-width: 68ch; }
+  .lede { color: #b4bfce; font-size: 16px; }
+  a { color: var(--accent); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-top: 26px; }
+  .card { display: block; padding: 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: inherit; text-decoration: none; }
+  .card:hover, .card:focus-visible { border-color: var(--accent); outline: none; }
+  .card strong { display: block; font-size: 18px; margin-bottom: 4px; }
+  .card span { color: var(--muted); font-size: 14px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  .scroll { overflow-x: auto; }
+  th, td { text-align: left; padding: 7px 14px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  code { font: 13px ui-monospace, Menlo, Consolas, monospace; background: #151c2a; padding: 1px 5px; border-radius: 4px; }
+  ul { padding-left: 20px; margin: 0; max-width: 68ch; }
+  li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mass-Conserving Eulerian Liquid Simulation</h1>
+  <p class="lede">A browser implementation of Chentanez &amp; Müller (SCA 2012). The whole solver runs on the GPU as WebGL2 shader passes: conservative density advection, density sharpening with local mass conservation, and a multigrid pressure solve with separating solid boundaries.</p>
+
+  <div class="cards">
+    <a class="card" href="2d.html"><strong>2D simulator</strong><span>13 scenes, mouse push / pour / drain, moving obstacles, floating rigid bodies, field views.</span></a>
+    <a class="card" href="3d.html"><strong>3D simulator</strong><span>9 scenes, ray-marched liquid surface and density volume, orbit camera, the same interactions in 3D.</span></a>
+  </div>
+
+  <h2>What you are looking at</h2>
+  <p>The liquid is a density field ρ on a regular staggered grid; the surface is its 0.5 iso-contour. The paper's contribution is that this field is transported so that the total mass never changes, without particles:</p>
+  <div class="scroll">
+  <table>
+    <tr><th>Paper</th><th>Step</th><th>How it runs here</th></tr>
+    <tr><td class="n">Sec. 3.3</td><td>Velocity extrapolation</td><td>Pull–push over the grid hierarchy</td></tr>
+    <tr><td class="n">Sec. 3.4</td><td>Conservative density advection</td><td>Backward gather, then three scatter passes drawn as GPU points with additive float blending</td></tr>
+    <tr><td class="n">Sec. 3.5</td><td>Sharpening with local mass conservation</td><td>Removed density is traced up the density gradient and re-deposited (Algorithm 2)</td></tr>
+    <tr><td class="n">Sec. 3.6</td><td>Solids cutting cells, moving solids</td><td>Analytic distance fields → area and volume fractions; excess density is pushed out of solids</td></tr>
+    <tr><td class="n">Sec. 3.7</td><td>Incompressibility</td><td>Variational discretisation, ghost-fluid free surface, projected red–black Gauss–Seidel multigrid</td></tr>
+    <tr><td class="n">Sec. 3.8</td><td>Sub-grid detail</td><td>Optional density post-process before the surface is extracted</td></tr>
+  </table>
+  </div>
+
+  <h2>Measured on this implementation</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>Grid</th><th>Step time (RTX 3090)</th><th>Paper, Table 2 (GTX 680)</th></tr>
+    <tr><td class="n">128 × 128 (2D)</td><td class="n">≈ 1.1 ms</td><td class="n">–</td></tr>
+    <tr><td class="n">128 × 64 × 64</td><td class="n">3.1 ms</td><td class="n">26.7 ms (128 × 128 × 64)</td></tr>
+    <tr><td class="n">128 × 128 × 128</td><td class="n">9.8 ms</td><td class="n">53.4 – 54.2 ms</td></tr>
+    <tr><td class="n">256 × 128 × 128</td><td class="n">15.1 ms</td><td class="n">113.2 – 118.6 ms</td></tr>
+  </table>
+  </div>
+  <p style="margin-top:12px">Total mass drifts by only a few parts per million over hundreds of steps in every scene (32-bit float round-off), even at time steps where the liquid crosses more than ten cells per step. With plain semi-Lagrangian advection the same dam break loses 90&nbsp;% of its mass in ten seconds; you can switch between the two under <em>Solver</em>.</p>
+
+  <h2>Running it</h2>
+  <ul>
+    <li>Serve this folder over HTTP (ES modules do not load from <code>file://</code>): <code>node tools/serve.mjs</code> or <code>python3 -m http.server 8080</code>, then open <code>http://localhost:8080/</code>.</li>
+    <li>Needs WebGL2 with <code>EXT_color_buffer_float</code>, <code>EXT_float_blend</code> and <code>OES_texture_float_linear</code> (any recent desktop browser on a discrete or integrated GPU).</li>
+    <li><code>README.md</code> lists every place where the paper leaves a choice open and what was chosen, and the one extension that is on by default.</li>
+  </ul>
+
+  <h2>Sources</h2>
+  <p>N. Chentanez, M. Müller: <a href="masscon_sca.pdf">Mass-Conserving Eulerian Liquid Simulation</a>, ACM SIGGRAPH / Eurographics Symposium on Computer Animation 2012. The eight papers it builds on are in <code>references/</code>.</p>
+</main>
+</body>
+</html>

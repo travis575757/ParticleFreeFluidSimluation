@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>2D filmstrip (diagnostic)</title>
+<style>body{margin:0;background:#000} canvas{display:block}</style>
+<canvas id="c"></canvas>
+<script type="module">
+// Renders a grid of snapshots with a diagnostic colour map of rho':
+//   black = empty, purple = mist (rho' < 0.5), blue->white = liquid (0.5..1), yellow->red = over-full (> 1)
+import { GLContext } from '../src/gl.js';
+import { Runner } from '../src/runner.js';
+import { header } from '../src/shaders/common.js';
+import { SCENES2D, buildScene } from '../src/scenes2d.js';
+
+const q = new URLSearchParams(location.search);
+const N = Number(q.get('n') || 128);
+const frames = Number(q.get('frames') || 12);
+const stride = Number(q.get('stride') || 30);
+const cols = Number(q.get('cols') || 4);
+const tile = Number(q.get('tile') || 256);
+const start = Number(q.get('start') || 0);
+const sceneName = q.get('scene') || 'ballDrop';
+const reserved = ['n', 'frames', 'stride', 'cols', 'tile', 'scene', 'view', 'start'];
+const params = {};
+for (const [k, v] of q) if (!reserved.includes(k)) params[k] = Number(v);
+
+try {
+  const canvas = document.getElementById('c');
+  const rows = Math.ceil(frames / cols);
+  canvas.width = cols * tile;
+  canvas.height = rows * tile;
+  const glc = new GLContext(canvas, { preserveDrawingBuffer: true });
+  const scene = buildScene(SCENES2D[sceneName], N);
+  const runner = new Runner(glc, 2, scene, params);
+  const sim = runner.sim;
+
+  const view = glc.program('view', `${header(2, glc.floatLinear)}
+uniform Grid G;
+uniform sampler2D uRho, uLiq, uSdf, uVel, uP;
+uniform vec4 uRect;
+uniform int uView;
+out vec4 o;
+vec3 ramp(float r) {
+  if (r <= 0.0005) return vec3(0.0);
+  if (r < 0.5) return mix(vec3(0.10, 0.0, 0.16), vec3(0.85, 0.15, 0.75), r / 0.5);
+  if (r <= 1.0) return mix(vec3(0.0, 0.15, 0.75), vec3(0.85, 0.97, 1.0), (r - 0.5) / 0.5);
+  if (r <= 1.03) return vec3(0.85, 0.97, 1.0);
+  return mix(vec3(1.0, 0.95, 0.2), vec3(1.0, 0.1, 0.0), clamp(r - 1.0, 0.0, 1.0));
+}
+void main() {
+  vec2 uv = (gl_FragCoord.xy - uRect.xy) / uRect.zw;
+  vec3 x = vec3(uv * vec2(G.n.xy), 0.5);
+  ivec3 c = ivec3(floor(x));
+  vec3 col;
+  if (uView == 0) col = ramp(0.5 - fetchC(uLiq, G, c).r);
+  else if (uView == 1) { float g = fetchC(uRho, G, c).g; col = vec3(0.5) + vec3(1.0, 0.0, -1.0) * (g - 1.0) * 2.0; }
+  else if (uView == 2) col = vec3(fetchC(uP, G, c).r * 0.01);
+  else { vec3 v = fetchC(uVel, G, c).xyz; col = vec3(0.5) + vec3(v.x, v.y, 0.0) * 0.02; }
+  if (sampleFast(uSdf, G, x).w < 0.0) col = vec3(0.32);
+  if (uv.x < 0.004 || uv.y < 0.004) col = vec3(0.0);
+  o = vec4(col, 1.0);
+}`);
+  const fmt = (s) => `step ${String(s.frame).padStart(4)} t=${s.time.toFixed(2)}s  mass ${(s.massRatio * 100).toFixed(5)}%  vol ${(s.volumeRatio * 100).toFixed(1)}%` +
+    `  gamma [${s.gammaMin.toFixed(3)}, ${s.gammaMax.toFixed(3)}]  rho'max ${s.maxRhoP.toFixed(2)}  CFL ${s.cfl.toFixed(2)}  res ${s.residual.toExponential(1)}`;
+  const advance = async (n) => {
+    for (let i = 0; i < n; i++) {
+      runner.step();
+      if (runner.bodies.length) await new Promise((r) => setTimeout(r, 0));   // let force readbacks land
+    }
+  };
+  await advance(start);
+  for (let f = 0; f < frames; f++) {
+    if (f > 0) await advance(stride);
+    const cx = f % cols;
+    const cy = rows - 1 - Math.floor(f / cols);
+    console.log(fmt(sim.measureSync()));
+    glc.draw(view, null, { G: sim.grid, uRho: sim.rho, uLiq: sim.liq, uSdf: sim.T.sdf, uVel: sim.vel, uP: sim.pressure,
+      uRect: [cx * tile * scene.nx / Math.max(scene.nx, scene.ny), cy * tile, tile * scene.nx / Math.max(scene.nx, scene.ny), tile * scene.ny / Math.max(scene.nx, scene.ny)],
+      uView: Number(q.get('view') || 0) },
+    { viewport: [cx * tile, cy * tile, tile, tile] });
+  }
+  glc.finish();
+  window.__done = true;
+} catch (e) {
+  console.log(String(e.stack || e));
+  window.__error = String(e.message || e);
+}
+</script>

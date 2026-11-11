@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>basic 3D test</title>
+<style>body{margin:0;background:#000} canvas{display:block}</style>
+<canvas id="c" width="1024" height="512"></canvas>
+<script type="module">
+// Runs a 3D scene headlessly, prints conservation statistics and timings, and draws the raw
+// density atlas (all z-slices side by side) with the diagnostic colour map.
+import { GLContext } from '../src/gl.js';
+import { Runner } from '../src/runner.js';
+import { header } from '../src/shaders/common.js';
+import { SCENES3D, buildScene3D } from '../src/scenes3d.js';
+const q = new URLSearchParams(location.search);
+const N = Number(q.get('n') || 32);
+const steps = Number(q.get('steps') || 60);
+const every = Number(q.get('every') || 20);
+const params = {};
+for (const [k, v] of q) if (!['n', 'steps', 'every', 'scene'].includes(k)) params[k] = Number(v);
+try {
+  const canvas = document.getElementById('c');
+  const glc = new GLContext(canvas, { preserveDrawingBuffer: true });
+  const scene = buildScene3D(SCENES3D[q.get('scene') || 'damBreak'], N);
+  const t00 = performance.now();
+  const runner = new Runner(glc, 3, scene, params);
+  const sim = runner.sim;
+  glc.finish();
+  console.log(`grid ${sim.grid.n.join('x')} (${sim.grid.cells} cells), atlas ${sim.grid.w}x${sim.grid.h}, ${sim.levels.length} levels, setup ${(performance.now() - t00).toFixed(0)} ms`);
+  const fmt = (s) => `step ${String(s.frame).padStart(4)}  mass ${(s.massRatio * 100).toFixed(5)}%  vol ${(s.volumeRatio * 100).toFixed(1)}%` +
+    `  gamma [${s.gammaMin.toFixed(3)}, ${s.gammaMax.toFixed(3)}]  rho'max ${s.maxRhoP.toFixed(2)}  CFL ${s.cfl.toFixed(2)}  res ${s.residual.toExponential(1)}`;
+  console.log(fmt(sim.measureSync()));
+  let tSim = 0;
+  for (let i = 1; i <= steps; i++) {
+    const t0 = performance.now();
+    runner.step();
+    glc.finish();
+    tSim += performance.now() - t0;
+    if (runner.bodies.length) await new Promise((r) => setTimeout(r, 0));
+    if (i % every === 0 || i === steps) console.log(fmt(sim.measureSync()));
+  }
+  console.log(`${(tSim / steps).toFixed(2)} ms per step, ${(glc.passCount / steps).toFixed(0)} passes per step`);
+  const view = glc.program('atlas', `${header(3, glc.floatLinear)}
+uniform sampler2D uLiq; uniform vec2 uRes; out vec4 o;
+vec3 ramp(float r) {
+  if (r <= 0.0005) return vec3(0.0);
+  if (r < 0.5) return mix(vec3(0.10, 0.0, 0.16), vec3(0.85, 0.15, 0.75), r / 0.5);
+  if (r <= 1.03) return mix(vec3(0.0, 0.15, 0.75), vec3(0.85, 0.97, 1.0), clamp((r - 0.5) / 0.5, 0.0, 1.0));
+  return mix(vec3(1.0, 0.95, 0.2), vec3(1.0, 0.1, 0.0), clamp(r - 1.0, 0.0, 1.0));
+}
+void main() { vec2 l = texture(uLiq, gl_FragCoord.xy / uRes).rg; o = vec4(l.g <= 0.0 ? vec3(0.3) : ramp(0.5 - l.r), 1.0); }`);
+  glc.draw(view, null, { uLiq: sim.liq, uRes: [canvas.width, canvas.height] });
+  window.__done = true;
+} catch (e) { console.log(String(e.stack || e)); window.__error = String(e.message || e); }
+</script>

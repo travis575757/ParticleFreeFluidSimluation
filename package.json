@@ -1,0 +1,14 @@
+{
+  "name": "masscon-fluid",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser GPU reimplementation of Chentanez & Mueller, Mass-Conserving Eulerian Liquid Simulation (SCA 2012)",
+  "type": "module",
+  "scripts": {
+    "serve": "node tools/serve.mjs",
+    "test": "node tools/interact.mjs 2d && node tools/interact.mjs 3d"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.17.0"
+  }
+}
