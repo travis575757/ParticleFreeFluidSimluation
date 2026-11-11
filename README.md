@@ -3,11 +3,35 @@
 A browser implementation of
 
 > N. Chentanez, M. Müller. *Mass-Conserving Eulerian Liquid Simulation.*
-> ACM SIGGRAPH / Eurographics Symposium on Computer Animation, 2012. (`masscon_sca.pdf`)
+> ACM SIGGRAPH / Eurographics Symposium on Computer Animation, 2012.
 
 in 2D and 3D. The whole solver runs on the GPU as WebGL2 shader passes over float textures
 (about 190–215 passes per time step). JavaScript only sequences the passes, integrates the
 few rigid bodies and sums a small reduced texture for the on-screen statistics.
+
+![3D simulator: dam break in a 192×96×96 tank](docs/screenshots/app-3d.png)
+
+## Screenshots
+
+3D (`3d.html`): the liquid surface is ray-marched from the density field.
+
+| | | |
+|:-:|:-:|:-:|
+| ![Dam break hitting the far wall](docs/screenshots/3d-dam-break.png) | ![Crown splash](docs/screenshots/3d-crown.png) | ![Floating rigid bodies](docs/screenshots/3d-floaters.png) |
+| Dam break, 256×128×128, t = 1.5 s | Ball dropped into a pool, 96³, t = 0.5 s | Rigid bodies of different densities, 144×96×96 |
+| ![Flow around a moving sphere](docs/screenshots/3d-obstacle.png) | ![Density volume rendering](docs/screenshots/3d-volume.png) | |
+| Fast moving obstacle, 192×96×96 | The density field itself (volume view), dam break | |
+
+2D (`2d.html`), 256² grids:
+
+| | | | |
+|:-:|:-:|:-:|:-:|
+| ![2D dam break](docs/screenshots/2d-dam-break.png) | ![Rotating paddle](docs/screenshots/2d-mixer.png) | ![Liquid ball hitting a pool](docs/screenshots/2d-splash.png) | ![Speed view](docs/screenshots/2d-speed.png) |
+| Dam break | Rotating paddle | Ball into pool | Dam break, speed view |
+
+![2D simulator: rigid bodies falling into a pool](docs/screenshots/app-2d.png)
+
+The pictures are produced from the real apps by `node tools/screenshots.mjs`.
 
 ## Run
 
@@ -151,15 +175,80 @@ These are interpretations, not things the paper states. Each was decided by expe
   therefore contracted with a negative artificial divergence, the mirror image of the paper's
   ρ′ > 1 term. With it the same run stays at 96–101 %. Switch it off to see the method exactly
   as published.
-* **Two-way rigid bodies.** The paper couples solids to the liquid one way. Bodies here also
-  feel the liquid: pressure force and torque are integrated over each body on the GPU, read
-  back asynchronously, and applied one step late with an added-mass term, a force cap and
-  liquid-relative drag for stability. Contacts between bodies and with walls are solved with
-  sequential impulses. Within 1.5 cells of another solid the liquid may stop a body's approach
-  and carry it, but not push it away harder than that: the stiff force of a squeezed film
-  arrives after the contact has already stopped the body and would otherwise throw it back.
-  This is a plausible game-style coupling, not a strongly coupled solve as in [BBB07].
+* **Two-way rigid bodies.** The paper couples solids to the liquid one way; bodies here also
+  feel the liquid. The next section describes how.
 * **Rendering.** The surface is ray-marched instead of meshed with marching cubes.
+
+## Rigid bodies
+
+No physics library is used. The rigid bodies are a small solver in `src/bodies.js` that runs
+in JavaScript on the CPU (a scene holds at most 12 solids, container included); everything
+that touches grid cells stays in shaders.
+
+**State and shapes.** A body is a ball or a (rounded) box with a position, an orientation
+quaternion, a linear and an angular velocity, and a density relative to the liquid. Shapes are
+analytic signed distance functions, the same primitives the liquid solver rasterises. A 2D
+body is the same object restricted to the plane (rotation about z only). Scripted obstacles
+(paddle, moving sphere) and the container are bodies of infinite mass whose velocity is the
+finite difference of their scripted position.
+
+**One time step** (`Runner.step`):
+
+1. Scripted obstacles and the container move to their position at t + Δt.
+2. `stepBodies` advances the dynamic bodies, using the liquid force measured after the
+   previous liquid step: velocities first, then positions (semi-implicit Euler; the
+   orientation is rotated by ω Δt), then contacts.
+3. The liquid step runs with the bodies at their new positions and velocities.
+4. The pressure of that step is integrated over every body on the GPU and read back for the
+   next step.
+
+**Body → liquid** is the paper's solid coupling (Sec. 3.6, 3.7). The `solid` pass turns all
+primitives into a solid distance, a solid velocity v + ω × r per face, face area fractions and
+cell volume fractions. The pressure solve takes the solid velocity as its boundary condition
+(variational discretisation, separating boundaries), so a moving body pushes liquid aside and
+drags it along, and density that ends up inside a solid is pushed out.
+
+**Liquid → body** is not in the paper. The `bodyForce` pass draws one point per cell; cells
+within 1.5 cells of a body's surface evaluate −p ∇W, where W is that body's own non-solid
+volume fraction, so ∇W is the discrete surface normal times area of the pressure
+discretisation. Force, torque r × f, the wet fraction of the surface and the mean liquid
+velocity next to the body are summed by additive blending into one texel per body and read
+back through a pixel-pack buffer and a fence, without stalling the GPU. Buoyancy is not a
+separate formula: it is what the hydrostatic part of the pressure integrates to.
+
+The force arrives one step late, and an explicit, lagged pressure force is unstable for
+bodies lighter than the liquid they displace. It is therefore conditioned before use:
+
+* a low-pass filter (half of the new value per step);
+* an added-mass term treated implicitly, a = (g + a_p + r a_prev) / (1 + r) with
+  r = 1.5 · max(wet, 0.3) / density, which stands in for the liquid the body has to
+  accelerate with it;
+* a cap at 3 g / min(density, 1), with the torque scaled by the same factor, so that a late
+  impact spike cannot catapult a light body;
+* next to another solid (within 1.5 cells) the liquid may stop a body's approach and carry
+  its weight, but not push it away harder than that: the stiff force of a squeezed film
+  arrives after the contact has already stopped the body and would otherwise throw it back;
+* quadratic and linear drag relative to the surrounding liquid and damping of the spin
+  (both unconditionally stable), because the inviscid solver exerts no shear on a body.
+
+**Contacts** are found by testing sample points on each body's surface (16 in 2D, 26 in 3D:
+for a box its corners, edge midpoints and face centres) against the distance functions of
+the container, the scripted obstacles and the other bodies. The deepest point is pushed out along the normal
+(80 % per step, shared by inverse mass). Velocities are corrected with sequential impulses
+(projected Gauss–Seidel, 10 iterations): one non-penetration constraint per touching point
+with an accumulated, non-negative normal impulse, and Coulomb friction (μ = 0.4) limited by
+it. A contact only bounces (restitution 0.25) if the approach speed before this step's
+forces exceeds 8 cells/s, so a body lying on the floor ends the step exactly at rest; any
+residual velocity would be seen by the liquid as a moving wall and pump it.
+
+**Mouse.** A grabbed body is driven towards the pointer with a limited velocity and still
+takes part in contacts, so it cannot be pulled through a wall; on release it keeps its
+velocity and can be thrown.
+
+This is a partitioned, explicit coupling, not a strongly coupled solve with the bodies inside
+the pressure system as in [BBB07]; the consequences are listed under the limitations below.
+Because contacts use surface sample points, two boxes meeting edge to edge between sample
+points can interpenetrate slightly before the contact is seen.
 
 ## Known limitations
 
@@ -192,18 +281,21 @@ src/bodies.js                  rigid bodies and contacts
 src/render2d.js, render3d.js   renderers
 src/scenes2d.js, scenes3d.js   scenarios
 tests/, tools/                 headless diagnostics and interaction checks (puppeteer-core)
-references/                    the eight papers the method builds on
+docs/screenshots/              the pictures above (tools/screenshots.mjs regenerates them)
 ```
 
-## References (in `references/`)
+## References
+
+The papers are not part of this repository. Links go to the authors' own copies where one
+could be confirmed.
 
 | Key | Paper |
 |---|---|
-| MMTD07 | Mullen, McKenzie, Tong, Desbrun. A Variational Approach to Eulerian Geometry Processing. SIGGRAPH 2007 |
+| MMTD07 | Mullen, McKenzie, Tong, Desbrun. [A Variational Approach to Eulerian Geometry Processing](http://www.geometry.caltech.edu/pubs/MMTD07.pdf). SIGGRAPH 2007 |
 | LGF11 | Lentine, Grétarsson, Fedkiw. An Unconditionally Stable Fully Conservative Semi-Lagrangian Method. JCP 2011 |
-| LAF11 | Lentine, Aanjaneya, Fedkiw. Mass and Momentum Conservation for Fluid Simulation. SCA 2011 |
-| CM11a | Chentanez, Müller. A Multigrid Fluid Pressure Solver Handling Separating Solid Boundary Conditions. SCA 2011 |
-| CM11b | Chentanez, Müller. Real-Time Eulerian Water Simulation Using a Restricted Tall Cell Grid. SIGGRAPH 2011 |
-| BBB07 | Batty, Bertails, Bridson. A Fast Variational Framework for Accurate Solid-Fluid Coupling. SIGGRAPH 2007 |
+| LAF11 | Lentine, Aanjaneya, Fedkiw. [Mass and Momentum Conservation for Fluid Simulation](https://pages.cs.wisc.edu/~aanjneya/papers/MMCFS/conservative_fluids.pdf). SCA 2011 |
+| CM11a | Chentanez, Müller. [A Multigrid Fluid Pressure Solver Handling Separating Solid Boundary Conditions](https://matthias-research.github.io/pages/publications/separatingBoundaries.pdf). SCA 2011 |
+| CM11b | Chentanez, Müller. [Real-Time Eulerian Water Simulation Using a Restricted Tall Cell Grid](https://matthias-research.github.io/pages/publications/tallCells.pdf). SIGGRAPH 2011 |
+| BBB07 | Batty, Bertails, Bridson. [A Fast Variational Framework for Accurate Solid-Fluid Coupling](https://www.cs.ubc.ca/labs/imager/tr/2007/Batty_VariationalFluids/variationalFluids.pdf). SIGGRAPH 2007 |
 | ENGF03 | Enright, Nguyen, Gibou, Fedkiw. Using the Particle Level Set Method and a Second Order Accurate Pressure Boundary Condition for Free Surface Flows. FEDSM 2003 |
-| JRW07 | Jeong, Whitaker. A Fast Iterative Method for a Class of Hamilton-Jacobi Equations on Parallel Systems. Utah TR UUCS-07-010 |
+| JRW07 | Jeong, Whitaker. [A Fast Iterative Method for a Class of Hamilton-Jacobi Equations on Parallel Systems](https://www-old.cs.utah.edu/docs/techreports/2007/pdf/UUCS-07-010.pdf). Utah TR UUCS-07-010 |
