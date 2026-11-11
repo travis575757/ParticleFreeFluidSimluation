@@ -456,13 +456,16 @@ export class FluidSim {
         { G, uP: this.levels[0].p[0], uLiq: this.levels[0].liq, uVel: T.vel[0], uSlots: MAX_PRIMS, ...packPrims(prims, 'B', this.dim) },
         G.cells, { clear: true });
       const [a, b, c] = await Promise.all(T.force.map((tex) => glc.readAsync(tex)));
+      // the weights are sums of O(1) terms: "none" is tested against a threshold because some
+      // browsers return zeros with their last bits flipped (see GLContext._testReadback)
+      const NONE = 1e-6;
       return prims.map((_, i) => {
         const w = c[4 * i + 3];
         return {
           force: [a[4 * i], a[4 * i + 1], a[4 * i + 2]],
           torque: [b[4 * i], b[4 * i + 1], b[4 * i + 2]],
-          wet: a[4 * i + 3] > 0 ? b[4 * i + 3] / a[4 * i + 3] : 0,
-          fluidVel: w > 0 ? [c[4 * i] / w, c[4 * i + 1] / w, c[4 * i + 2] / w] : [0, 0, 0],
+          wet: a[4 * i + 3] > NONE ? b[4 * i + 3] / a[4 * i + 3] : 0,
+          fluidVel: w > NONE ? [c[4 * i] / w, c[4 * i + 1] / w, c[4 * i + 2] / w] : [0, 0, 0],
         };
       });
     } finally {

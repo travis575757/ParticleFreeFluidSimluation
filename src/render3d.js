@@ -440,7 +440,7 @@ void main() {
 
   /** Distance along a ray to the liquid surface (asynchronous 1-pixel readback); -1 if none. */
   async pick(runner, origin, dir) {
-    if (this.pickBusy || !this.vol) return null;
+    if (this.pickBusy || !this.vol || this.glc.readback === 'scrambled') return null;
     this.pickBusy = true;
     try {
       this.glc.draw(this.pPick, this.pickTex, { ...this._volumeUniforms(runner, this.vol), uRo: origin, uRd: dir });

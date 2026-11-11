@@ -19,6 +19,21 @@ node tools/serve.mjs          # or: python3 -m http.server 8080
 ES modules do not load from `file://`, so the folder has to be served. Requirements: WebGL2
 with `EXT_color_buffer_float`, `EXT_float_blend`, `OES_texture_float_linear`.
 
+Tested in Chrome 154, Firefox 159 and LibreWolf 156 (Linux, NVIDIA). Two things differ in the
+Firefox family:
+
+* Firefox refuses a draw call with more than 30 million vertices
+  (`webgl.max-vert-ids-per-draw`) and only says so in the console. The scatter passes of the
+  256×128×128 grid have 33.5 million points, so they are drawn in pieces of 2²⁴
+  (`GLContext.scatter`); before that the conservative advection silently did nothing at that
+  resolution and the liquid lost mass and blew up within a second. The first step on every
+  new grid now also checks `gl.getError()` and stops with a message if a pass was refused.
+* With `privacy.resistFingerprinting` on (the default in LibreWolf) every read-back from the
+  GPU returns random numbers. The apps test this at start-up and say so: the liquid still
+  runs, but the statistics, the liquid's force on rigid bodies and 3D picking are switched
+  off. With that setting off LibreWolf still flips the last bits of some values that are read
+  back, which is harmless here.
+
 WebGL2 was chosen over WebGPU because WebGPU has no adapter in stock Chrome 154 on
 Linux/NVIDIA (it needs three launch flags), while WebGL2 is hardware accelerated out of the box.
 
@@ -74,8 +89,11 @@ Chrome 154, RTX 3090, default settings unless stated.
 
 Reproduce with the pages in `tests/` through `node tools/run.mjs <page>` (`still2d.html` runs
 any 2D scene for a long time and reports rest, residuals and rigid body motion, `body2d.html`
-drops one body into a pool) and with `node tools/interact.mjs 2d|3d`, which drives the real
-apps with synthetic mouse input.
+drops one body into a pool, `glinfo.html` prints the browser's WebGL2 limits and whether
+float read-back is exact) and with `node tools/interact.mjs 2d|3d`, which drives the real
+apps with synthetic mouse input. Both tools take `--browser chrome|firefox|librewolf`;
+`npm test` runs the interaction checks in Chrome, `npm run test:firefox` and
+`npm run test:librewolf` in the other two.
 
 ## Where the paper leaves a choice open
 
@@ -145,8 +163,8 @@ These are interpretations, not things the paper states. Each was decided by expe
 
 ## Known limitations
 
-* Verified in Chrome 154 on Linux with an NVIDIA GPU only. Firefox could not be launched
-  headlessly here and is untested.
+* Verified on Linux with an NVIDIA GPU only (Chrome 154, Firefox 159, LibreWolf 156). Firefox
+  has no GPU timer queries for WebGL2, so the step time read-out stays empty there.
 * Density below 0.5 ("mist") has no dynamics of its own: as in the paper it moves with velocity
   extrapolated from the nearest liquid, so spray can hang in the air until sharpening gathers it.
 * Two V-cycles per step leave a pressure residual around 1e-2 during violent motion; raise

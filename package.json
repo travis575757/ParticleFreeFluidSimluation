@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "serve": "node tools/serve.mjs",
-    "test": "node tools/interact.mjs 2d && node tools/interact.mjs 3d"
+    "test": "node tools/interact.mjs 2d && node tools/interact.mjs 3d",
+    "test:firefox": "node tools/interact.mjs 2d --browser firefox && node tools/interact.mjs 3d --browser firefox",
+    "test:librewolf": "node tools/interact.mjs 2d --browser librewolf && node tools/interact.mjs 3d --browser librewolf"
   },
   "devDependencies": {
     "puppeteer-core": "^25.17.0"

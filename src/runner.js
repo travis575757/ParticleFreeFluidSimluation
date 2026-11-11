@@ -93,6 +93,7 @@ export class Runner {
 
     sim.step();
     this.time = t1;
+    if (!this._checked) { this._checked = true; this.glc.checkErrors(`the first step on a ${sim.grid.n.slice(0, dim).join('x')} grid`); }
     // resolves once the liquid forces of this step have arrived (within a frame in the apps;
     // tests await it so that their timing matches a real-time run)
     this.forcesReady = this._requestForces(dt);
@@ -100,7 +101,8 @@ export class Runner {
 
   _requestForces(dt) {
     const dyn = this.bodies.filter((b) => !b.kinematic);
-    if (!dyn.length) return Promise.resolve();
+    // without usable read-back the bodies only feel gravity and contacts
+    if (!dyn.length || this.glc.readback === 'scrambled') return Promise.resolve();
     return this.sim.measureBodyForces(dyn.map((b) => b.prim())).then((res) => {
       if (!res) return;
       dyn.forEach((b, i) => {

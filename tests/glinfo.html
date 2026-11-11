@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGL2 environment</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// Prints what the browser's WebGL2 offers and checks the few things the solver relies on beyond
+// the specification's minimum: float render targets, float blending, exact float readback.
+try {
+  const gl = document.getElementById('c').getContext('webgl2', { antialias: false });
+  if (!gl) throw new Error('no WebGL2 context');
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  console.log('userAgent: ' + navigator.userAgent);
+  console.log('renderer: ' + (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)));
+  console.log('version: ' + gl.getParameter(gl.VERSION) + ' | ' + gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
+  for (const e of ['EXT_color_buffer_float', 'EXT_float_blend', 'OES_texture_float_linear', 'EXT_disjoint_timer_query_webgl2'])
+    console.log(`${e}: ${gl.getExtension(e) ? 'yes' : 'NO'}`);
+  for (const k of ['MAX_TEXTURE_SIZE', 'MAX_3D_TEXTURE_SIZE', 'MAX_DRAW_BUFFERS', 'MAX_COLOR_ATTACHMENTS', 'MAX_ELEMENTS_VERTICES', 'MAX_VERTEX_TEXTURE_IMAGE_UNITS'])
+    console.log(`${k}: ${gl.getParameter(gl[k])}`);
+  console.log('ALIASED_POINT_SIZE_RANGE: ' + [...gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)]);
+  // read-back: a float texture with known contents, read synchronously and through a pixel-pack buffer
+  gl.getExtension('EXT_color_buffer_float');
+  const W = 64, H = 8, src = new Float32Array(W * H * 4);
+  for (let i = 0; i < src.length; i++) src[i] = Math.sin(i * 12.9898) * 1e3 + i;
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, H, 0, gl.RGBA, gl.FLOAT, src);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  const diff = (out) => {
+    let n = 0, worst = 0, first = null;
+    for (let i = 0; i < src.length; i++) if (out[i] !== src[i]) { n++; const r = Math.abs(out[i] - src[i]) / Math.abs(src[i]); if (r > worst) worst = r; first ??= `[${i}] ${src[i]} -> ${out[i]}`; }
+    return n ? `${n} of ${src.length} values differ, largest relative change ${worst.toExponential(1)}, first ${first}` : 'exact';
+  };
+  const sync = new Float32Array(src.length);
+  gl.readPixels(0, 0, W, H, gl.RGBA, gl.FLOAT, sync);
+  console.log('readPixels (float, synchronous): ' + diff(sync));
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buf);
+  gl.bufferData(gl.PIXEL_PACK_BUFFER, src.byteLength, gl.STREAM_READ);
+  gl.readPixels(0, 0, W, H, gl.RGBA, gl.FLOAT, 0);
+  gl.finish();
+  const packed = new Float32Array(src.length);
+  gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, packed);
+  console.log('readPixels (float, pixel-pack buffer): ' + diff(packed));
+  console.log('getError: ' + gl.getError());
+  // the same question for an ordinary 2D canvas and for 8-bit WebGL read-back
+  const c2 = document.createElement('canvas'); c2.width = c2.height = 32;
+  const cx = c2.getContext('2d');
+  const img = cx.createImageData(32, 32);
+  for (let i = 0; i < img.data.length; i++) img.data[i] = i % 4 === 3 ? 255 : (i * 37) & 255;
+  cx.putImageData(img, 0, 0);
+  const back = cx.getImageData(0, 0, 32, 32).data;
+  let n2 = 0; for (let i = 0; i < back.length; i++) if (back[i] !== img.data[i]) n2++;
+  console.log('2D canvas getImageData: ' + (n2 ? `${n2} of ${back.length} bytes differ` : 'exact'));
+  window.__done = true;
+} catch (e) {
+  console.log(String(e.stack || e));
+  window.__error = String(e.message || e);
+}
+</script>

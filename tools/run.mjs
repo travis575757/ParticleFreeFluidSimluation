@@ -2,12 +2,13 @@
 // same WebGL2 backend a normal Chrome window uses here), relays console output, waits for
 // `window.__done`, and optionally saves screenshots.
 //
-//   node tools/run.mjs <page> [--shot out.png] [--timeout ms] [--size WxH] [--eval "js"] [--headed]
-import puppeteer from 'puppeteer-core';
+//   node tools/run.mjs <page> [--shot out.png] [--timeout ms] [--size WxH] [--eval "js"] [--headed] [--port n]
+//                            [--browser chrome|firefox|librewolf] [--pref name=value ...]
 import { startServer } from './serve.mjs';
+import { launch, browserArgs } from './browser.mjs';
 
 const args = process.argv.slice(2);
-const page_ = args.find((a) => !a.startsWith('--')) || 'index.html';
+const page_ = args.find((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--') && !['--headed'].includes(args[i - 1]))) || 'index.html';
 const opt = (name, def) => {
   const i = args.indexOf('--' + name);
   return i >= 0 ? args[i + 1] : def;
@@ -15,15 +16,9 @@ const opt = (name, def) => {
 const flag = (name) => args.includes('--' + name);
 const [W, H] = opt('size', '1000x800').split('x').map(Number);
 const timeout = Number(opt('timeout', 60000));
-const server = await startServer(0);
+const server = await startServer(Number(opt('port', 0)));
 const port = server.address().port;
-const browser = await puppeteer.launch({
-  executablePath: process.env.CHROME || '/usr/bin/google-chrome',
-  headless: !flag('headed'),
-  args: ['--no-first-run', '--use-gl=angle', '--use-angle=gl', '--ignore-gpu-blocklist', '--enable-gpu-rasterization',
-    '--disable-gpu-vsync', '--disable-frame-rate-limit', `--window-size=${W},${H}`],
-  defaultViewport: { width: W, height: H },
-});
+const browser = await launch({ ...browserArgs(args), width: W, height: H, unthrottled: true });
 let failed = false;
 try {
   const page = await browser.newPage();

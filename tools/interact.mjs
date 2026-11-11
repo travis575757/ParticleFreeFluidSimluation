@@ -1,20 +1,15 @@
 // Drives the real apps with synthetic mouse input and checks that every interaction does what
 // it says: push, pour, drain, spawn + drag bodies, orbit/zoom (3D), scene switching.
-//   node tools/interact.mjs [2d|3d] [--shots dir]
-import puppeteer from 'puppeteer-core';
+//   node tools/interact.mjs [2d|3d] [--shots dir] [--browser chrome|firefox|librewolf] [--pref name=value ...]
 import { startServer } from './serve.mjs';
+import { launch, browserArgs } from './browser.mjs';
 
 const which = process.argv[2] || '2d';
 const shotsIdx = process.argv.indexOf('--shots');
 const shots = shotsIdx > 0 ? process.argv[shotsIdx + 1] : null;
 const server = await startServer(0);
 const port = server.address().port;
-const browser = await puppeteer.launch({
-  executablePath: process.env.CHROME || '/usr/bin/google-chrome',
-  headless: true,
-  args: ['--no-first-run', '--use-gl=angle', '--use-angle=gl', '--ignore-gpu-blocklist', '--window-size=1280,800'],
-  defaultViewport: { width: 1280, height: 800 },
-});
+const browser = await launch({ ...browserArgs(process.argv), width: 1280, height: 800 });
 let failures = 0;
 const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`); if (!ok) failures++; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

@@ -10,6 +10,19 @@ const canvas = document.getElementById('view');
 const hud = document.getElementById('hud');
 const stage = document.getElementById('stage');
 
+// Non-fatal notice at the bottom of the view.
+function notice(msg) {
+  const e = document.getElementById('notice');
+  e.textContent = msg;
+  const close = document.createElement('button');
+  close.textContent = '×';
+  close.title = 'Dismiss';
+  close.addEventListener('click', () => { e.style.display = 'none'; });
+  e.append(close);
+  e.style.display = 'block';
+  window.__notice = msg;
+}
+
 function fail(msg) {
   const e = document.getElementById('error');
   e.style.display = 'grid';
@@ -274,7 +287,7 @@ function tick() {
       view: state.view, postProcess: state.postProcess,
       cursor: showCursor ? [pointer.pos[0], pointer.pos[1], brushCells() * (state.tool === 'push' ? 1.3 : 1), pointer.down ? 0.5 : 0.22] : [0, 0, 0, 0],
     });
-    if (frame % 6 === 0) runner.sim.measure().then(updateStats).catch(() => {});
+    if (frame % 6 === 0 && glc.readback !== 'scrambled') runner.sim.measure().then(updateStats).catch(() => {});
     const g = runner.sim.grid;
     hud.textContent = `${g.n[0]}×${g.n[1]}  t = ${runner.time.toFixed(2)} s${state.paused ? '  (paused)' : ''}\n${passesPerStep} GPU shader passes / step`;
     frame++;
@@ -294,6 +307,11 @@ try {
   window.runner = runner;
   fitCanvas();
   panel = buildPanel();
+  if (glc.readback === 'scrambled') {
+    notice('This browser returns random numbers when a page reads results back from the GPU (Firefox / LibreWolf with ' +
+      'privacy.resistFingerprinting on). The liquid is simulated and drawn as usual, but the statistics are unavailable, ' +
+      'rigid bodies do not feel the liquid. Turn that setting off in about:config and reload to get them back.');
+  }
   window.app = { state, loadScene, stepOnce, get runner() { return runner; } };
   requestAnimationFrame(tick);
 } catch (e) {

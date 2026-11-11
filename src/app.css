@@ -49,6 +49,33 @@ body {
   pointer-events: none;
   white-space: pre;
 }
+#notice {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: none;
+  max-width: min(64ch, calc(100% - 24px));
+  padding: 10px 34px 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--amber);
+  border-radius: 6px;
+  background: rgba(8, 11, 18, 0.9);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+#notice button {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+#notice button:hover, #notice button:focus-visible { color: var(--text); }
 #error {
   position: absolute;
   inset: 0;

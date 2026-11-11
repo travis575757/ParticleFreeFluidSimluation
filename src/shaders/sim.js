@@ -241,11 +241,13 @@ void main() {
   const scatterVS = (decl, body) => `${H}
 uniform Grid G;
 uniform sampler2D uSrc;    // xyz = deposit position, w = amount (meaning depends on the pass)
+uniform int uBase;         // index of the first point of this draw call (see GLContext.scatter)
 ${decl}
 out vec4 vVal;
 void main() {
-  int corner = gl_VertexID % NC;
-  int ci = gl_VertexID / NC;
+  int id = gl_VertexID + uBase;
+  int corner = id % NC;
+  int ci = id / NC;
   int aw = G.n.x * G.tx;
   ivec2 st = ivec2(ci % aw, ci / aw);
   vec4 src = texelFetch(uSrc, st, 0);
@@ -1028,6 +1030,7 @@ uniform sampler2D uP;
 uniform sampler2D uLiq;
 uniform sampler2D uVel;
 uniform float uSlots;
+uniform int uBase;
 ${prims('B')}
 out vec4 vA;   // xyz = pressure force, w = surface band weight
 out vec4 vB;   // xyz = torque, w = wet part of the band
@@ -1035,7 +1038,8 @@ out vec4 vC;   // xyz = liquid velocity summed over the wet band, w = its weight
 float vol(float d) { return clamp(0.5 + d, 0.0, 1.0); }
 void main() {
   int aw = G.n.x * G.tx;
-  ivec2 st = ivec2(gl_VertexID % aw, gl_VertexID / aw);
+  int id = gl_VertexID + uBase;
+  ivec2 st = ivec2(id % aw, id / aw);
   ivec3 c = cellOf(G, st);
   vec3 xc = cellPos(c, vec3(0.5));
   vec2 s = sdB(xc);

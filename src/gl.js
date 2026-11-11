@@ -35,6 +35,10 @@ export class GLContext {
     this.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
     this.timerExt = gl.getExtension('EXT_disjoint_timer_query_webgl2');
 
+    // points per draw call in scatter passes (a multiple of every stencil size, below every
+    // browser's per-draw limit)
+    this.maxPointsPerDraw = opts.maxPointsPerDraw || 1 << 24;
+
     this._fboCache = new Map();
     this._texId = 0;
     this.passCount = 0;
@@ -44,6 +48,29 @@ export class GLContext {
     gl.disable(gl.CULL_FACE);
     gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    this.readback = this._testReadback();
+  }
+
+  /**
+   * Reads a known float texture back and reports what arrived: 'exact', 'noisy' or 'scrambled'.
+   * Browsers with fingerprinting protection alter canvas data on its way to the page. LibreWolf
+   * always flips the last bits of some values (a few units in the last place: harmless here);
+   * with privacy.resistFingerprinting on, Firefox and LibreWolf return random numbers instead,
+   * and nothing that depends on read-back (statistics, forces on bodies, picking) can work.
+   */
+  _testReadback() {
+    const n = 16;
+    const src = new Float32Array(n * n * 4);
+    for (let i = 0; i < src.length; i++) src[i] = 1 + ((i * 7919) % 1024) / 8;
+    const t = this.texture(n, n, 'rgba32f', { data: src });
+    const out = this.read(t);
+    this.deleteTexture(t);
+    let worst = 0;
+    for (let i = 0; i < src.length; i++) {
+      const d = Math.abs(out[i] - src[i]) / src[i];
+      if (!(d <= worst)) worst = d;   // also catches NaN
+    }
+    return worst === 0 ? 'exact' : worst < 1e-5 ? 'noisy' : 'scrambled';
   }
 
   // ---- programs -----------------------------------------------------------
@@ -187,19 +214,45 @@ export class GLContext {
     this.passCount++;
   }
 
-  /** Additive point-scatter pass: `count` attribute-less points, positions from gl_VertexID. */
+  /**
+   * Additive point-scatter pass: `count` attribute-less points. The vertex shader takes the
+   * point's index from `gl_VertexID + uBase`: browsers cap the number of vertices in one draw
+   * call (Firefox at 30 million, and a larger draw is dropped with nothing but a console
+   * warning), so a large pass is drawn in pieces.
+   */
   scatter(p, target, uniforms, count, { clear = false } = {}) {
     const gl = this.gl;
     this._bindTarget(target);
     if (clear) { gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
     gl.useProgram(p.prog);
-    this._setUniforms(p, uniforms);
+    this._setUniforms(p, { ...uniforms, uBase: 0 });
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ONE, gl.ONE);
-    gl.drawArrays(gl.POINTS, 0, count);
+    const base = p.uniforms.get('uBase');
+    if (!base) throw new Error(`Program "${p.label}": a scatter pass needs "uniform int uBase"`);
+    for (let first = 0; first < count; first += this.maxPointsPerDraw) {
+      if (first > 0) gl.uniform1i(base.loc, first);
+      gl.drawArrays(gl.POINTS, 0, Math.min(this.maxPointsPerDraw, count - first));
+    }
     gl.disable(gl.BLEND);
     this.passCount++;
+  }
+
+  /**
+   * Throws if the context has recorded an error. WebGL drops a call it rejects and carries on,
+   * so a pass that the browser refuses would otherwise only show up as wrong physics. This is
+   * a synchronous round trip to the GPU process: call it once per set-up, not per frame.
+   */
+  checkErrors(where) {
+    const gl = this.gl;
+    const names = [];
+    for (let e = gl.getError(); e !== gl.NO_ERROR && names.length < 8; e = gl.getError()) {
+      if (e === gl.CONTEXT_LOST_WEBGL) { names.push('CONTEXT_LOST_WEBGL'); break; }
+      names.push(['INVALID_ENUM', 'INVALID_VALUE', 'INVALID_OPERATION', 'INVALID_FRAMEBUFFER_OPERATION', 'OUT_OF_MEMORY']
+        .find((n) => gl[n] === e) || '0x' + e.toString(16));
+    }
+    if (names.length) throw new Error(`WebGL reported ${[...new Set(names)].join(', ')} during ${where}; the browser console has the details.`);
   }
 
   clear(target, r = 0, g = 0, b = 0, a = 0) {

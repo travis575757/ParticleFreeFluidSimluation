@@ -15,10 +15,11 @@ const N = Number(q.get('n') || 32);
 const steps = Number(q.get('steps') || 60);
 const every = Number(q.get('every') || 20);
 const params = {};
-for (const [k, v] of q) if (!['n', 'steps', 'every', 'scene', 'bodies'].includes(k)) params[k] = Number(v);
+for (const [k, v] of q) if (!['n', 'steps', 'every', 'scene', 'bodies', 'points'].includes(k)) params[k] = Number(v);
 try {
   const canvas = document.getElementById('c');
-  const glc = new GLContext(canvas, { preserveDrawingBuffer: true });
+  // &points=K: at most K points per draw call in the scatter passes (default 2^24)
+  const glc = new GLContext(canvas, { preserveDrawingBuffer: true, maxPointsPerDraw: Number(q.get('points')) || undefined });
   const scene = buildScene3D(SCENES3D[q.get('scene') || 'damBreak'], N);
   const t00 = performance.now();
   const runner = new Runner(glc, 3, scene, params);
