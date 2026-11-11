@@ -58,10 +58,10 @@
   <div class="scroll">
   <table>
     <tr><th>Grid</th><th>Step time (RTX 3090)</th><th>Paper, Table 2 (GTX 680)</th></tr>
-    <tr><td class="n">128 × 128 (2D)</td><td class="n">≈ 1.1 ms</td><td class="n">–</td></tr>
-    <tr><td class="n">128 × 64 × 64</td><td class="n">3.1 ms</td><td class="n">26.7 ms (128 × 128 × 64)</td></tr>
-    <tr><td class="n">128 × 128 × 128</td><td class="n">9.8 ms</td><td class="n">53.4 – 54.2 ms</td></tr>
-    <tr><td class="n">256 × 128 × 128</td><td class="n">15.1 ms</td><td class="n">113.2 – 118.6 ms</td></tr>
+    <tr><td class="n">128 × 128 (2D)</td><td class="n">≈ 1.4 ms</td><td class="n">–</td></tr>
+    <tr><td class="n">128 × 64 × 64</td><td class="n">3.2 ms</td><td class="n">26.7 ms (128 × 128 × 64)</td></tr>
+    <tr><td class="n">128 × 128 × 128</td><td class="n">8.8 ms</td><td class="n">53.4 – 54.2 ms</td></tr>
+    <tr><td class="n">256 × 128 × 128</td><td class="n">18.0 ms</td><td class="n">113.2 – 118.6 ms</td></tr>
   </table>
   </div>
   <p style="margin-top:12px">Total mass drifts by only a few parts per million over hundreds of steps in every scene (32-bit float round-off), even at time steps where the liquid crosses more than ten cells per step. With plain semi-Lagrangian advection the same dam break loses 90&nbsp;% of its mass in ten seconds; you can switch between the two under <em>Solver</em>.</p>

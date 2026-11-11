@@ -1,0 +1,167 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>hydrostatic stability (2D)</title>
+<style>body{margin:0;background:#111} canvas{display:block}</style>
+<canvas id="c" width="768" height="768"></canvas>
+<script type="module">
+// Long-run check of a scene that should stay at rest: tracks the liquid speed, the height of the
+// 0.5 iso-contour per column and air cells trapped below the surface.
+//   ?scene=still&n=128&steps=6000&every=500&p.<param>=..   &profile=1 prints the column heights
+//   &dump=x0,y0,w,h prints fields of that window at the end
+//   &bodies=1 prints how far each rigid body moved between samples   &summary=1 prints one line
+import { GLContext } from '../src/gl.js';
+import { Runner } from '../src/runner.js';
+import { SCENES2D, buildScene } from '../src/scenes2d.js';
+import { Renderer2D } from '../src/render2d.js';
+
+const q = new URLSearchParams(location.search);
+const N = Number(q.get('n') || 128);
+const steps = Number(q.get('steps') || 3000);
+const every = Number(q.get('every') || 250);
+const overrides = {};
+for (const [k, v] of q) if (k.startsWith('p.')) overrides[k.slice(2)] = Number(v);
+
+try {
+  const canvas = document.getElementById('c');
+  const glc = new GLContext(canvas, { preserveDrawingBuffer: true });
+  const scene = buildScene(SCENES2D[q.get('scene') || 'still'], N);
+  const runner = new Runner(glc, 2, scene, overrides);
+  const sim = runner.sim;
+  const g = sim.grid;
+  const h = sim.params.h;
+
+  const surface = () => {
+    const rho = glc.read(sim.rho);
+    const liq = glc.read(sim.liq);
+    const vel = glc.read(sim.vel);
+    const rp = (x, y) => 0.5 - liq[(y * g.w + x) * 2];
+    const heights = [];
+    let pockets = 0, vmax = 0, vxmax = 0, vymax = 0, vmaxAt = null;
+    for (let x = 1; x < g.n[0] - 1; x++) {
+      let top = -1;
+      for (let y = g.n[1] - 2; y >= 1; y--) if (rp(x, y) >= 0.5) { top = y; break; }
+      if (top < 0) { heights.push(0); continue; }
+      const a = rp(x, top), b = rp(x, top + 1);
+      heights.push(top + 0.5 + (a - 0.5) / Math.max(a - b, 1e-6) - 1);   // cells above the floor
+      for (let y = 1; y < top; y++) if (rp(x, y) < 0.5) pockets++;
+      for (let y = 1; y <= top; y++) {
+        const u = vel[(y * g.w + x) * 4], v = vel[(y * g.w + x) * 4 + 1];
+        const s = Math.hypot(u, v);
+        if (s > vmax) { vmax = s; vmaxAt = [x, y]; }
+        vxmax = Math.max(vxmax, Math.abs(u)); vymax = Math.max(vymax, Math.abs(v));
+      }
+    }
+    // density statistics of the bulk (cells at least 4 below the lowest surface point)
+    const yTop = Math.floor(Math.min(...heights)) - 4;
+    let n = 0, sum = 0, sq = 0, bmin = Infinity, bmax = -Infinity;
+    for (let x = 1; x < g.n[0] - 1; x++) for (let y = 1; y <= yTop; y++) {
+      const r = rp(x, y); n++; sum += r; sq += r * r; bmin = Math.min(bmin, r); bmax = Math.max(bmax, r);
+    }
+    const bulk = n ? { mean: sum / n, std: Math.sqrt(Math.max(0, sq / n - (sum / n) ** 2)), min: bmin, max: bmax } : { mean: 0, std: 0, min: 0, max: 0 };
+    const mean = heights.reduce((s, v) => s + v, 0) / heights.length;
+    const lo = Math.min(...heights), hi = Math.max(...heights);
+    // roughness: mean |h[i] - (h[i-1]+h[i+1])/2|, i.e. the cell-to-cell (grid-frequency) part
+    let rough = 0;
+    for (let i = 1; i < heights.length - 1; i++) rough += Math.abs(heights[i] - 0.5 * (heights[i - 1] + heights[i + 1]));
+    rough /= heights.length - 2;
+    return { heights, mean, lo, hi, rough, pockets, vmax, vxmax, vymax, vmaxAt, rho, bulk };
+  };
+
+  const line = (s, f) => `t ${sim.time.toFixed(2).padStart(7)}s step ${String(sim.frame).padStart(5)}  mass ${(s.massRatio * 100).toFixed(4)}%  vol ${(s.volumeRatio * 100).toFixed(2)}%` +
+    `  height ${f.mean.toFixed(2)} [${f.lo.toFixed(2)}, ${f.hi.toFixed(2)}] rough ${f.rough.toFixed(4)}  pockets ${f.pockets}` +
+    `  bulk rho' ${f.bulk.mean.toFixed(3)} +-${f.bulk.std.toFixed(3)} [${f.bulk.min.toFixed(2)}, ${f.bulk.max.toFixed(2)}]` +
+    `  speed ${(f.vmax * h).toFixed(4)} m/s (${(f.vmax * sim.params.dt).toFixed(4)} c/step) at ${f.vmaxAt}   res ${s.residual.toExponential(1)}`;
+  console.log(`scene ${q.get('scene') || 'still'}  grid ${g.n[0]}x${g.n[1]}  h ${h.toFixed(4)} m  dt ${sim.params.dt.toFixed(5)}  ${JSON.stringify(overrides)}`);
+  console.log(line(sim.measureSync(), surface()));
+  let last;
+  const bodyStats = q.get('bodies') ? runner.bodies.map(() => ({ lo: Infinity, hi: -Infinity, v: 0 })) : null;
+  const summary = q.get('summary');
+  const agg = { resMax: 0, resSum: 0, n: 0, cflMax: 0, rhoMax: 0, massLo: 1, massHi: 1, bad: false };
+  for (let i = 1; i <= steps; i++) {
+    runner.step();
+    if (runner.bodies.length) await runner.forcesReady;   // as in the apps: forces arrive before the next step
+    if (bodyStats) for (const [k, b] of runner.bodies.entries()) {
+      const st = bodyStats[k];
+      st.lo = Math.min(st.lo, b.pos[1]); st.hi = Math.max(st.hi, b.pos[1]);
+      st.v = Math.max(st.v, Math.hypot(b.vel[0], b.vel[1]) * h);
+    }
+    if (i % every === 0 || i === steps) {
+      if (bodyStats) {
+        // per body since the last sample: range of the centre height [cells] and largest speed [m/s]
+        console.log('   bodies: ' + runner.bodies.map((b, k) => { const st = bodyStats[k]; const t = `d${b.density} y [${st.lo.toFixed(2)}, ${st.hi.toFixed(2)}] v ${st.v.toFixed(3)}`; bodyStats[k] = { lo: Infinity, hi: -Infinity, v: 0 }; return t; }).join(' | '));
+      }
+      const s = sim.measureSync();
+      if (!Number.isFinite(s.mass) || !Number.isFinite(s.maxSpeed)) agg.bad = true;
+      agg.resMax = Math.max(agg.resMax, s.residual); agg.resSum += s.residual; agg.n++;
+      agg.cflMax = Math.max(agg.cflMax, s.cfl); agg.rhoMax = Math.max(agg.rhoMax, s.maxRhoP);
+      agg.massLo = Math.min(agg.massLo, s.massRatio); agg.massHi = Math.max(agg.massHi, s.massRatio);
+      agg.vol = s.volumeRatio;
+      if (!summary) { last = surface(); console.log(line(s, last)); }
+      if (agg.bad && !summary) throw new Error('non-finite state');
+    }
+  }
+  if (summary) {
+    console.log(`SUMMARY ${agg.bad ? 'NON-FINITE' : 'ok'}  res max ${agg.resMax.toExponential(1)} mean ${(agg.resSum / agg.n).toExponential(1)}  CFL max ${agg.cflMax.toFixed(1)}` +
+      `  rho'max ${agg.rhoMax.toFixed(2)}  mass [${((agg.massLo - 1) * 1e6).toFixed(0)}, ${((agg.massHi - 1) * 1e6).toFixed(0)}] ppm  final vol ${(agg.vol * 100).toFixed(1)}%`);
+    last = surface();
+  }
+  if (q.get('solve')) {
+    // Convergence of V-cycles on the last step's system (same right-hand side), restarted from
+    // p = 0, for the current settings and for the variants listed in &variants=a:1,b:2;c:3
+    const K = Number(q.get('solve'));
+    const study = (label, change) => {
+      const saved = { ...sim.params };
+      Object.assign(sim.params, change);
+      sim._buildMatrix();
+      for (const L of sim.levels) { glc.clear(L.p[0]); glc.clear(L.p[1]); }
+      let ln = `V-cycles from p=0 [${label}]:`;
+      let prev = sim.measureSync().residual;
+      for (let i = 0; i < K; i++) {
+        sim._vcycle(0);
+        const r = sim.measureSync().residual;
+        ln += ` ${r.toExponential(1)}`;
+        prev = r;
+      }
+      console.log(ln);
+      Object.assign(sim.params, saved);
+    };
+    study('as run', {});
+    for (const v of (q.get('variants') || '').split(';').filter(Boolean)) {
+      study(v, Object.fromEntries(v.split(',').map((kv) => { const [k, val] = kv.split(':'); return [k, Number(val)]; })));
+    }
+  }
+  if (q.get('profile')) console.log('heights: ' + last.heights.map((v) => v.toFixed(2)).join(' '));
+  if (q.get('dump')) {
+    // &dump=x0,y0,w,h or &dump=auto,w,h (window centred on the fastest liquid cell)
+    let [x0, y0, w, hh] = q.get('dump').split(',').map(Number);
+    if (q.get('dump').startsWith('auto')) {
+      const f = surface();
+      [w, hh] = q.get('dump').split(',').slice(1).map(Number);
+      x0 = Math.max(0, Math.min(g.n[0] - w, f.vmaxAt[0] - (w >> 1)));
+      y0 = Math.max(0, Math.min(g.n[1] - hh, f.vmaxAt[1] - (hh >> 1)));
+      console.log(`fastest cell ${f.vmaxAt}; bodies: ` + runner.bodies.map((b) => `d${b.density} at ${b.pos[0].toFixed(2)},${b.pos[1].toFixed(2)} angle ${(2 * Math.atan2(b.quat[2], b.quat[3])).toFixed(3)} vel ${(b.vel[0] * sim.params.dt).toFixed(3)},${(b.vel[1] * sim.params.dt).toFixed(3)} c/step`).join(' | '));
+    }
+    const rd = (t) => ({ d: glc.read(t), ch: t.channels });
+    const F = { rho: rd(sim.rho), vel: rd(sim.vel), p: rd(sim.pressure), liq: rd(sim.liq), rhs: rd(sim.levels[0].rhs), frac: rd(sim.T.frac), W: rd(sim.levels[0].W) };
+    const at = (f, x, y, c) => f.d[(y * g.w + x) * f.ch + c];
+    const show = (name, f, c, digits = 3, scale = 1) => {
+      console.log(`-- ${name} (rows top to bottom, x=${x0}..${x0 + w - 1}, y=${y0 + hh - 1}..${y0})`);
+      for (let y = y0 + hh - 1; y >= y0; y--) {
+        let ln = '';
+        for (let x = x0; x < x0 + w; x++) ln += (at(f, x, y, c) * scale).toFixed(digits).padStart(digits + 6);
+        console.log(ln);
+      }
+    };
+    show('V', F.frac, 3); show('Wx', F.W, 0); show('Wy', F.W, 1); show('phi = 0.5 - rho\'', F.liq, 0);
+    show('rho', F.rho, 0); show('gamma', F.rho, 1); show('u*dt', F.vel, 0, 4, sim.params.dt); show('v*dt', F.vel, 1, 4, sim.params.dt);
+    show('p', F.p, 0, 1); show('rhs', F.rhs, 0, 4);
+  }
+  const renderer = new Renderer2D(glc);
+  renderer.render(runner, { view: q.get('view') || 'liquid', postProcess: false });
+  window.runner = runner;
+  window.__done = true;
+} catch (e) {
+  console.log(String(e.stack || e));
+  window.__error = String(e.message || e);
+}
+</script>

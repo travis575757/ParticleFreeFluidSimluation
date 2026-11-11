@@ -93,13 +93,15 @@ export class Runner {
 
     sim.step();
     this.time = t1;
-    this._requestForces(dt);
+    // resolves once the liquid forces of this step have arrived (within a frame in the apps;
+    // tests await it so that their timing matches a real-time run)
+    this.forcesReady = this._requestForces(dt);
   }
 
   _requestForces(dt) {
     const dyn = this.bodies.filter((b) => !b.kinematic);
-    if (!dyn.length) return;
-    this.sim.measureBodyForces(dyn.map((b) => b.prim())).then((res) => {
+    if (!dyn.length) return Promise.resolve();
+    return this.sim.measureBodyForces(dyn.map((b) => b.prim())).then((res) => {
       if (!res) return;
       dyn.forEach((b, i) => {
         if (!this.bodies.includes(b)) return;

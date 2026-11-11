@@ -19,7 +19,9 @@ export const DEFAULT_PARAMS = {
   advection: 1,          // 0 plain semi-Lagrangian (NOT conservative), 1 paper, 2 1/gamma row scale, 3 no gamma feedback
   traceSteps: 1,         // RK2 sub-steps per characteristic
   diffusionIters: 1,     // gamma diffusion sweeps per step ([LAF11] uses 1..7)
-  kappa: 0.5,            // exchange factor per sweep (0.5 = neighbours meet at their mean)
+  diffusionPairs: 1,     // 1 = pairwise exchange as in [LAF11] (two passes per axis), 0 = both neighbours at once (Jacobi)
+  diffusionLimit: 1,     // 1 = the exchange never moves liquid from an emptier cell into a fuller one
+  kappa: 0.5,            // exchange factor (0.5 = the pair meets at its mean; Jacobi needs <= 0.25)
 
   // sharpening (Sec. 3.5)
   sharpen: 1,
@@ -31,6 +33,7 @@ export const DEFAULT_PARAMS = {
   // solids (Sec. 3.6)
   S: 1,                  // excess density is moved S cells out of the solid
   vthr: 0.1,             // cells with less non-solid volume take rho' from their neighbours
+  closeSlivers: 1,       // faces between two such cells are closed (a sliver between two solids is not an air pocket)
 
   // pressure (Sec. 3.7)
   lambda: 0.5,
@@ -43,8 +46,7 @@ export const DEFAULT_PARAMS = {
   postSweeps: 2,
   coarseSweeps: 12,
   thetaMin: 0.01,        // ghost-fluid clamp
-  bubbleLevels: 99,      // "C" of [CM11a]: number of coarse levels on which a cell with any air child stays air
-  bubbleRule: 2,         // 1 = [CM11a] average of positive phi, 2 = keep the averaged interface position
+  airLeak: 1,            // coarse levels keep the p = 0 condition of air pockets that averaging phi erases
   pminLevels: 3,         // "S" of [CM11a]
 };
 
@@ -196,7 +198,7 @@ export class FluidSim {
 
   _updateSolids() {
     const { glc, prog: P, T, grid: G } = this;
-    glc.draw(P.solid, [T.sdf, T.us, T.frac, this.levels[0].W], { G, ...packPrims(this.solids, 'S', this.dim) });
+    glc.draw(P.solid, [T.sdf, T.us, T.frac, this.levels[0].W], { G, uVthr: this.params.closeSlivers ? this.params.vthr : 0, ...packPrims(this.solids, 'S', this.dim) });
   }
 
   _computeLiq() {
@@ -283,10 +285,14 @@ export class FluidSim {
       { G, ...tr, uRho: T.rho[0], uTraceTex: T.trace, uBeta: T.beta, uFrac: T.frac, uDt: dt });
     glc.scatter(P.scatterFwd, T.rho[1], { G, uSrc: T.fwd, uRho: T.rho[0], uFrac: T.frac }, count);
     this._swap(T.rho);
+    const pairs = p.diffusionPairs ? [0, 1] : [-1];
     for (let it = 0; it < p.diffusionIters; it++) {
       for (let axis = 0; axis < this.dim; axis++) {
-        glc.draw(P.diffuse, T.rho[1], { G, uRho: T.rho[0], uFrac: T.frac, uAxis: axis, uKappa: p.kappa });
-        this._swap(T.rho);
+        for (const pair of pairs) {
+          glc.draw(P.diffuse, T.rho[1],
+            { G, uRho: T.rho[0], uFrac: T.frac, uAxis: axis, uPair: pair, uLimit: p.diffusionLimit, uKappa: p.kappa });
+          this._swap(T.rho);
+        }
       }
     }
   }
@@ -352,17 +358,32 @@ export class FluidSim {
     this._smooth(l, p.postSweeps);
   }
 
+  /** Matrix coefficients on every level of the hierarchy, from the current liquid and solids. */
+  _buildMatrix() {
+    const { glc, prog: P, levels, params: p } = this;
+    const invThetaMax = 1 / p.thetaMin;
+    const L0 = levels[0];
+    // (the finer-level inputs are unused on level 0; any texture that is not a target of the pass will do)
+    glc.draw(P.coef, [L0.cA, L0.cB], {
+      G: L0.grid, uLiq: L0.liq, uW: L0.W, uInvThetaMax: invThetaMax,
+      uCoarse: 0, GF: L0.grid, uLiqF: L0.liq, uWF: L0.W, uCBF: L0.exB,
+    });
+    for (let l = 1; l < levels.length; l++) {
+      const L = levels[l];
+      const F = levels[l - 1];
+      glc.draw(P.downsample, [L.liq, L.W], { G: L.grid, GF: F.grid, uLiqF: F.liq, uWF: F.W });
+      glc.draw(P.coef, [L.cA, L.cB], {
+        G: L.grid, uLiq: L.liq, uW: L.W, uInvThetaMax: invThetaMax,
+        uCoarse: p.airLeak, GF: F.grid, uLiqF: F.liq, uWF: F.W, uCBF: F.cB,
+      });
+    }
+  }
+
   _project(dt) {
     const { glc, prog: P, T, levels, params: p } = this;
     const invThetaMax = 1 / p.thetaMin;
-    for (let l = 1; l < levels.length; l++) {
-      glc.draw(P.downsample, [levels[l].liq, levels[l].W], {
-        G: levels[l].grid, GF: levels[l - 1].grid, uLiqF: levels[l - 1].liq, uWF: levels[l - 1].W,
-        uBubbles: l <= p.bubbleLevels ? p.bubbleRule : 0,
-      });
-    }
-    for (const L of levels) glc.draw(P.coef, [L.cA, L.cB], { G: L.grid, uLiq: L.liq, uW: L.W, uInvThetaMax: invThetaMax });
     const L0 = levels[0];
+    this._buildMatrix();
     glc.draw(P.rhs, L0.rhs, {
       G: L0.grid, uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uSdf: T.sdf,
       uSrcScale: p.lambda / dt, uSrcMax: p.eta / dt, uSinkScale: p.compress / dt, uSinkMax: p.compressMax / dt,

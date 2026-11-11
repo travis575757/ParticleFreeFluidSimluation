@@ -6,7 +6,7 @@ A browser implementation of
 > ACM SIGGRAPH / Eurographics Symposium on Computer Animation, 2012. (`masscon_sca.pdf`)
 
 in 2D and 3D. The whole solver runs on the GPU as WebGL2 shader passes over float textures
-(about 160–210 passes per time step). JavaScript only sequences the passes, integrates the
+(about 190–215 passes per time step). JavaScript only sequences the passes, integrates the
 few rigid bodies and sums a small reduced texture for the on-screen statistics.
 
 ## Run
@@ -53,25 +53,29 @@ Chrome 154, RTX 3090, default settings unless stated.
 
 | Grid | Step time | Paper, Table 2 (GTX 680) |
 |---|---|---|
-| 128² (2D) | ≈ 1.1 ms | – |
-| 128 × 64 × 64 | 3.1 ms | 26.7 ms (for 128 × 128 × 64) |
-| 128³ | 9.8 ms | 53.4–54.2 ms |
-| 256 × 128 × 128 | 15.1 ms | 113.2–118.6 ms |
+| 128² (2D) | ≈ 1.4 ms | – |
+| 128 × 64 × 64 | 3.2 ms | 26.7 ms (for 128 × 128 × 64) |
+| 128³ | 8.8 ms | 53.4–54.2 ms |
+| 256 × 128 × 128 | 18.0 ms | 113.2–118.6 ms |
 
-* Mass: drifts by 2e-6 to 5e-6 relative over 240–900 steps in every scene, 2D and 3D, including
-  Δt = 1/30 s with CFL up to 11. The drift is 32-bit float round-off (tiny deposits added to
-  cells holding ρ ≈ 1); the paper's own Fig. 10 shows ±0.05 %.
-* Row sums γ for the ball drop at 128², Δt = 1/60 s, over cells holding liquid: 0.25–11.8 over
-  the whole run, 0.86–1.05 once the pool has settled. The extremes last a few steps while the
-  ball hits the floor at CFL ≈ 7 and several rows of liquid land in the floor row. The paper's
-  Table 1 reports 0.627–2.403 for its run of this test; I did not reproduce that narrower
-  range (the paper does not give the time step of its 2D test).
+* Mass: drifts by at most 5e-6 relative over 10 s in every 2D scene, at Δt = 1/60 s and at
+  Δt = 1/30 s with CFL up to 21, and by 1e-6 to 3e-6 over 240 steps in 3D. The drift is 32-bit
+  float round-off (tiny deposits added to cells holding ρ ≈ 1) and keeps accumulating: 4e-5
+  after 60 s of the floating bodies scene. The paper's own Fig. 10 shows ±0.05 %.
+* Row sums γ for the ball drop at 128², Δt = 1/60 s, over cells holding liquid: 0.77–2.62 over
+  the whole run, 0.91–1.09 once the pool has settled. The paper's Table 1 reports 0.627–2.403
+  for its run of this test.
+* A pool at rest stays at rest: after 120 s at 64², 128² and 256² the liquid speed is
+  0.0000 m/s, the surface height has not changed in the second decimal of a cell and the bulk
+  density is 1.000 ± 0.000. (At 384² see the limitations.)
 * Plain semi-Lagrangian advection on the same dam break: 10 % of the mass left after 10 s.
 * Volume of the 0.5 iso-contour stays within roughly 95–107 % once splashes settle, with dips
   while liquid is spread thinner than a cell (as in the paper's Fig. 10).
 
-Reproduce with the pages in `tests/` through `node tools/run.mjs <page>` and with
-`node tools/interact.mjs 2d|3d`, which drives the real apps with synthetic mouse input.
+Reproduce with the pages in `tests/` through `node tools/run.mjs <page>` (`still2d.html` runs
+any 2D scene for a long time and reports rest, residuals and rigid body motion, `body2d.html`
+drops one body into a pool) and with `node tools/interact.mjs 2d|3d`, which drives the real
+apps with synthetic mouse input.
 
 ## Where the paper leaves a choice open
 
@@ -82,9 +86,16 @@ These are interpretations, not things the paper states. Each was decided by expe
    extra γⱼ factor that I dropped. An advected cumulative γ fights the intentional divergence of
    Sec. 3.7 and was unstable. The row scale γᵢ / max(1, βₗ) is used as printed; the solver menu
    also offers 1/γ and no feedback.
-2. **γ diffusion only exchanges between liquid cells.** Outside the liquid the velocity is an
-   extrapolation that is not divergence free, so row sums there are not a compression signal;
-   exchanging with them smeared the surface.
+2. **γ diffusion (advection step 8) exchanges pairwise, between liquid cells only, and never
+   uphill.** As [LAF11] describes it, two neighbours meet at the mean of their γ: one pass per
+   axis and pair parity, (2k, 2k+1) then (2k+1, 2k+2). Exchanging with both neighbours at once
+   (a Jacobi sweep with the same coefficient) flips a cell-to-cell alternation instead of
+   damping it; a pool at rest then slowly grew a density checkerboard and its surface started
+   to move up and down at grid frequency. Outside the liquid the velocity is an extrapolation
+   that is not divergence free, so row sums there are not a compression signal; exchanging with
+   them smeared the surface. And an exchange may level ρ′ between two cells but never moves
+   liquid from the emptier into the fuller one, which would work against the intentional
+   divergence of Sec. 3.7.
 3. **Solids in the advection.** Capacities are the non-solid volume fractions V, so the scheme
    transports ρ′ = ρ/V and γᵢ = (Σ Aᵢₗ Vₗ)/Vᵢ. Without this, wall cells inflated γ and still
    water next to a wall was unstable.
@@ -92,14 +103,22 @@ These are interpretations, not things the paper states. Each was decided by expe
    denominator, which is not a divergence dimensionally.
 5. **Sharpening near solids** uses ρ′ (extrapolated into solid cells) for the weight, the
    limiter and the gradient trace, and ρ with face area fractions for Eq. 18–19 as printed.
-6. **Coarse multigrid levels keep air.** A coarse cell covering both liquid and air stays air,
-   with the averaged interface position. Plain averaging converges faster on simple cases
-   (factor ≈ 0.1 per V-cycle) but diverged as soon as a splash trapped an air pocket; the
-   reference's "average of positive φ" rule was stable but non-monotone. Convergence with the
-   rule used is about 0.7 per V-cycle on splashing scenes.
+6. **Coarse multigrid levels** average the interface position φ = 0.5 − ρ′ of their children
+   (weighted with the non-solid volume, and clamped at −0.5 so that over-full cells do not
+   dominate). Averaging erases air pockets smaller than a coarse cell together with their
+   p = 0 condition, which made the V-cycle diverge as soon as a splash trapped air. Every
+   coarse cell therefore carries a diagonal "leak" term: the ghost-fluid coupling of its
+   children to the air that the coarse level no longer sees. Measured convergence per V-cycle:
+   0.05–0.1 on a pool at rest, about 0.3 in the round tank. Keeping every coarse cell that
+   covers both liquid and air as air (what this code did first) was stable but only reached
+   0.76–0.87; the unconverged remainder showed as a pulsing flow with air pockets in the
+   corners of a pool at rest. The reference's "average of positive φ" rule was not monotone.
 7. **Solid fractions** are computed from analytic distance fields: volume fractions as
    clamp(0.5 + d), area fractions as a planar cut. A wider ramp leaked pressure through wall
-   corners.
+   corners. Faces between two cells that are both almost entirely solid (V < 0.1) are closed:
+   such a sliver, for instance under a body lying on the floor, has no neighbour with real
+   volume to take its liquid/air state from and otherwise acts as an air pocket at the bottom
+   of the pool that the liquid next to it rushes into.
 8. **Velocity advection** is semi-Lagrangian with a midpoint trace (the paper does not say).
 9. **Velocity extrapolation** uses the grid hierarchy only; the reference additionally runs an
    eikonal solver in a two-cell band.
@@ -116,8 +135,12 @@ These are interpretations, not things the paper states. Each was decided by expe
   as published.
 * **Two-way rigid bodies.** The paper couples solids to the liquid one way. Bodies here also
   feel the liquid: pressure force and torque are integrated over each body on the GPU, read
-  back asynchronously, and applied with an added-mass term, a force cap and liquid-relative
-  drag for stability. This is a plausible game-style coupling, not a strongly coupled solve.
+  back asynchronously, and applied one step late with an added-mass term, a force cap and
+  liquid-relative drag for stability. Contacts between bodies and with walls are solved with
+  sequential impulses. Within 1.5 cells of another solid the liquid may stop a body's approach
+  and carry it, but not push it away harder than that: the stiff force of a squeezed film
+  arrives after the contact has already stopped the body and would otherwise throw it back.
+  This is a plausible game-style coupling, not a strongly coupled solve as in [BBB07].
 * **Rendering.** The surface is ray-marched instead of meshed with marching cubes.
 
 ## Known limitations
@@ -128,6 +151,14 @@ These are interpretations, not things the paper states. Each was decided by expe
   extrapolated from the nearest liquid, so spray can hang in the air until sharpening gathers it.
 * Two V-cycles per step leave a pressure residual around 1e-2 during violent motion; raise
   *V-cycles / step* for a tighter solve.
+* At 384² a pool at rest starts a slow long slosh after about a minute (±1.4 cells of 153
+  after 120 s). The pressure residual sits at 1.6e-3 from the first step there and more
+  V-cycles do not lower it, which points at 32-bit float precision of the pressure solve.
+* Rigid bodies are coupled explicitly (see above). Floating bodies keep bobbing on the slosh
+  they caused for a long time, since nothing in the inviscid solver damps it (about ±2 cells
+  a minute after four bodies were dropped into the 128² pool), and a body lying on the floor
+  can jitter by less than a tenth of a cell. Removing this needs the bodies inside the
+  pressure solve.
 * Fast impacts on solids momentarily produce ρ′ well above 1 (the paper mentions the same); it
   is expelled over the following steps.
 

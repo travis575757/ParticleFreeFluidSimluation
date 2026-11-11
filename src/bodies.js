@@ -200,6 +200,9 @@ export function stepBodies(bodies, statics, o) {
   const { dt, gravity } = o;
   const Ca = o.addedMass ?? 1.5;
   for (const b of bodies) {
+    // velocity before this step's forces: decides whether a contact is an impact or resting
+    b.velPre = [...b.vel];
+    b.omegaPre = [...b.omega];
     if (b.kinematic) continue;
     if (b.grabbed) {
       // follow the drag target; contacts still apply so the body cannot be pulled through walls
@@ -221,8 +224,23 @@ export function stepBodies(bodies, statics, o) {
     const cap = (3 * glen) / Math.min(b.density, 1);
     const fl = len(b.force);
     const fs = fl > cap ? cap / fl : 1;
+    const af = mul(b.force, fs);
+    let ts = fs;               // the torque is scaled with the force it comes from
+    // A film of liquid squeezed between the body and a solid it is about to touch is stiff, and
+    // the force it exerts arrives one step late: by then the contact has stopped the body and
+    // the force throws it back instead of cushioning it. Next to a solid the liquid may
+    // therefore stop the approach and carry the body (its weight, or its full buoyancy if it is
+    // lighter than the liquid), but not push it away any harder than that.
+    for (const n of b.near || []) {
+      const lim = Math.max(1, 1 / b.density) * glen + Math.max(0, -dot(b.vel, n)) / dt;
+      const an = dot(af, n);
+      if (an > lim) {
+        for (let k = 0; k < 3; k++) af[k] -= (an - lim) * n[k];
+        ts *= lim / an;
+      }
+    }
     const acc = [0, 0, 0];
-    for (let k = 0; k < 3; k++) acc[k] = (gravity[k] + fs * b.force[k] + r * b.accPrev[k]) / (1 + r);
+    for (let k = 0; k < 3; k++) acc[k] = (gravity[k] + af[k] + r * b.accPrev[k]) / (1 + r);
     if (b.dim === 2) acc[2] = 0;
     b.accPrev = acc;
     b.vel = add(b.vel, mul(acc, dt));
@@ -234,7 +252,7 @@ export function stepBodies(bodies, statics, o) {
     const kd = ((b.wet ?? 0) * (0.6 * len(vr) / Math.max(b.extent, 1) + 0.6)) / b.density;
     b.vel = add(vf, mul(vr, 1 / (1 + dt * kd)));
     if (b.dim === 2) b.vel[2] = 0;
-    b.omega = add(b.omega, mul(b.invInertia(b.torque), dt / (1 + r)));
+    b.omega = add(b.omega, mul(b.invInertia(b.torque), ts * dt / (1 + r)));
     // mild damping of the spin inside liquid (the inviscid solver exerts no shear)
     const damp = Math.exp(-dt * (0.2 + 2.0 * (b.wet ?? 0)));
     b.omega = mul(b.omega, damp);
@@ -244,48 +262,96 @@ export function stepBodies(bodies, statics, o) {
   }
   for (const b of bodies) if (!b.scripted) b.integrate(dt);
 
-  // contacts: sample points of each body against statics and the other bodies
-  for (let iter = 0; iter < 3; iter++) {
-    for (let i = 0; i < bodies.length; i++) {
-      const a = bodies[i];
-      if (a.kinematic) continue;
-      const others = [...statics, ...bodies.filter((_, j) => j !== i)];
-      for (const o2 of others) {
-        const isBody = o2 instanceof Body;
-        if (isBody && len(sub(o2.pos, a.pos)) > a.extent + o2.extent + 1) continue;
-        const fixedB = !isBody || o2.kinematic;
-        const fixedA = false;
-        const wA = fixedA ? 0 : 1 / (a.density * a.volume);
-        const wB = fixedB ? 0 : 1 / (o2.density * o2.volume);
-        let deepest = 0;
-        let hit = null;
-        for (const p of a.samplePoints()) {
-          const d = o2.sd(p);
-          if (d < deepest) { deepest = d; hit = p; }
-        }
-        if (!hit) continue;
-        const n = o2.normal(hit);              // points out of o2, i.e. the way `a` must move
-        const pen = -deepest;
-        const corr = pen * 0.8;
-        if (!fixedA) a.pos = add(a.pos, mul(n, (corr * wA) / (wA + wB)));
-        if (!fixedB) o2.pos = sub(o2.pos, mul(n, (corr * wB) / (wA + wB)));
-        const vrel = sub(a.velocityAt(hit), o2.velocityAt(hit));
-        const vn = dot(vrel, n);
-        if (vn < 0) {
-          const rA = sub(hit, a.pos);
-          let k = wA + wB;
-          if (!fixedA) k += wA * dot(cross(a.invInertia(cross(rA, n)), rA), n);
-          if (!fixedB) { const rB = sub(hit, o2.pos); k += wB * dot(cross(o2.invInertia(cross(rB, n)), rB), n); }
-          const e = Math.min(a.restitution, isBody ? o2.restitution : a.restitution);
-          const j = (-(1 + (Math.abs(vn) > 8 ? e : 0)) * vn) / k;
-          // friction: remove part of the tangential slip
-          const vt = sub(vrel, mul(n, vn));
-          const jt = mul(vt, -0.25 / k);
-          const J = add(mul(n, j), jt);
-          if (!fixedA) a.applyImpulse(mul(J, wA), hit);
-          if (!fixedB) o2.applyImpulse(mul(J, -wB), hit);
-        }
+  resolveContacts(bodies, statics);
+}
+
+function preVelocity(o, p) {
+  if (!o.velPre) return o.velocityAt(p);
+  const r = sub(p, o.pos);
+  if (o.dim === 2) r[2] = 0;
+  return add(o.velPre, cross(o.omegaPre, r));
+}
+
+const NEAR = 1.5;            // [cells] a liquid film thinner than this between two solids is under-resolved
+const FRICTION = 0.4;
+const BOUNCE_SPEED = 8;      // approach speeds below this [cells/s] do not bounce (resting contact)
+
+/**
+ * Contacts between the bodies' surface sample points and the other solids, solved with
+ * sequential impulses. All penetrating points of a pair take part and the normal impulses are
+ * accumulated and clamped, so a body lying on the floor ends the step with zero velocity
+ * (the liquid sees that velocity as a boundary condition; a residual would pump liquid).
+ */
+function resolveContacts(bodies, statics) {
+  const contacts = [];
+  for (let i = 0; i < bodies.length; i++) {
+    const a = bodies[i];
+    a.near = [];               // normals of the solids within NEAR cells, for the next step
+    if (a.kinematic) continue;
+    const others = [...statics, ...bodies.filter((_, j) => j !== i)];
+    for (const o2 of others) {
+      const isBody = o2 instanceof Body;
+      if (isBody && len(sub(o2.pos, a.pos)) > a.extent + o2.extent + 1) continue;
+      const fixedB = !isBody || o2.kinematic;
+      const wA = 1 / (a.density * a.volume);
+      const wB = fixedB ? 0 : 1 / (o2.density * o2.volume);
+      // position: separate along the normal of the deepest point
+      let deepest = 0;
+      let hit = null;
+      let closest = NEAR;
+      let closestPoint = null;
+      for (const p of a.samplePoints()) {
+        const d = o2.sd(p);
+        if (d < deepest) { deepest = d; hit = p; }
+        if (d < closest) { closest = d; closestPoint = p; }
       }
+      if (closestPoint) a.near.push(o2.normal(closestPoint));
+      if (!hit) continue;
+      const nd = o2.normal(hit);                 // points out of o2, i.e. the way `a` must move
+      const corr = -deepest * 0.8;
+      a.pos = add(a.pos, mul(nd, (corr * wA) / (wA + wB)));
+      if (!fixedB) o2.pos = sub(o2.pos, mul(nd, (corr * wB) / (wA + wB)));
+      // velocity: one constraint per sample point that is (still) touching
+      for (const p of a.samplePoints()) {
+        if (o2.sd(p) > 0.05) continue;
+        const n = o2.normal(p);
+        const rA = sub(p, a.pos);
+        if (a.dim === 2) rA[2] = 0;
+        let k = wA + wB + wA * dot(cross(a.invInertia(cross(rA, n)), rA), n);
+        let rB = null;
+        if (!fixedB) {
+          rB = sub(p, o2.pos);
+          if (a.dim === 2) rB[2] = 0;
+          k += wB * dot(cross(o2.invInertia(cross(rB, n)), rB), n);
+        }
+        // approach speed without the velocity gained from this step's forces: a body at rest
+        // picks up g dt (and more when the liquid presses on it) every step and must not bounce
+        const vn0 = dot(sub(preVelocity(a, p), preVelocity(o2, p)), n);
+        const e = Math.min(a.restitution, isBody ? o2.restitution : a.restitution);
+        contacts.push({ a, b: o2, fixedB, wA, wB, p, n, k, target: vn0 < -BOUNCE_SPEED ? -e * vn0 : 0, lambda: 0, jt: [0, 0, 0] });
+      }
+    }
+  }
+  const apply = (c, J) => {
+    c.a.applyImpulse(mul(J, c.wA), c.p);
+    if (!c.fixedB) c.b.applyImpulse(mul(J, -c.wB), c.p);
+  };
+  for (let iter = 0; iter < 10; iter++) {
+    for (const c of contacts) {
+      let vrel = sub(c.a.velocityAt(c.p), c.b.velocityAt(c.p));
+      const vn = dot(vrel, c.n);
+      const lambda = Math.max(c.lambda + (c.target - vn) / c.k, 0);
+      apply(c, mul(c.n, lambda - c.lambda));
+      c.lambda = lambda;
+      // Coulomb friction, accumulated and limited by the normal impulse
+      vrel = sub(c.a.velocityAt(c.p), c.b.velocityAt(c.p));
+      const vt = sub(vrel, mul(c.n, dot(vrel, c.n)));
+      let jt = sub(c.jt, mul(vt, 1 / c.k));
+      const max = FRICTION * c.lambda;
+      const l = len(jt);
+      if (l > max) jt = mul(jt, max / (l || 1));
+      apply(c, sub(jt, c.jt));
+      c.jt = jt;
     }
   }
 }

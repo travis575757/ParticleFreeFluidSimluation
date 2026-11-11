@@ -15,7 +15,7 @@ const N = Number(q.get('n') || 32);
 const steps = Number(q.get('steps') || 60);
 const every = Number(q.get('every') || 20);
 const params = {};
-for (const [k, v] of q) if (!['n', 'steps', 'every', 'scene'].includes(k)) params[k] = Number(v);
+for (const [k, v] of q) if (!['n', 'steps', 'every', 'scene', 'bodies'].includes(k)) params[k] = Number(v);
 try {
   const canvas = document.getElementById('c');
   const glc = new GLContext(canvas, { preserveDrawingBuffer: true });
@@ -29,13 +29,23 @@ try {
     `  gamma [${s.gammaMin.toFixed(3)}, ${s.gammaMax.toFixed(3)}]  rho'max ${s.maxRhoP.toFixed(2)}  CFL ${s.cfl.toFixed(2)}  res ${s.residual.toExponential(1)}`;
   console.log(fmt(sim.measureSync()));
   let tSim = 0;
+  const bodyStats = q.get('bodies') ? runner.bodies.map(() => ({ lo: Infinity, hi: -Infinity, v: 0 })) : null;
   for (let i = 1; i <= steps; i++) {
     const t0 = performance.now();
     runner.step();
     glc.finish();
     tSim += performance.now() - t0;
-    if (runner.bodies.length) await new Promise((r) => setTimeout(r, 0));
-    if (i % every === 0 || i === steps) console.log(fmt(sim.measureSync()));
+    if (runner.bodies.length) await runner.forcesReady;   // as in the apps: forces arrive before the next step
+    if (bodyStats) for (const [k, b] of runner.bodies.entries()) {
+      const st = bodyStats[k];
+      st.lo = Math.min(st.lo, b.pos[1]); st.hi = Math.max(st.hi, b.pos[1]);
+      st.v = Math.max(st.v, Math.hypot(...b.vel) * sim.params.h);
+    }
+    if (i % every === 0 || i === steps) {
+      console.log(fmt(sim.measureSync()));
+      // &bodies=1: per body since the last sample, range of the centre height [cells] and largest speed [m/s]
+      if (bodyStats) console.log('   bodies: ' + runner.bodies.map((b, k) => { const st = bodyStats[k]; const t = `d${b.density} y [${st.lo.toFixed(2)}, ${st.hi.toFixed(2)}] v ${st.v.toFixed(3)}`; bodyStats[k] = { lo: Infinity, hi: -Infinity, v: 0 }; return t; }).join(' | '));
+    }
   }
   console.log(`${(tSim / steps).toFixed(2)} ms per step, ${(glc.passCount / steps).toFixed(0)} passes per step`);
   const view = glc.program('atlas', `${header(3, glc.floatLinear)}

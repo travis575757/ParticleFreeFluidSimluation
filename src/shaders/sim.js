@@ -27,10 +27,17 @@ layout(location = 0) out vec4 oSdf;
 layout(location = 1) out vec4 oUs;
 layout(location = 2) out vec4 oFrac;
 layout(location = 3) out vec4 oW;
+uniform float uVthr;
 ivec3 gc;
 float D(float x, float y, float z) { return sdS(cellPos(gc, vec3(x, y, z))).x; }
 float ramp(float d, float l1) { return clamp(0.5 + d / max(l1, 1.0e-6), 0.0, 1.0); }
 float vol(float d) { float w = clamp(0.5 + d, 0.0, 1.0); return w < 0.01 ? 0.0 : w; }
+// A cell with V < uVthr has no density of its own to speak of: it is liquid or air according to
+// its neighbours (pass "liq"). A sliver of such cells between two solids (under a body lying
+// on the floor) has no neighbour to ask and would count as air, i.e. as a p = 0 pocket at the
+// bottom of the pool that the liquid next to it rushes into. Faces between two such cells are
+// therefore closed; a sliver cell only ever exchanges with a neighbour that has real volume.
+bool sliver(float x, float y, float z) { return clamp(0.5 + D(x, y, z), 0.0, 1.0) < uVthr; }
 void main() {
   gc = cellOf(G, ivec2(gl_FragCoord.xy));
   // A wall lying exactly on a face must count as closed, hence the small bias on the area fraction.
@@ -59,6 +66,13 @@ void main() {
   A.y = ramp(sy.x - bias, abs(xy10 - xy00) + abs(yz01 - yz00));
   A.z = ramp(sz.x - bias, abs(xz10 - xz00) + abs(yz10 - yz00));
 #endif
+  if (clamp(0.5 + dc, 0.0, 1.0) < uVthr) {
+    if (sliver(-0.5, 0.5, 0.5)) W.x = 0.0;
+    if (sliver(0.5, -0.5, 0.5)) W.y = 0.0;
+#if DIM == 3
+    if (sliver(0.5, 0.5, -0.5)) W.z = 0.0;
+#endif
+  }
   oSdf = vec4(g, dc);
   oUs = vec4(us, 0.0);
   oFrac = vec4(A, clamp(0.5 + dc, 0.0, 1.0));
@@ -328,22 +342,40 @@ void main() {
   o = vec4(V > 0.0 ? sampleLin(uRho, G, xb).r : 0.0, 1.0, 0.0, 0.0);
 }`;
 
-  // Step 8: diffusion of the row sums [LAF11 Sec. 2.1], one axis per pass (Jacobi within the
-  // axis). gamma relaxes towards its neighbours and carries the matching share of rho along.
+  // Step 8: diffusion of the row sums [LAF11 Sec. 2.1]. For two neighbouring cells the one with
+  // the larger gamma hands rho (gamma_j - gamma_i) / (2 gamma_j) to the other and both take the
+  // mean gamma. The reference sweeps the cells sequentially; here each sweep along an axis is
+  // split into the two disjoint pairings (2k, 2k+1) and (2k+1, 2k+2) (uPair = 0 / 1), so every
+  // cell has exactly one partner per pass and the pair exchange is exactly the sequential one.
+  // uPair = -1 exchanges with both neighbours at once (Jacobi); that needs uKappa <= 0.25,
+  // because with 0.5 the grid-frequency mode just changes sign every sweep and is never damped.
   // Only pairs of liquid cells (rho' > 0.5) exchange: outside the liquid the velocity is an
   // extrapolation that is not divergence free, so row sums there say nothing about compression
   // and exchanging with them would just smear the free surface.
+  // uLimit = 1: the exchange may level the fill rho' of the two cells but not move liquid from
+  // the emptier to the fuller one (see README, "Where the paper leaves a choice open").
   S.diffuse = `${H}
 uniform Grid G;
 uniform sampler2D uRho;
 uniform sampler2D uFrac;
 uniform int uAxis;
+uniform int uPair;
+uniform int uLimit;
 uniform float uKappa;
 out vec4 o;
-vec2 exchange(vec2 me, vec2 nb) {
-  float dg = (nb.g - me.g) * uKappa;
-  float dr = dg > 0.0 ? nb.r * dg / max(nb.g, 1.0e-6) : me.r * dg / max(me.g, 1.0e-6);
-  return vec2(dr, dg);
+// change of (rho, gamma) of cell "me" from the exchange with "nb"
+vec2 exchange(vec2 me, float Vme, vec2 nb, float Vnb) {
+  float dg = (nb.g - me.g) * uKappa;            // > 0: the neighbour is the donor
+  bool take = dg > 0.0;
+  vec2 src = take ? nb : me;
+  float amount = src.r * abs(dg) / max(src.g, 1.0e-6);
+  if (uLimit == 1 && amount > 0.0) {
+    float fs = take ? nb.r / Vnb : me.r / Vme;
+    float fd = take ? me.r / Vme : nb.r / Vnb;
+    float cap = max(0.0, fs - fd) * Vme * Vnb / (Vme + Vnb) * (uPair < 0 ? 0.5 : 1.0);
+    if (amount > cap) { dg *= cap / amount; amount = cap; }
+  }
+  return vec2(take ? amount : -amount, dg);
 }
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
@@ -352,19 +384,21 @@ void main() {
   vec2 me = texelFetch(uRho, t, 0).rg;
   vec2 r = me;
   if (fr.a > 0.0 && me.r > 0.5 * fr.a) {
+    bool useLo = true, useHi = true;
+    if (uPair >= 0) { useHi = ((c[uAxis] + uPair) & 1) == 0; useLo = !useHi; }
     ivec3 lo = c - AX[uAxis];
     ivec3 hi = c + AX[uAxis];
-    if (lo[uAxis] >= 0 && fr[uAxis] > 0.0) {
+    if (useLo && lo[uAxis] >= 0 && fr[uAxis] > 0.0) {
       ivec2 tl = texelOf(G, lo);
       float Vl = texelFetch(uFrac, tl, 0).a;
       vec2 nb = texelFetch(uRho, tl, 0).rg;
-      if (Vl > 0.0 && nb.r > 0.5 * Vl) r += exchange(me, nb);
+      if (Vl > 0.0 && nb.r > 0.5 * Vl) r += exchange(me, fr.a, nb, Vl);
     }
-    if (hi[uAxis] < G.n[uAxis]) {
+    if (useHi && hi[uAxis] < G.n[uAxis]) {
       ivec2 th = texelOf(G, hi);
       vec4 fh = texelFetch(uFrac, th, 0);
       vec2 nb = texelFetch(uRho, th, 0).rg;
-      if (fh[uAxis] > 0.0 && fh.a > 0.0 && nb.r > 0.5 * fh.a) r += exchange(me, nb);
+      if (fh[uAxis] > 0.0 && fh.a > 0.0 && nb.r > 0.5 * fh.a) r += exchange(me, fr.a, nb, fh.a);
     }
   }
   o = vec4(r, 0.0, 0.0);
@@ -522,14 +556,18 @@ void main() {
 }`;
 
   // ---------------------------------------------------------------- pressure projection (Sec. 3.7, [CM11a])
-  // Coarse levels of the multigrid hierarchy: phi and V by 2^d-to-1 averaging (with the
-  // "keep air bubbles on the finest levels" rule), W by averaging the staggered cells covered.
+  // Coarse levels of the multigrid hierarchy: phi and V by 2^d-to-1 averaging, W by averaging
+  // the staggered cells covered.
+  //   * phi is averaged with the non-solid volume V as weight. Cells deep inside a solid carry
+  //     no liquid and would otherwise count as air, which puts a spurious p = 0 condition along
+  //     every wall that is not aligned with the grid.
+  //   * phi = 0.5 - rho' is a distance only for rho' <= 1, so it is clamped: a cell that
+  //     momentarily holds rho' = 8 must not outvote three empty siblings.
   S.downsample = `${H}
 uniform Grid G;    // coarse
 uniform Grid GF;   // fine
 uniform sampler2D uLiqF;
 uniform sampler2D uWF;
-uniform int uBubbles;
 layout(location = 0) out vec4 oLiq;
 layout(location = 1) out vec4 oW;
 void main() {
@@ -538,23 +576,17 @@ void main() {
 #if DIM == 2
   f.z = 0;
 #endif
-  float sum = 0.0, sumPos = 0.0, nPos = 0.0, V = 0.0;
+  float sumV = 0.0, sumPhi = 0.0, minPhi = BIG;
   for (int k = 0; k < NC; k++) {
     vec2 l = fetchC(uLiqF, GF, f + cornerOffset(k)).rg;
-    sum += l.r;
-    V += l.g;
-    if (l.r >= 0.0) { sumPos += l.r; nPos += 1.0; }
+    float phi = max(l.r, -0.5);
+    sumV += l.g;
+    sumPhi += l.g * phi;
+    minPhi = min(minPhi, phi);
   }
-  float phi = sum / float(NC);
-  if (nPos > 0.0 && nPos < float(NC)) {
-    // A coarse cell that covers both liquid and air. Losing the air (and with it the p = 0
-    // condition) makes the coarse operator softer than the fine one and the cycle can diverge.
-    //   1: [CM11a/b] average of the positive values
-    //   2: stay air, but keep the averaged interface position (phi >= small positive)
-    if (uBubbles == 1) phi = sumPos / nPos;
-    else if (uBubbles == 2) phi = max(phi, 1.0e-3);
-  }
-  oLiq = vec4(phi, V / float(NC), 0.0, 0.0);
+  // a coarse cell without any non-solid volume only matters through its partly open faces;
+  // it is liquid if one of its children was reached by the extrapolation of rho'
+  oLiq = vec4(sumV > 1.0e-4 ? sumPhi / sumV : minPhi, sumV / float(NC), 0.0, 0.0);
   vec3 W = vec3(0.0);
   for (int d = 0; d < DIM; d++) {
     float s = 0.0;
@@ -571,13 +603,50 @@ void main() {
 
   // Matrix coefficients of  sum_f W_f (p_i - p_nb) = b_i  with the ghost-fluid treatment of
   // air neighbours (p_nb = p_i * phi_nb / phi_i, [CM11a] Eq. 6-7).
+  //
+  // Coarse levels (uCoarse = 1) are re-discretised from the averaged phi, which places the free
+  // surface to sub-cell accuracy but erases every air pocket smaller than a coarse cell, and
+  // with it the p = 0 condition on its boundary. The coarse operator is then softer than the
+  // fine one and the cycle diverges. So the ghost-fluid terms towards air that the averaging
+  // removed are kept as an extra diagonal term K ("leak"):
+  //   K_coarse = 4 / 2^d * sum over the children of ( K_child + ghost-fluid terms of the child
+  //              towards fine air cells that the coarse level no longer sees )
+  // (4 / 2^d is the scaling of the restricted right-hand side, i.e. of a diagonal term: for a
+  // bubbly mixture the leak per cell grows with the cell area, as it must.)
+  // A fine air cell is still seen if its coarse parent is air or if it touches a fine air cell
+  // whose parent is air: at an ordinary free surface the air stays represented, and counting it
+  // twice would shift the surface.
   S.coef = `${H}
 uniform Grid G;
 uniform sampler2D uLiq;
 uniform sampler2D uW;
 uniform float uInvThetaMax;
+uniform int uCoarse;
+uniform Grid GF;            // next finer level (uCoarse = 1)
+uniform sampler2D uLiqF;
+uniform sampler2D uWF;
+uniform sampler2D uCBF;     // its coefficients; .w = K
 layout(location = 0) out vec4 oA;   // xyz = coupling to low neighbours, w = diagonal
-layout(location = 1) out vec4 oB;   // xyz = coupling to high neighbours
+layout(location = 1) out vec4 oB;   // xyz = coupling to high neighbours, w = K
+bool parentLiquid(ivec3 f) {
+  ivec3 pc = f >> 1;
+#if DIM == 2
+  pc.z = 0;
+#endif
+  return texelFetch(uLiq, texelOf(G, pc), 0).r < 0.0;
+}
+float ghost(float w, float phiAir, float phiLiq) { return w * min(uInvThetaMax, 1.0 - phiAir / phiLiq); }
+// fine air cell a: is its air still present on this (coarse) level?
+bool airSeen(ivec3 a) {
+  if (!parentLiquid(a)) return true;
+  for (int d = 0; d < DIM; d++) {
+    for (int sgn = -1; sgn <= 1; sgn += 2) {
+      ivec3 b = a + sgn * AX[d];
+      if (inGrid(GF, b) && texelFetch(uLiqF, texelOf(GF, b), 0).r >= 0.0 && !parentLiquid(b)) return true;
+    }
+  }
+  return false;
+}
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
   ivec3 c = cellOf(G, t);
@@ -592,7 +661,7 @@ void main() {
       if (lo[d] >= 0 && Wc[d] > 0.0) {
         float pn = fetchC(uLiq, G, lo).r;
         if (pn < 0.0) { A[d] = Wc[d]; diag += Wc[d]; }
-        else diag += Wc[d] * min(uInvThetaMax, 1.0 - pn / phi);
+        else diag += ghost(Wc[d], pn, phi);
       }
       ivec3 hi = c + AX[d];
       if (hi[d] < G.n[d]) {
@@ -601,11 +670,42 @@ void main() {
         if (w > 0.0) {
           float pn = texelFetch(uLiq, th, 0).r;
           if (pn < 0.0) { B[d] = w; diag += w; }
-          else diag += w * min(uInvThetaMax, 1.0 - pn / phi);
+          else diag += ghost(w, pn, phi);
         }
       }
     }
-    A.w = diag;
+    float K = 0.0;
+    if (uCoarse == 1) {
+      ivec3 f0 = c * 2;
+#if DIM == 2
+      f0.z = 0;
+#endif
+      for (int k = 0; k < NC; k++) {
+        ivec3 f = f0 + cornerOffset(k);
+        ivec2 tf = texelOf(GF, f);
+        K += texelFetch(uCBF, tf, 0).w;
+        float pf = texelFetch(uLiqF, tf, 0).r;
+        if (pf >= 0.0) continue;
+        vec4 Wf = texelFetch(uWF, tf, 0);
+        for (int d = 0; d < DIM; d++) {
+          ivec3 lo = f - AX[d];
+          if (lo[d] >= 0 && Wf[d] > 0.0) {
+            float pn = fetchC(uLiqF, GF, lo).r;
+            if (pn >= 0.0 && !airSeen(lo)) K += ghost(Wf[d], pn, pf);
+          }
+          ivec3 hi = f + AX[d];
+          if (hi[d] < GF.n[d]) {
+            ivec2 th = texelOf(GF, hi);
+            float w = texelFetch(uWF, th, 0)[d];
+            float pn = texelFetch(uLiqF, th, 0).r;
+            if (w > 0.0 && pn >= 0.0 && !airSeen(hi)) K += ghost(w, pn, pf);
+          }
+        }
+      }
+      K *= 4.0 / float(NC);
+    }
+    A.w = diag + K;
+    B.w = K;
   }
   oA = A;
   oB = B;

@@ -22,11 +22,33 @@ try {
   let ymax = -1e9, ymin = 1e9, vmax = 0;
   for (let i = 1; i <= Number(q.get('steps') || 600); i++) {
     runner.step();
-    await new Promise((r) => setTimeout(r, 0));
+    await runner.forcesReady;
     const y = (b.pos[1] - m) / L;
     if (i > 300) { ymax = Math.max(ymax, y); ymin = Math.min(ymin, y); }
     vmax = Math.max(vmax, Math.hypot(b.vel[0], b.vel[1]) * runner.sim.params.dt);
     if (i % 30 === 0) line += ` ${y.toFixed(3)}`;
+    if (q.get('spike') && Math.abs(b.force[1] / runner.gravityCells[1]) > Number(q.get('spike')) && i > 180 && !window.__dumped) {
+      // first step (after settling) at which the liquid force exceeds `spike` body weights: show the cells under the body
+      window.__dumped = true;
+      const sim = runner.sim, g = sim.grid, glc2 = runner.glc;
+      const rd = (t) => ({ d: glc2.read(t), ch: t.channels });
+      const F = { rho: rd(sim.rho), p: rd(sim.pressure), liq: rd(sim.liq), frac: rd(sim.T.frac), W: rd(sim.levels[0].W), vel: rd(sim.vel), cA: rd(sim.levels[0].cA) };
+      const at = (f, x, y, c) => f.d[(y * g.w + x) * f.ch + c];
+      const x0 = Math.round(b.pos[0]) - 15, w = 30;
+      const show = (name, f, c, digits, scale = 1) => {
+        console.log(`-- ${name} step ${i} (rows y=4..0, x=${x0}..${x0 + w - 1})`);
+        for (let y = 4; y >= 0; y--) { let ln = ''; for (let x = x0; x < x0 + w; x++) ln += (at(f, x, y, c) * scale).toFixed(digits).padStart(digits + 4); console.log(ln); }
+      };
+      console.log(`SPIKE at step ${i}: F/W ${(b.force[1] / -runner.gravityCells[1]).toFixed(2)} body x ${b.pos[0].toFixed(2)} y ${b.pos[1].toFixed(2)} angle ${(2 * Math.atan2(b.quat[2], b.quat[3])).toFixed(3)} half ${b.half}`);
+      show('V', F.frac, 3, 2); show("rho'=0.5-phi", F.liq, 0, 2, -1); show('rho', F.rho, 0, 2); show('Wy', F.W, 1, 2); show('Wx', F.W, 0, 2); show('p', F.p, 0, 0); show('diag', F.cA, 3, 1); show('v*dt', F.vel, 1, 2, runner.sim.params.dt);
+    }
+    if (q.get('trace') && i % Number(q.get('trace')) === 0) {
+      // height of the body's lowest point above the floor [cells], vertical speed [m/s],
+      // liquid force in units of the body's weight, wet fraction
+      const g = runner.gravityCells;
+      const low = b.shape === 'ball' ? b.pos[1] - b.radius : Math.min(...b.samplePoints().map((p) => p[1]));
+      console.log(`  t ${(i * runner.sim.params.dt).toFixed(2)}  gap ${(low - m).toFixed(2)}  vy ${(b.vel[1] * runner.sim.params.h).toFixed(3)} m/s  F/W ${(b.force[1] / -g[1]).toFixed(2)}  wet ${(b.wet ?? 0).toFixed(2)}  angle ${(2 * Math.atan2(b.quat[2], b.quat[3])).toFixed(2)}`);
+    }
   }
   const s = runner.sim.measureSync();
   console.log(`density ${density} ${shape}: y(t) every 0.5s:${line}`);

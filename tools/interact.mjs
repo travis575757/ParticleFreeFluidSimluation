@@ -136,6 +136,25 @@ try {
     check(`scene "${sc}" runs`, ok, `mass ${(s.mass * 100).toFixed(4)}%  volume ${(s.vol * 100).toFixed(1)}%  CFL ${s.cfl.toFixed(1)}${s.err ? '  ' + s.err : ''}`);
     await shot('scene_' + sc);
   }
+  // the first scene at the highest resolution in the menu, watched through its first seconds
+  // (the deepest grid hierarchy and the largest scatter passes the app can be asked for)
+  const top = await page.evaluate(() => { const o = [...document.querySelector('#c-n').options]; return o[o.length - 1].value; });
+  await page.evaluate((v, n) => {
+    const s = document.querySelector('#c-scene'); s.value = v; s.dispatchEvent(new Event('change'));
+    const r = document.querySelector('#c-n'); r.value = n; r.dispatchEvent(new Event('change'));
+  }, scenes[0], top);
+  const w = { cfl: 0, rmax: 0, vlo: 1, vhi: 1, dm: 0, bad: null };
+  const fTop = await page.evaluate(() => window.__frames);
+  for (let k = 1; k <= 12 && !w.bad; k++) {
+    await page.waitForFunction((f) => window.__frames >= f || window.__error, { timeout: 120000 }, fTop + 25 * k);
+    const s = await page.evaluate(() => { const s = window.runner.sim.measureSync(); return { mass: s.massRatio, vol: s.volumeRatio, cfl: s.cfl, rmax: s.maxRhoP, err: window.__error || null }; });
+    if (s.err || ![s.mass, s.vol, s.cfl, s.rmax].every(Number.isFinite)) { w.bad = s.err || 'non-finite state'; break; }
+    w.cfl = Math.max(w.cfl, s.cfl); w.rmax = Math.max(w.rmax, s.rmax);
+    w.vlo = Math.min(w.vlo, s.vol); w.vhi = Math.max(w.vhi, s.vol); w.dm = Math.max(w.dm, Math.abs(s.mass - 1));
+  }
+  check(`scene "${scenes[0]}" at ${top} cells stays bounded for 300 steps`,
+    !w.bad && w.cfl < 40 && w.dm < 1e-3 && w.vlo > 0.8 && w.vhi < 1.25,
+    w.bad || `CFL <= ${w.cfl.toFixed(1)}  rho' <= ${w.rmax.toFixed(1)}  volume ${(w.vlo * 100).toFixed(1)}-${(w.vhi * 100).toFixed(1)}%  mass drift ${w.dm.toExponential(1)}`);
   check('no page errors', errors.length === 0, errors.slice(0, 3).join(' | '));
 } catch (e) {
   console.log('FAIL  harness error: ' + (e.stack || e.message));
