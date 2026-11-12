@@ -38,6 +38,14 @@ const SHOTS = [
   { name: 'world-harbour-bricks', page: 'world3d.html?scene=harbour&bricks', steps: 600 },
   { name: 'world-buoys', page: 'world3d.html?scene=buoys', steps: 1260 },
   { name: 'world-buoys-bricks', page: 'world3d.html?scene=buoys&bricks', steps: 1260 },
+  // ... with a height field: the view, and the page with the map of who has the water
+  { name: 'world-river', page: 'world3d.html?scene=river', steps: 1800 },
+  { name: 'world-surf', page: 'world3d.html?scene=surf', steps: 2400 },
+  { name: 'world-dam', page: 'world3d.html?scene=dam', steps: 480 },
+  { name: 'world-dam-later', page: 'world3d.html?scene=dam', steps: 1800 },
+  { name: 'world-cave', page: 'world3d.html?scene=cave', steps: 1445 },
+  { name: 'world-spring', page: 'world3d.html?scene=spring', steps: 2400 },
+  { name: 'app-world-surf', page: 'world3d.html?scene=surf', steps: 2400, ui: true },
 ];
 
 const argv = process.argv.slice(2);
@@ -82,7 +90,17 @@ try {
         const R = window.runner || window.world;
         const s = await R.sim.measure();
         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-        if (window.world) return `t ${R.time.toFixed(2)} s  ${R.sim.bricks} bricks, ${(R.sim.storedCells / 1e6).toFixed(2)} M cells stored of ${(R.boundsCells() / 1e6).toFixed(1)} M in the box around them`;
+        if (window.world) {
+          let row = `t ${R.time.toFixed(2)} s  ${R.sim.bricks} bricks, ${(R.sim.storedCells / 1e6).toFixed(2)} M cells stored of ${(R.boundsCells() / 1e6).toFixed(1)} M in the box around them`;
+          const tr = R.tiers();
+          if (tr) {
+            // who has the water, per column of bricks, and how much of the budget of solved bricks is in use
+            let wet = 0, solved = 0;
+            for (const t of tr.tier) { if (t & 7) wet++; if ((t & 3) === 3) solved++; }
+            row += `; height field: ${wet} columns of bricks with water, ${solved} solved in 3D, ${R.sim.bricks - R.sim.nHeld} of ${R.sim.params.maxSolved || 3000} solved bricks, ${R.sim.nHeld} copies`;
+          }
+          return row;
+        }
         return `t ${R.time.toFixed(2)} s  mass ${(s.massRatio * 100).toFixed(4)} %  CFL ${s.cfl.toFixed(1)}`;
       }, n - done).catch((e) => { failed = true; return 'FAILED: ' + e.message; });
       done = n;

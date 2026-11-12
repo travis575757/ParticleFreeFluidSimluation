@@ -1,0 +1,464 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>hand-over between the 3D solver and the height field</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// Stage 3 of world mode: the water that is not solved is a height field (shallow water), and the
+// two solvers hand liquid over to each other where they meet. A channel with a flat bed, a
+// window of solved bricks in its middle:
+//   ?mode=rest    a lake: with the window in it, it stays at rest
+//   ?mode=river   a uniform river runs through the window: the same depth, speed and discharge
+//                 before it, in it and behind it as without the window
+//   ?mode=wave    a hump of water travels along the channel and through the window: how much of
+//                 it comes back from the window (against the same run without one), how much
+//                 gets through, and the water of both solvers together stays what it was.
+//                 &sigma=60 half-width of the hump (cells), &amp=2 its height, &window=0 no
+//                 window at all, &window=all the whole channel solved
+//   ?mode=swap    solving a stretch of the height field and handing it back at once changes nothing
+//   ?mode=drop    nothing stored: a ball of water falls into the lake. Bricks are solved where it
+//                 splashes and given back to the height field afterwards.
+//   ?dim=2|3  &steps=  &every=  &p.<param>=value (solver)  &hf.<param>=value (height field)  &map=1
+// Lengths are cells of 10 cm, 60 steps per second.
+import { GLContext } from '../src/gl.js';
+import { SparseSim } from '../src/world/sparsesim.js';
+import { HeightField } from '../src/world/heightfield.js';
+import { staticSolidTest } from '../src/world/terrain.js';
+
+const q = new URLSearchParams(location.search);
+const dim = Number(q.get('dim') || 2);
+const mode = q.get('mode') || 'rest';
+const num = (k, d) => (q.has(k) ? Number(q.get(k)) : d);
+const params = {}, hparams = {};
+for (const [k, v] of q) {
+  if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
+  if (k.startsWith('hf.')) hparams[k.slice(3)] = Number(v);
+}
+const log = (s) => console.log(s);
+let failed = 0;
+const check = (ok, what) => { if (!ok) failed++; log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); };
+const yieldNow = () => new Promise((r) => setTimeout(r));
+const e = (v, d = 1) => v.toExponential(d);
+
+try {
+  if (document.readyState !== 'complete') await new Promise((r) => addEventListener('load', r, { once: true }));
+  const glc = new GLContext(document.getElementById('c'));
+  log(`readback ${glc.readback} | ${glc.renderer}`);
+  const CELL = 2, bedY = 4, mid = dim === 2 ? 0.5 : 0;
+  // (3D: a channel; for the drop a square lake, where the waves of the splash can spread)
+  const nx = num('nx', dim === 2 ? 1024 : mode === 'drop' ? 128 : 256), nz = dim === 2 ? 1 : num('nz', mode === 'drop' ? 128 : 32);
+  const LX = nx * CELL, LZ = nz * CELL;
+  // A basin: a floor, and walls at the edges of the height field's map. (The map ends there and
+  // so does its water; without walls the solved water at the edge pours out over the floor
+  // beyond, into bricks that are stored for it as for any liquid.)
+  const wall = (ax, at, side) => { const c = [LX / 2, 0, dim === 2 ? mid : LZ / 2]; c[ax] = at + side * 500; const half = [1e5, 1e5, 1e5]; half[ax] = 500; return { type: 'box', center: c, half }; };
+  const floor = [{ type: 'box', center: [0, bedY - 500, mid], half: [1e5, 500, 1e5] }, wall(0, 0, -1), wall(0, LX, 1)];
+  if (dim === 3) floor.push(wall(2, 0, -1), wall(2, LZ, 1));
+
+  /** A solver with a height field under it. lifecycle 0: the bricks are what the test says. */
+  const world = (lifecycle, depth) => {
+    const S = new SparseSim(glc, { dim, params: { h: 0.1, lifecycle, ...params } });
+    const g = -S.params.gravity[1] / S.params.h;
+    const hf = new HeightField(glc, { origin: [0, 0], n: [nx, nz], cell: CELL, gravity: g, params: { sync: 1, ...hparams } });
+    hf.setBed(() => bedY);
+    S.setHeightField(hf);
+    // (the boxes lie along the axes: a cell whose centre is half a cell deep is solid throughout)
+    S.solidBrick = staticSolidTest(dim, null, floor, 0.5);
+    return { S, hf, g, dt: S.params.dt, depth };
+  };
+  /** Solve the bricks of the box of cells x0..x1 (3D: the middle half of the width), from the bed to `top`. */
+  const windowOf = (W, x0, x1, top, wide = false) => {
+    const lo = [x0, 0, dim === 2 || wide ? 0 : LZ / 4], hi = [x1, top, dim === 2 ? 1 : wide ? LZ : 3 * LZ / 4];
+    W.S.ensureBox(lo, hi);
+    W.S._syncBricks();
+    return { lo, hi };
+  };
+  /** The height field, and with it what the 3D solver holds: h follows its liquid, u its faces. */
+  const look = (W) => {
+    const { S, hf } = W;
+    const s = hf.read();
+    const c = glc.read(S.hfc.C[0]);
+    let vTrue = 0, vol = 0, own = 0, off = 0, air = 0;
+    for (let i = 0; i < s.h.length; i++) {
+      // (with what has been handed over to the height field and not been taken in yet)
+      const v = (s.h[i] + s.x[i]) * hf.area;
+      vol += v;
+      // (the water the 3D solver has, counted in its own cells; elsewhere the height field's,
+      // and the liquid in solved bricks over it, which is no part of its depth)
+      if (s.m[i] === 1) { vTrue += c[4 * i]; own++; off = Math.max(off, Math.abs(s.h[i] - c[4 * i] / hf.area)); } else { vTrue += v + c[4 * i]; air += c[4 * i]; }
+    }
+    vol += air;
+    return { ...s, vTrue, vol, own, off, air };
+  };
+  // row of texels along x through the middle of the map
+  const rowOf = (a) => a.subarray(Math.floor(nz / 2) * nx, Math.floor(nz / 2) * nx + nx);
+  // the depths of that row alone
+  const rowH = (f) => { const d = glc.read(f.H[0], 0, Math.floor(nz / 2), nx, 1), o = new Float32Array(nx); for (let k = 0; k < nx; k++) o[k] = d[4 * k]; return o; };
+  const mapOf = (S) => {
+    const set = S.levels[0].set, bb = set.bounds();
+    if (!bb) return;
+    if (dim === 3) {
+      // bricks per row: solved / held
+      const rows = new Map();
+      for (let s = 0; s < set.high; s++) if (set.used[s]) { const r = rows.get(set.by[s]) || [0, 0]; r[set.state(s) === 2 ? 1 : 0]++; rows.set(set.by[s], r); }
+      log('    rows (solved/held): ' + [...rows.keys()].sort((u, v) => u - v).map((y) => `${y}: ${rows.get(y).join('/')}`).join(', '));
+    }
+    const z = dim === 2 ? 0 : Math.floor(LZ / 2 / S.B);
+    for (let y = bb.hi[1] - 1; y >= bb.lo[1]; y--) {
+      let row = `  ${String(y).padStart(4)} `;
+      for (let x = bb.lo[0]; x < bb.hi[0]; x++) { const s = set.get(x, y, z); row += s < 0 ? '.' : set.state(s) === 2 ? '-' : '#'; }
+      log(row);
+    }
+  };
+
+  if (mode === 'rest') {
+    const depth = num('depth', 12.3), steps = num('steps', 600);
+    const W = world(0, depth);
+    const { S, hf } = W;
+    hf.fill(bedY + depth);
+    S.reset(floor, []);
+    // (?window=all: the whole lake, which is then the 3D solver's alone)
+    const all = q.get('window') === 'all';
+    const win = all ? windowOf(W, 0, LX, bedY + depth + 6, true) : windowOf(W, LX / 2 - 80, LX / 2 + 80, bedY + depth + 6);
+    const a = look(W);
+    log(`${dim}D lake ${depth} cells deep, ${nx} x ${nz} texels: ${S.bricks} bricks, ${S.nHeld} held; ${a.own} texels are the 3D solver's`);
+    if (q.get('map') === '1') mapOf(S);
+    const split = (s) => { let v3 = 0, vh = 0; const c = glc.read(S.hfc.C[0]); for (let i = 0; i < s.h.length; i++) { if (s.m[i] === 1) v3 += c[4 * i]; else vh += (s.h[i] + s.x[i]) * hf.area; } return [v3, vh]; };
+    const s0 = split(a);
+    let moved = 0;
+    for (let i = 1; i <= steps; i++) {
+      S.step();
+      if (q.get('v') === '1') {
+        // what the step moved into the held cells, as "column" counted it
+        const c = glc.read(S.hfc.C[0]);
+        for (let k = 0; k < nx * nz; k++) moved += c[4 * k + 1];
+        if (i % num('every', 100) === 0) { const s1 = split(look(W)); log(`  step ${i}: the 3D solver's liquid ${e(s1[0] - s0[0], 3)} cells, the height field's ${e(s1[1] - s0[1], 3)}; into the held cells so far ${e(moved, 3)}`); }
+      }
+    }
+    const b = look(W);
+    let dh = 0, vmax = 0;
+    for (let i = 0; i < a.h.length; i++) { dh = Math.max(dh, Math.abs(b.h[i] - a.h[i])); vmax = Math.max(vmax, Math.abs(b.u[i]), Math.abs(b.w[i])); }
+    const m = S.measureSync();
+    check(a.own > 0 && b.own === a.own, `the window is the 3D solver's (${b.own} texels)`);
+    check(dh < 2e-3 && vmax < 0.02, `after ${(steps * W.dt).toFixed(0)} s the lake is at rest: depths within ${e(dh)} cells, fastest face of the height field ${e(vmax)} cells/s, fastest liquid of the 3D solver ${e(m.maxSpeed)} cells/s`);
+    check(b.off < 1e-3, `the depth of the height field under the window is the liquid of the 3D solver (within ${e(b.off)} cells)`);
+    check(Math.abs(b.vTrue - a.vTrue) <= 1e-6 * a.vTrue && Math.abs(b.vol - a.vol) <= 1e-6 * a.vol, `no water lost or gained: ${e((b.vTrue - a.vTrue) / a.vTrue)} of ${a.vTrue.toFixed(0)} cells counted in both solvers, ${e((b.vol - a.vol) / a.vol)} in the height field's depths`);
+    S.dispose(); hf.dispose();
+  }
+
+  if (mode === 'river') {
+    const depth = num('depth', 12.3), fr = num('fr', 0.4), steps = num('steps', 1800), every = num('every', 300);
+    const W = world(0, depth);
+    const { S, hf, g, dt } = W;
+    const U = fr * Math.sqrt(g * depth), qin = U * depth;
+    hf.setState(() => depth, () => [U, 0]);
+    // a source at the upstream end, a level held at the other
+    hf.sources = [{ box: [0, 0, 32, LZ], rate: qin / 32 }, { box: [LX - 32, 0, LX, LZ], level: bedY + depth, pull: 0.3 }];
+    // the river without the window first, until it is steady
+    const flux = (s) => { const h = rowOf(s.h), u = rowOf(s.u), f = new Float64Array(nx); for (let i = 1; i < nx; i++) f[i] = u[i] * (u[i] > 0 ? h[i - 1] : h[i]); return f; };
+    const spread = (f, i0, i1) => { let lo = Infinity, hi = -Infinity; for (let i = i0; i < i1; i++) { lo = Math.min(lo, f[i]); hi = Math.max(hi, f[i]); } return [lo, hi]; };
+    const T0 = 24, T1 = nx - 24;
+    let worst = 1, spin = 0;
+    for (let round = 0; round < 60 && worst > 0.002; round++) {
+      for (let i = 0; i < 600; i++) hf.step(dt);
+      spin += 600;
+      const [lo, hi] = spread(flux(hf.read()), T0, T1);
+      worst = (hi - lo) / qin;
+    }
+    const ref = hf.read();
+    const rh = Float64Array.from(rowOf(ref.h)), ru = Float64Array.from(rowOf(ref.u));
+    log(`${dim}D river: ${depth} cells deep at ${U.toFixed(1)} cells/s (Froude ${fr}), ${qin.toFixed(1)} cells^2/s; steady without a window after ${(spin * dt).toFixed(0)} s (discharge within ${(worst * 100).toFixed(2)} %)`);
+    S.reset(floor, []);
+    const x0 = LX / 2 - 128, x1 = LX / 2 + 128;
+    if (q.get('window') !== '0') windowOf(W, x0, x1, bedY + depth + 6);
+    hf.readLedger();
+    const a = look(W), in0 = hf.added - hf.removed;
+    log(`  window: cells ${x0}..${x1}, ${S.bricks} bricks, ${S.nHeld} held, ${a.own} texels the 3D solver's`);
+    if (q.get('map') === '1') mapOf(S);
+    // means over the last second, of three stretches: before the window, in it, behind it
+    const parts = [['before', 40, x0 / CELL - 16], ['in', x0 / CELL + 8, x1 / CELL - 8], ['behind', x1 / CELL + 16, nx - 40]];
+    const acc = parts.map(() => [0, 0, 0, 0]);
+    let n = 0, worstV = 0, fluxLo = Infinity, fluxHi = -Infinity;
+    for (let i = 1; i <= steps; i++) {
+      S.step();
+      if (i % every === 0 || i > steps - 60) {
+        const s = look(W);
+        hf.readLedger();
+        const off = s.vTrue - a.vTrue - (hf.added - hf.removed - in0);
+        worstV = Math.max(worstV, Math.abs(off));
+        const h = rowOf(s.h), u = rowOf(s.u), f = flux(s);
+        if (i > steps - 60) {
+          n++;
+          parts.forEach(([, i0, i1], k) => { for (let t = i0; t < i1; t++) { acc[k][0] += h[t] / rh[t]; acc[k][1] += u[t] / ru[t]; acc[k][2] += f[t] / qin; acc[k][3]++; } });
+          const [lo, hi] = spread(f, T0, T1);
+          fluxLo = Math.min(fluxLo, lo); fluxHi = Math.max(fluxHi, hi);
+        }
+        if (i % every === 0) {
+          const [lo, hi] = spread(f, T0, T1);
+          log(`  step ${i}: discharge ${(lo / qin * 100).toFixed(1)} .. ${(hi / qin * 100).toFixed(1)} % of what is put in; depth ${parts.map(([nm, i0, i1]) => `${nm} ${(h.subarray(i0, i1).reduce((x, y) => x + y, 0) / (i1 - i0)).toFixed(3)}`).join(', ')}; books ${e(off / a.vTrue)} (in the height field's depths ${e((s.vol - a.vol - (hf.added - hf.removed - in0)) / a.vol)}; ${s.own} texels, depth against the 3D liquid within ${e(s.off)}; not in the depths yet: ${e(s.x.reduce((m, v) => Math.max(m, Math.abs(v)), 0))} at the most, ${e(s.x.reduce((m, v) => m + v, 0))} in all); ${hf.subSteps} sub-steps`);
+        }
+        await yieldNow();
+      }
+    }
+    if (q.get('dump') === '1') {
+      const s = look(W), h = rowOf(s.h), u = rowOf(s.u), f = flux(s), m = rowOf(s.m);
+      for (const [i0, i1, st] of [[x0 / CELL - 14, x0 / CELL + 6, 1], [x0 / CELL + 6, x1 / CELL - 6, 8], [x1 / CELL - 6, x1 / CELL + 14, 1]]) {
+        let row = `    texels ${i0}.. (mark | depth, % of the river without a window | speed % | discharge % of what is put in):`;
+        for (let k = i0; k < i1; k += st) row += ` ${m[k]}|${(h[k] / rh[k] * 100).toFixed(1)}|${(u[k] / ru[k] * 100).toFixed(1)}|${(f[k] / qin * 100).toFixed(1)}`;
+        log(row);
+      }
+    }
+    if (q.get('dump') === '2') {
+      // a few steps one by one, at the upstream edge of the window
+      const t0 = x0 / CELL - 3, t1 = x0 / CELL + 3;
+      for (let k = 0; k < 8; k++) {
+        S.step();
+        const s = look(W), h = rowOf(s.h), u = rowOf(s.u), x = rowOf(s.x), c = glc.read(S.hfc.C[0]);
+        let row = `    +${k} (depth | speed % | exchange left | D of the step):`;
+        for (let t = t0; t < t1; t++) row += `  ${h[t].toFixed(3)}|${(u[t] / ru[t] * 100).toFixed(1)}|${x[t].toFixed(3)}|${(c[4 * t + 1] / hf.area).toFixed(3)}`;
+        log(row);
+      }
+    }
+    const r = acc.map((v) => [v[0] / v[3], v[1] / v[3], v[2] / v[3]]);
+    const txt = parts.map(([nm], k) => `${nm} the window depth ${((r[k][0] - 1) * 100).toFixed(2)} %, speed ${((r[k][1] - 1) * 100).toFixed(2)} %, discharge ${((r[k][2] - 1) * 100).toFixed(2)} %`).join('; ');
+    check(r.every((v) => Math.abs(v[0] - 1) < 0.02 && Math.abs(v[1] - 1) < 0.02 && Math.abs(v[2] - 1) < 0.02), `after ${(steps * dt).toFixed(0)} s, against the river without a window: ${txt}`);
+    check(fluxLo / qin > 0.95 && fluxHi / qin < 1.05, `the discharge through every face is ${(fluxLo / qin * 100).toFixed(1)} .. ${(fluxHi / qin * 100).toFixed(1)} % of what is put in (over the last second)`);
+    const through = hf.added;
+    check(worstV <= 1e-5 * Math.max(a.vTrue, through), `no water lost or gained: off by ${e(worstV / Math.max(a.vTrue, through))} at the most (${a.vTrue.toFixed(0)} cells in the channel, ${through.toFixed(0)} put through)`);
+    S.dispose(); hf.dispose();
+  }
+
+  if (mode === 'wave') {
+    // (two cells high: the 3D solver carries a wave lower than a cell at a speed that depends on
+    // how full the cell at the surface is, see README; &amp= to measure that)
+    const depth = num('depth', 12.3), sigma = num('sigma', 60), amp = num('amp', 2);
+    const steps = num('steps', 3600), every = num('every', 600);
+    const W = world(0, depth);
+    const { S, hf, g, dt } = W;
+    const c0 = Math.sqrt(g * depth);
+    const xs = num('from', 0.28 * LX), x0 = LX / 2 - 96, x1 = LX / 2 + 96;
+    const eta = (x) => amp * Math.exp(-(((x - xs) / sigma) ** 2));
+    // (a wave that travels one way: u = 2 (sqrt(g (d + eta)) - sqrt(g d)))
+    const init = (f) => f.setState((x) => depth + eta(x), (x) => [2 * (Math.sqrt(g * (depth + eta(x))) - c0), 0]);
+    init(hf);
+    const ref = new HeightField(glc, { origin: [0, 0], n: [nx, nz], cell: CELL, gravity: g, params: { sync: 1, ...hparams } });
+    ref.setBed(() => bedY);
+    init(ref);
+    S.reset(floor, []);
+    // (window=all: the whole channel is the 3D solver's, the hump with it: what that solver alone makes of the wave)
+    if (q.get('window') === 'all') windowOf(W, 32, LX - 32, bedY + depth + 6);
+    else if (q.get('window') !== '0') windowOf(W, x0, x1, bedY + depth + 6);
+    const a = look(W);
+    // probes: half way between the hump and the window, and as far behind the window
+    const pL = Math.round(0.5 * (xs + x0) / CELL), pR = Math.round((x1 + 0.5 * (x0 - xs)) / CELL);
+    // until the wave has come back from the end of the channel to the probe behind the window
+    const tEnd = Math.min((2 * LX - xs - pR * CELL - 3 * sigma) / c0, steps * dt);
+    log(`${dim}D channel ${depth} cells deep (waves at ${c0.toFixed(1)} cells/s), a hump of ${amp} cells, half-width ${sigma} (${(2 * Math.PI * depth / (3.5 * sigma)).toFixed(2)} depths per radian of its length), at ${xs.toFixed(0)}; ` +
+      `window ${x0}..${x1}: ${S.bricks} bricks, ${S.nHeld} held; probes at ${pL * CELL} and ${pR * CELL}, measured for ${tEnd.toFixed(1)} s`);
+    const m = { inL: 0, backL: 0, inR: 0, outR: 0, diffR: 0, tRef: 0, tOut: 0 };
+    const dumpAt = q.has('dump') ? q.get('dump').split(',').map(Number) : [];
+    const dump = (i) => {
+      const s = hf.read();
+      if (q.get('wide') === '1') {
+        const r = ref.read();
+        let row = `    step ${i} eta (ref):`;
+        for (let k = x0 / CELL - 60; k < x1 / CELL + 60; k += 4) row += ` ${k}${'.-#'[s.m[k]]}${(s.h[k] - depth).toFixed(3)}(${(r.h[k] - depth).toFixed(3)})`;
+        log(row);
+        row = `    step ${i} u (ref):`;
+        for (let k = x0 / CELL - 60; k < x1 / CELL + 60; k += 4) row += ` ${k}${'.-#'[s.m[k]]}${s.u[k].toFixed(3)}(${r.u[k].toFixed(3)})`;
+        log(row);
+        return;
+      }
+      const c = glc.read(S.hfc.C[0]), c1 = glc.read(S.hfc.C1);
+      if (q.get('cells') === '1') {
+        // the velocity and the density of the cells of the buffer and the first solved cells, in three rows
+        const lo = [x0 - 20, 0, 0], n = [28, 32, 1];
+        const v = glc.read(S.resolve(S.T.vel[0], lo, n)).slice(), r = glc.read(S.resolve(S.T.rho[0], lo, n)).slice();
+        for (const y of [8, 15, 16, 17]) {
+          let row = `    step ${i} cells x ${lo[0]}.., y ${y}: u`;
+          for (let x = 0; x < n[0]; x++) row += ` ${(1000 * v[4 * (y * n[0] + x)]).toFixed(1)}`;
+          row += ' | rho';
+          for (let x = 0; x < n[0]; x++) row += ` ${r[4 * (y * n[0] + x)].toFixed(4)}`;
+          log(row);
+        }
+      }
+      for (const [i0, i1] of [[x0 / CELL - 12, x0 / CELL + 4], [x1 / CELL - 4, x1 / CELL + 12]]) {
+        let row = `    step ${i}, texels ${i0}..${i1 - 1} (mark | eta | u | 1000 x exchange | velocity of the 3D faces):`;
+        for (let k = i0; k < i1; k++) row += ` ${s.m[k]}|${(s.h[k] - depth).toFixed(4)}|${s.u[k].toFixed(3)}|${(1000 * c[4 * k + 1] / hf.area).toFixed(2)}|${(c1[4 * k + 1] > 0 ? c1[4 * k] / c1[4 * k + 1] : 0).toFixed(3)}`;
+        log(row);
+      }
+    };
+    let worstV = 0, worstVol = 0, worstOff = 0;
+    for (let i = 1; i <= steps; i++) {
+      S.step();
+      ref.step(dt);
+      if (dumpAt.includes(i)) dump(i);
+      const t = i * dt;
+      if (t <= tEnd && i % 2 === 0) {
+        const h = rowH(hf), hr = rowH(ref);
+        m.inL = Math.max(m.inL, hr[pL] - depth);
+        m.backL = Math.max(m.backL, Math.abs(h[pL] - hr[pL]));
+        if (hr[pR] - depth > m.inR) { m.inR = hr[pR] - depth; m.tRef = t; }
+        if (h[pR] - depth > m.outR) { m.outR = h[pR] - depth; m.tOut = t; }
+        m.diffR = Math.max(m.diffR, Math.abs(h[pR] - hr[pR]));
+      }
+      if (i % every === 0 || i === steps) {
+        const s = look(W);
+        worstV = Math.max(worstV, Math.abs(s.vTrue - a.vTrue));
+        worstVol = Math.max(worstVol, Math.abs(s.vol - a.vol));
+        worstOff = Math.max(worstOff, s.off);
+        let top = 0, at = 0;
+        const h = rowOf(s.h);
+        for (let k = 0; k < nx; k++) if (h[k] - depth > top) { top = h[k] - depth; at = k * CELL; }
+        log(`  step ${i}: crest ${top.toFixed(3)} cells at ${at}; books ${e((s.vTrue - a.vTrue) / a.vTrue)}; fastest 3D liquid ${S.measureSync().maxSpeed.toFixed(2)} cells/s`);
+        await yieldNow();
+      }
+    }
+    const R = m.backL / m.inL, T = m.outR / m.inR;
+    const long = sigma >= 40;
+    check(R < (long ? 0.1 : 0.15), `of a hump ${m.inL.toFixed(3)} cells high ${(R * 100).toFixed(1)} % comes back from the window (allowed ${long ? 10 : 15} %)`);
+    check(Math.abs(T - 1) < (long ? 0.1 : 0.3), `behind the window it is ${m.outR.toFixed(3)} cells high, ${(T * 100).toFixed(1)} % of what it is without a window; it arrives ${(m.tOut - m.tRef).toFixed(2)} s later; the two runs differ by ${(m.diffR / m.inR * 100).toFixed(0)} % of it at the most`);
+    // The hand-overs themselves lose nothing (mode=rest&v=1 shows the height field gaining exactly
+    // what the solver's cells next to it gave up). What is left is the 3D solver's own drift in
+    // single precision: a lake that is solved everywhere and at rest loses 1.4e-6 of itself in 10 s
+    // (mode=rest&window=all), solved water in motion about as much. In 2D that stays below the
+    // 1e-5 aimed at for a minute; in 3D it comes to 1.0e-5 .. 1.1e-5, so the bound there is 2e-5.
+    const tol = dim === 2 ? 1e-5 : 2e-5;
+    check(worstV <= tol * a.vTrue && worstVol <= tol * a.vol, `no water lost or gained in ${(steps * dt).toFixed(0)} s: counted in both solvers off by ${e(worstV / a.vTrue)} at the most, in the height field's depths ${e(worstVol / a.vol)} (allowed ${e(tol)}); depth under the window against the 3D liquid within ${e(worstOff)} cells`);
+    S.dispose(); hf.dispose(); ref.dispose();
+  }
+
+  if (mode === 'swap') {
+    const depth = num('depth', 12.3);
+    const W = world(0, depth);
+    const { S, hf, g } = W;
+    const c0 = Math.sqrt(g * depth), xs = LX / 2;
+    const eta = (x) => 1.5 * Math.exp(-(((x - xs) / 40) ** 2));
+    hf.setState((x) => depth + eta(x), (x) => [2 * (Math.sqrt(g * (depth + eta(x))) - c0), 0]);
+    S.reset(floor, []);
+    for (let i = 0; i < 30; i++) S.step();       // (no bricks yet: the height field alone)
+    const a = look(W);
+    const win = windowOf(W, xs - 96, xs + 96, bedY + depth + 8);
+    const b = look(W);
+    const set = S.levels[0].set, list = [];
+    for (let s = 0; s < set.high; s++) if (set.used[s] && set.state(s) !== 2) list.push([set.bx[s], set.by[s], set.bz[s]]);
+    for (const k of list) S.setHeld(...k, true);
+    S._syncBricks();
+    const c = look(W);
+    const diff = (p, r, k) => { let d = 0; for (let i = 0; i < p[k].length; i++) d = Math.max(d, Math.abs(p[k][i] - r[k][i])); return d; };
+    log(`${dim}D: a hump ${Math.max(...a.h).toFixed(2)} cells deep moving at up to ${Math.max(...a.u).toFixed(1)} cells/s; ${list.length} bricks solved (${b.own} texels) and held again`);
+    check(b.own > 0 && c.own === 0, `the stretch was the 3D solver's (${b.own} texels) and is the height field's again (${c.own})`);
+    // (a browser that alters what is read back flips a few of the last bits: GLContext._testReadback)
+    const bit = glc.readback === 'exact' ? 0 : 1e-5;
+    check(diff(a, b, 'h') <= bit && diff(a, c, 'h') <= bit, `the depths are the same ${bit ? 'within what this browser adds to a read-back (1e-5 cells)' : 'to the last bit'}: differ by ${e(diff(a, b, 'h'))} when solved, ${e(diff(a, c, 'h'))} when handed back`);
+    check(diff(a, c, 'u') < 1e-3 * Math.max(...a.u), `the velocities come back within ${e(diff(a, c, 'u'))} cells/s (when solved: ${e(diff(a, b, 'u'))})`);
+    check(b.off < 1e-4, `solved, the bricks hold the water the height field has there (within ${e(b.off)} cells of depth)`);
+    // and once more after the 3D solver has had it for a while: nothing lost on the way
+    for (const k of list) S.setHeld(...k, false);
+    for (let i = 0; i < 60; i++) S.step();
+    const d = look(W);
+    const set2 = S.levels[0].set;
+    for (let s = 0; s < set2.high; s++) if (set2.used[s] && set2.state(s) !== 2) S.setHeld(set2.bx[s], set2.by[s], set2.bz[s], true);
+    S._syncBricks();
+    const f = look(W);
+    check(diff(d, f, 'h') <= bit && Math.abs(f.vol - a.vol) <= 1e-6 * a.vol, `after a second in the 3D solver: handing back leaves the depths as they are (${e(diff(d, f, 'h'))}), the water what it was (${e((f.vol - a.vol) / a.vol)})`);
+    S.dispose(); hf.dispose();
+  }
+
+  if (mode === 'drop') {
+    const depth = num('depth', 12.3), r = num('r', dim === 2 ? 8 : 6), drop = num('drop', 30);
+    // (3D: the short waves of the splash, which a height field cannot hold, keep the middle of the lake solved for a minute)
+    const steps = num('steps', dim === 2 ? 2400 : 4800), every = num('every', Math.floor(steps / 12));
+    const W = world(1, depth);
+    const { S, hf, dt } = W;
+    hf.fill(bedY + depth);
+    const v0 = hf.volume();
+    const xc = LX / 2 + 3, zc = dim === 2 ? mid : LZ / 2 + 3;
+    S.reset(floor, [{ type: 'ball', center: [xc, bedY + depth + drop, zc], radius: r, vel: [0, 0, 0] }]);
+    const ball = look(W).vol - v0;
+    const flips = new Map();
+    S.onState = (x, y, z, what) => {
+      if (what === 'wake' || what === 'sleep') { const k = `${x},${y},${z}`; flips.set(k, (flips.get(k) || 0) + 1); }
+      if (q.get('v') === '1' && S.frame >= num('from', 1e9) - 1 && S.frame <= num('to', 0)) log(`    frame ${S.frame}: ${what} ${x},${y},${z}`);
+    };
+    log(`${dim}D lake ${depth} cells deep: a ball of ${ball.toFixed(1)} cells of water ${drop} cells above it; ${S.bricks} bricks stored, ${S.nHeld} held`);
+    let peak = 0, peakSolved = 0, last = 0, worstVol = 0, refused = 0, edge = 0, lastRep = null;
+    for (let i = 1; i <= steps; i++) {
+      S.step();
+      const rep = S.report;
+      if (rep && rep !== lastRep) {
+        lastRep = rep; edge += rep.edge;
+        if (rep.edge && q.get('v') === '2') {
+          // which bricks: the report the lifecycle has just acted on
+          const r = S.reports.find((u) => u.frame === rep.frame), set = S.levels[0].set;
+          let row = `    step ${i}: report of frame ${rep.frame}, ${rep.edge} cells at an edge:`;
+          if (r && r.data) for (let s = 0; s < r.high; s++) if (r.used[s] && r.data[0][4 * s + 2] > 0.5) row += ` ${r.bx[s]},${r.by[s]},${r.bz[s]}${set.state(s) === 2 ? 'h' : ''}:${r.data[0][4 * s + 2]}`;
+          log(row);
+        }
+      }
+      peak = Math.max(peak, S.bricks); peakSolved = Math.max(peakSolved, S.bricks - S.nHeld);
+      refused = S.refused;
+      if (S.bricks) last = i;
+      if (i % every === 0 || i === steps || (i >= num('from', 1e9) && i <= num('to', 0))) {
+        const s = look(W);
+        worstVol = Math.max(worstVol, Math.abs(s.vol - v0 - ball));
+        let top = 0, vmax = 0;
+        for (let k = 0; k < s.h.length; k++) { top = Math.max(top, Math.abs(s.h[k] - depth)); vmax = Math.max(vmax, Math.abs(s.u[k]), Math.abs(s.w[k])); }
+        log(`  step ${i}: ${S.bricks} bricks, ${S.nHeld} held; ${s.own} texels the 3D solver's; surface within ${top.toFixed(3)} cells of rest, fastest face ${vmax.toFixed(2)} cells/s; books ${e((s.vol - v0 - ball) / v0)}; ${s.air.toFixed(1)} cells in the air, depth against the 3D liquid within ${e(s.off)}${q.get('v') === '1' ? `; freed ${e(S.freedMass)}, vTrue ${e((s.vTrue - v0 - ball) / v0)}, x total ${e(s.x.reduce((m, v) => m + v, 0))}` : ''}`);
+        if (q.get('v') === '3') {
+          // why the solved bricks in the water are still solved: from the newest report
+          const r = S.reports[S.reports.length - 1], set = S.levels[0].set;
+          let n = 0, off = 0, moving = 0, reached = 0, pinned = 0, strong = 0, young = 0, cells = [0, 0];
+          if (r && r.data) {
+            const [, , C, D] = r.data;
+            for (let t = 0; t < r.high; t++) {
+              if (!r.used[t] || !set.used[t] || set.state(t) === 2 || !S._farWet(set.bx[t], set.by[t], set.bz[t])) continue;
+              n++;
+              const a = D[4 * t + 1] % 4194304;
+              if (D[4 * t + 1] >= 4194304) strong++;
+              if (a >= 1023.5) { off++; cells[0] += Math.floor(a / 1024); } else if (a > 0.5) { moving++; cells[1] += a; }
+              if (Math.round(C[4 * t + 2]) & 2) reached++;
+              if (S.pinOf[t] > S._pinStamp - S.params.pinHold) pinned++;
+              if (S.frame - S.since[t] < S.params.hfAwakeMin) young++;
+            }
+          }
+          log(`    ${n} solved bricks in the water: ${off} with cells off (${cells[0]}), ${moving} with cells moving only (${cells[1]}), ${strong} with fast cells, ${reached} reached by the moving cells of others, ${pinned} pinned, ${young} solved for less than ${S.params.hfAwakeMin} steps`);
+        }
+        if (q.get('map') === '1') {
+          mapOf(S);
+          // where the surface is furthest from rest, and what is there
+          let row = '    texel: mark|depth|speed|not in the depth yet:';
+          let k0 = 0;
+          for (let k = 0; k < s.h.length; k++) if (Math.abs(s.h[k] - depth) > Math.abs(s.h[k0] - depth)) k0 = k;
+          for (let k = Math.max(k0 - 10, 0); k < Math.min(k0 + 11, s.h.length); k++) row += ` ${k}: ${s.m[k]}|${s.h[k].toFixed(3)}|${s.u[k].toFixed(2)}|${s.x[k].toFixed(3)}`;
+          log(row);
+        }
+        await yieldNow();
+      }
+    }
+    const s = look(W);
+    // The channel has no friction: the waves of the splash go on for ever. What the hand-overs
+    // must not do is add to them: the energy of the waves against what the ball brought.
+    const level = depth + ball / (LX * (dim === 2 ? 1 : LZ));
+    let top = 0, energy = 0;
+    for (let k = 0; k < s.h.length; k++) {
+      top = Math.max(top, Math.abs(s.h[k] - level));
+      energy += hf.area * (0.5 * W.g * (s.h[k] - level) ** 2 + 0.5 * s.h[k] * (s.u[k] ** 2 + s.w[k] ** 2));
+    }
+    const brought = ball * W.g * (drop + depth - level);
+    const most = Math.max(0, ...flips.values());
+    check(peakSolved > 0 && S.bricks === 0, `bricks were solved where the ball fell (${peakSolved} at the most, ${peak} stored) and all given back (${S.bricks} left; the last at step ${last})`);
+    check(edge === 0 && refused === 0, `the liquid never reached the edge of the stored bricks (${edge} cell reports), no brick was refused (${refused})`);
+    check(most <= 4, `no brick changed between solved and held more than ${most} times`);
+    check(worstVol <= 1e-5 * v0, `the height field holds the lake and the ball: off by ${e(worstVol / v0)} at the most`);
+    check(energy < brought, `at the end the waves (within ${top.toFixed(2)} cells of the new level) have ${(energy / brought * 100).toFixed(0)} % of the energy the ball brought`);
+    S.dispose(); hf.dispose();
+  }
+
+  log(failed ? `${failed} check(s) failed` : 'all checks passed');
+} catch (err) {
+  console.log('ERROR ' + (err.stack || err));
+  window.__error = String(err);
+}
+window.__done = true;
+</script>

@@ -81,13 +81,30 @@ layout(location = 0) out vec4 oRho;
 layout(location = 1) out vec4 oP;
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
-  vec2 f = farState(cellOf(G, t));
-  oRho = vec4(texelFetch(uFrac, t, 0).a * f.x, 1.0, 0.0, 0.0);
+  ivec3 c = cellOf(G, t);
+  vec2 f = farState(c);
+  oRho = vec4(farFill(c, texelFetch(uFrac, t, 0).a), 1.0, 0.0, 0.0);
   if (uMerge == 1) {
     vec4 r = texelFetch(uRho, t, 0);
     if (r.r > oRho.r) oRho = r;
   }
   oP = vec4(f.y, 0.0, 0.0, 0.0);
+}`;
+
+  // The velocity of the water at rest, for bricks that have just been stored (over a height field
+  // it is not zero: a brick that came into a river standing still would be a rock in it).
+  // uMerge = 1: only where the liquid there has no velocity of its own (a scene's liquid, at reset).
+  S.farVelFill = `${H}
+uniform Grid G;
+${FAR}
+uniform sampler2D uVel;
+uniform int uMerge;
+out vec4 o;
+void main() {
+  ivec2 t = ivec2(gl_FragCoord.xy);
+  vec3 f = farVel(cellOf(G, t));
+  vec3 v = texelFetch(uVel, t, 0).xyz;
+  o = vec4(uMerge == 1 && dot(v, v) > 0.0 ? v : f, 0.0);
 }`;
 
   // Per slot, before that reset: what the step moved into a held brick. r = sum over its cells of
@@ -109,7 +126,7 @@ void main() {
   for (int i = 0; i < CB; i++) {
     ivec3 l = ivec3(i & BM, (i >> LB) & BM, i >> (2 * LB));
     ivec2 t = slotTexel(G.tiles, slot, l);
-    float d = texelFetch(uRho, t, 0).r - texelFetch(uFrac, t, 0).a * farState(g_frame + l).x;
+    float d = texelFetch(uRho, t, 0).r - farFill(g_frame + l, texelFetch(uFrac, t, 0).a);
     sum += d;
     sumAbs += abs(d);
     big = max(big, abs(d));
@@ -147,11 +164,62 @@ uniform float uEdge;
 uniform vec3 uSleep;      // speed (cells/s), pressure, density
 uniform vec3 uWake;       // speed, pressure, speed that wakes a body that sleeps
 uniform vec2 uMist;       // mass (cells), speed (cells/s)
+uniform float uSlope;     // over a height field: a surface steeper than this is not at rest
+uniform float uBedLayer;  // ... and in this many cells over the bed neither pressure nor density is looked at
 layout(location = 0) out vec4 o0;   // mass, peak speed in wet cells, cells with density above uEdge on a face whose neighbour brick is not stored, peak rho
 layout(location = 1) out vec4 o1;   // lowest wet cell (brick-local), number of wet cells
 layout(location = 2) out vec4 o2;   // highest wet cell, excess: sum of rho - rho at rest
 layout(location = 3) out vec4 o3;   // lowest and highest waking cell (x + 16 y + 256 z; -1: none), cells not at rest (moving + 1024 * off + 4194304 if one is fast enough to wake a body), sum of rho at rest
 float pack(vec3 c) { return c.x + 16.0 * c.y + 256.0 * c.z; }
+// the steepest slope of the height field's surface between the texel over cell c and those next to it
+float hfSlope(ivec3 c) {
+  ivec2 t;
+  if (!hfTexel(c - uAnchor, t)) return 0.0;
+  vec3 a = hfLevel(t);
+  // (in water a cell deep at least: where the ground runs through a column of the 3D solver's,
+  // the depth is the water it holds and says little about where its surface is)
+  if (a.x < a.y + 1.0) return 0.0;
+  ivec2 n = textureSize(uHf, 0);
+  float s = 0.0;
+  for (int k = 0; k < 4; k++) {
+    ivec2 u = t + ivec2(k == 0 ? 1 : k == 1 ? -1 : 0, k == 2 ? 1 : k == 3 ? -1 : 0);
+    if (u.x < 0 || u.y < 0 || u.x >= n.x || u.y >= n.y) continue;
+    if (texelFetch(uHfBed, u, 0).g > 0.5) continue;
+    vec3 b = hfLevel(u);
+    if (b.x >= b.y + 1.0) s = max(s, abs(a.x - b.x));
+  }
+  return s * uHfMap.z;
+}
+// Is cell c within uBedLayer cells of the bed of its texel of the height field? The bed of a
+// texel is the mean of its ground, and its copy fills the cells from that bed up. On sloping
+// ground the solver's water lies along the slope instead: cell by cell the two differ by up to
+// a cell of water wherever the water is thin, with the same amount in the column, and thin
+// water on a bank would stay solved for good on that account.
+bool bedLayer(ivec3 c) {
+  ivec2 t;
+  if (uBedLayer <= 0.0 || !hfTexel(c - uAnchor, t)) return false;
+  return float(c.y - uAnchor.y) < texelFetch(uHfBed, t, 0).r + uBedLayer;
+}
+// Is the brick at c over water of the height field that the solver has no part of? What hangs
+// in the air there, not a liquid cell in it, is going nowhere: it goes along with whatever the
+// nearest liquid does. Its brick is dropped and the height field takes it ("fold").
+bool hfOnlyBelow(ivec3 c) {
+  ivec2 t0;
+  if (!hfTexel(c - uAnchor, t0)) return false;
+  ivec2 n = textureSize(uHf, 0);
+  int per = int(floor(float(BS) * uHfMap.z + 0.5));
+  for (int j = 0; j < per; j++) {
+    for (int i = 0; i < per; i++) {
+      ivec2 t = t0 + ivec2(i, DIM == 3 ? j : 0);
+      if (t.x >= n.x || t.y >= n.y) continue;
+      if (texelFetch(uHf, t, 0).a > 0.5) return false;
+    }
+#if DIM == 2
+    break;
+#endif
+  }
+  return true;
+}
 void main() {
   ivec2 st = ivec2(gl_FragCoord.xy);
   int slot = st.x + st.y * G.tiles.x;
@@ -167,13 +235,13 @@ void main() {
     openLo[d] = unknownCell(G, g_frame - AX[d]);
     openHi[d] = unknownCell(G, g_frame + BS * AX[d]);
   }
-  bool water = uWaterN > 0;
+  bool water = FAR_ON;
   // (water at rest above and below solved water is a lid and a floor by design, stored or not)
   if (water && farWetBrick(g_frame)) {
     if (openLo[1] && farWetBrick(g_frame - BS * AX[1])) openLo[1] = false;
     if (openHi[1] && farWetBrick(g_frame + BS * AX[1])) openHi[1] = false;
   }
-  float mass = 0.0, vmax = 0.0, edge = 0.0, rmax = 0.0, n = 0.0, excess = 0.0, awake = 0.0, rest = 0.0;
+  float mass = 0.0, vmax = 0.0, vmist = 0.0, edge = 0.0, rmax = 0.0, n = 0.0, excess = 0.0, awake = 0.0, rest = 0.0;
   vec3 lo = vec3(BIG), hi = vec3(-BIG), wlo = vec3(BIG), whi = vec3(-BIG);
   bool anyLiquid = false, strong = false;
   for (int i = 0; i < CB; i++) {
@@ -187,8 +255,14 @@ void main() {
       n += 1.0;
       if (liquid) anyLiquid = true;
       rmax = max(rmax, rho);
-      speed = length(texelFetch(uVel, t, 0).xyz);
+      vec3 vel = texelFetch(uVel, t, 0).xyz;
+      speed = length(vel);
       vmax = max(vmax, speed);
+      // (at rest means: as the water at rest moves, which over a height field it does)
+      if (uHfMap.w > 0.5) speed = length(vel - farVel(g_frame + l));
+      // (mist hovers over a river that is not solved by going along with it: it has the
+      // velocity of the nearest liquid, which is the river's)
+      vmist = max(vmist, speed);
       lo = min(lo, vec3(l));
       hi = max(hi, vec3(l));
       bool e = false;
@@ -198,7 +272,7 @@ void main() {
     if (!water) continue;
     vec2 f = farState(g_frame + l);
     float V = texelFetch(uFrac, t, 0).a;
-    float fr = V * f.x;
+    float fr = farFill(g_frame + l, V);
     float dev = rho - fr;
     rest += fr;
     excess += dev;
@@ -213,12 +287,14 @@ void main() {
     // and then no pressure and no velocity that mean anything)
     if (!liquid || V < 0.5 || fetchC(uLiq, G, g_frame + l + AX[1]).r >= 0.0) speed = 0.0;
     float dp = liquid && V >= 0.5 ? abs(texelFetch(uP, t, 0).r - f.y) : 0.0;
-    if (dp > uSleep.y || abs(dev) > uSleep.z) awake += 1024.0;
+    // (the slope: once per column of cells)
+    bool off = (dp > uSleep.y || abs(dev) > uSleep.z) && !bedLayer(g_frame + l);
+    if (off || (l.y == 0 && uSlope > 0.0 && hfSlope(g_frame + l) > uSlope)) awake += 1024.0;
     else if (speed > uSleep.x) awake += 1.0;
     if (speed > uWake.x || (uWake.y > 0.0 && dp > uWake.y)) { wlo = min(wlo, vec3(l)); whi = max(whi, vec3(l)); }
     if (speed > uWake.z) strong = true;
   }
-  if (!anyLiquid && mass <= uMist.x && vmax <= uMist.y && !(water && farWetBrick(g_frame))) { n = 0.0; edge = 0.0; }
+  if (!anyLiquid && mass <= uMist.x && (vmist <= uMist.y || hfOnlyBelow(g_frame)) && !(water && farWetBrick(g_frame))) { n = 0.0; edge = 0.0; }
   if (strong) awake += 4194304.0;
   o0 = vec4(mass, vmax, edge, rmax);
   o1 = vec4(lo, n);
@@ -274,7 +350,7 @@ void main() {
     float r = reach(a0.y);
     bool reaches = wet && !g_held;
     bool wakes = a3.x >= 0.0 && !g_held;
-    bool rest = uWaterN > 0 && farWetBrick(g_frame);     // this brick holds water of a body at rest
+    bool rest = FAR_ON && farWetBrick(g_frame);     // this brick holds water of a body at rest
     vec3 wlo = unpack(max(a3.x, 0.0)), whi = unpack(max(a3.y, 0.0));
 #if DIM == 2
     const int K = 0;

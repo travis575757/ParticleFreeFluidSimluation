@@ -12,6 +12,11 @@
 // drawn from its density, moved up or down by what the map says its surface should differ by:
 // nothing inside the solved water, and at its edge whatever makes the two surfaces meet.
 //
+// The water of a height field (src/world/heightfield.js) that is not solved is traced as what it
+// is: a surface over its map (hfSurf). Where the 3D solver has a column, the same water is drawn
+// from its density, and the surface of the height field is put where that density would cross
+// one half if the column were stored as it stands, so a column that changes hands does not move.
+//
 // The density is first copied into a pool of its own in which every brick carries a border of
 // one cell from its neighbours: inside a brick the GPU's own filtering then gives a continuous
 // trilinear density from two fetches.
@@ -45,7 +50,7 @@ out vec4 o;
 // density of cell c; if it is not stored: of the water at rest that belongs there, if any
 float cellDens(ivec3 c) {
   vec4 q = fetchC(uLiq, G, c);
-  return q.g < 0.0 && uWaterN > 0 ? farState(c).x : max(0.5 - q.r, 0.0);
+  return q.g < 0.0 && FAR_ON ? farState(c).x : max(0.5 - q.r, 0.0);
 }
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
@@ -59,7 +64,7 @@ void main() {
   ivec3 l = ivec3(lx % ${AP}, t.y - tile.y * ${AP}, lx / ${AP}) - 1;
   ivec3 c = g_frame + l;
   float d = cellDens(c);
-  if (uWaterN > 0 && (l.x < 0 || l.x > BM || l.z < 0 || l.z > BM)) {
+  if (FAR_ON && (l.x < 0 || l.x > BM || l.z < 0 || l.z > BM)) {
     // A border cell beside the brick whose water is not solved (held, or not stored): the surface
     // of that water is the map's, not what is stored there. The border continues the brick's own
     // density in a straight line, so its surface runs on to the face of the brick as it arrives.
@@ -92,7 +97,7 @@ ${TERRAIN}
 ${FAR_FIELD}
 ${SWELL}
 ${prims('S')}
-uniform float uKind[${MAX_PRIMS}];    // per primitive: 0 fixed obstacle, 1 scripted body, 2.. rigid body colours
+uniform float uKind[${MAX_PRIMS}];    // per primitive: 0 fixed obstacle, 1 scripted body, 2..5 rigid body colours, 6 rock (as the ground where it is steep)
 const float FAR = 20000.0;
 
 // slot of brick b, -1 if it is not stored (the top level of the page table wraps: the answer
@@ -171,6 +176,130 @@ float waterEnter(vec3 ro, vec3 rd, vec3 inv, vec3 lo, vec3 hi, float t, float tO
   }
   return ta + (tb - ta) * fa / (fa - fb);
 }
+// ---- the water of a height field where it is not solved
+uniform sampler2D uHfGrp;     // per group of 16 x 16 columns of bricks: lowest bed, highest level of its water
+uniform ivec4 uHfGrpMap;      // group x and z of texel (0, 0) of uHfGrp, its size
+// The sea beyond the map (World.sea): for the eye only, nothing is solved or kept count of
+// there. Its surface is level + amp sin(phase - k (xz - origin) . dir), the swell that the
+// strip at the edge of the map sends in.
+uniform vec4 uHfSea;          // level, amp, k, phase
+uniform vec4 uHfSeaDir;       // dir, origin . dir, 1 if there is such a sea
+float hfSea(vec2 xz) {
+  return uHfSea.x + uHfSea.y * sin(uHfSea.w - uHfSea.z * (dot(xz - vec2(uAnchor.xz), uHfSeaDir.xy) - uHfSeaDir.z)) + float(uAnchor.y);
+}
+// where the density of a column filled to lv crosses one half between the centres of its cells
+float hfIso(float lv) {
+  float top = floor(lv - 0.5);
+  float a = min(lv - top, 1.0), b = max(lv - top - 1.0, 0.0);
+  return top + 0.5 + (a - 0.5) / (a - b);
+}
+// The surface of the height field's water at xz: x = its height, y > 0 if there is water (the
+// share of the texels around that are wet). Between the centres of the texels it runs straight;
+// dry ground below the water next to it counts with its own height (a front runs out on the
+// ground it runs over), higher dry ground does not (a shore: the water is level up to it, and
+// the ground itself is what hides it). Without water: the height of the bed.
+// iso: as the density would show it (see hfIso), else the level as it is.
+vec2 hfSurf(vec2 xz, bool iso) {
+  ivec2 n = textureSize(uHf, 0);
+  vec2 q = (xz - vec2(uAnchor.xz) - uHfMap.xy) * uHfMap.z;
+  if (q.x < 0.0 || q.y < 0.0 || q.x > float(n.x) || q.y > float(n.y)) return uHfSeaDir.w > 0.5 ? vec2(hfSea(xz), 1.0) : vec2(-1.0e9, 0.0);
+  if (iso) {
+    // (only where bricks are stored: next to solved water, where the two surfaces have to meet.
+    // Elsewhere the level as it is: hfIso() has a kink at every cell of height, which a surface
+    // seen at a low angle shows as stripes)
+    ivec2 k = ivec2(floor(xz / float(BS))) - uHfColsMap.xy;
+    vec4 c = k.x >= 0 && k.y >= 0 && k.x < uHfColsMap.z && k.y < uHfColsMap.w ? texelFetch(uHfCols, k, 0) : vec4(0.0);
+    iso = c.a > c.b;
+  }
+  q -= 0.5;
+  vec2 f0 = floor(q), f = q - f0;
+  float lv[4], wt[4];
+  int kind[4];              // 0: no part of the map, 1: dry, 2: wet
+  float sw = 0.0, sl = 0.0;
+  for (int k = 0; k < 4; k++) {
+    ivec2 t = ivec2(f0) + ivec2(k & 1, k >> 1);
+    wt[k] = ((k & 1) == 1 ? f.x : 1.0 - f.x) * ((k >> 1) == 1 ? f.y : 1.0 - f.y);
+    kind[k] = 0;
+    lv[k] = 0.0;
+    if (t.x < 0 || t.y < 0 || t.x >= n.x || t.y >= n.y) continue;
+    vec2 b = texelFetch(uHfBed, t, 0).rg;
+    if (b.y > 0.5) continue;
+    float h = texelFetch(uHf, t, 0).r;
+    if (h > 1.0e-3) { kind[k] = 2; lv[k] = iso ? hfIso(b.x + h) : b.x + h; sw += wt[k]; sl += wt[k] * lv[k]; }
+    else { kind[k] = 1; lv[k] = b.x; }
+  }
+  float an = float(uAnchor.y);
+  if (sw <= 0.0) {
+    float sb = 0.0, wb = 0.0;
+    for (int k = 0; k < 4; k++) if (kind[k] == 1) { sb += wt[k] * lv[k]; wb += wt[k]; }
+    return vec2(wb > 0.0 ? sb / wb + an : -1.0e9, 0.0);
+  }
+  float l0 = sl / sw, w = sw;
+  for (int k = 0; k < 4; k++) if (kind[k] == 1 && lv[k] < l0) { sl += wt[k] * lv[k]; w += wt[k]; }
+  return vec2(sl / w + an, sw);
+}
+// lowest bed and highest level of the height field's water in the block at lo (a brick, or a
+// group of bricks none of which is stored); x > y: it has none
+vec2 hfRange(vec3 lo, float size) {
+  ivec2 b = ivec2(floor(lo.xz / float(BS) + 0.5));
+  vec2 q = vec2(1.0, 0.0);
+  if (size > float(BS) + 0.5) {
+    ivec2 g = (b >> LS) - uHfGrpMap.xy;
+    if (g.x >= 0 && g.y >= 0 && g.x < uHfGrpMap.z && g.y < uHfGrpMap.w) q = texelFetch(uHfGrp, g, 0).rg;
+  } else {
+    ivec2 k = b - uHfColsMap.xy;
+    if (k.x >= 0 && k.y >= 0 && k.x < uHfColsMap.z && k.y < uHfColsMap.w) q = texelFetch(uHfCols, k, 0).rg;
+  }
+  vec2 r = q.y > q.x ? q + float(uAnchor.y) : vec2(1.0, 0.0);
+  if (uHfSeaDir.w > 0.5) {
+    // (a block that is not all over the map has the sea beyond it too)
+    vec2 a = (lo.xz - vec2(uAnchor.xz) - uHfMap.xy) * uHfMap.z, c = a + size * uHfMap.z;
+    vec2 n = vec2(textureSize(uHf, 0));
+    if (a.x < 0.0 || a.y < 0.0 || c.x > n.x || c.y > n.y) {
+      vec2 sea = vec2(uHfSea.x - uHfSea.y - 1.0e4, uHfSea.x + uHfSea.y) + float(uAnchor.y);
+      r = r.x < r.y ? vec2(min(r.x, sea.x), max(r.y, sea.y)) : sea;
+    }
+  }
+  return r;
+}
+// for a ray in the air: how far p is above the water (<= 0: in it); for one in the water: how
+// far below its surface (<= 0: out of it)
+float hfSide(vec3 p, bool inside) {
+  vec2 s = hfSurf(p.xz, true);
+  if (inside) return s.y > 0.0 ? s.x - p.y : -1.0;
+  return s.y > 0.0 ? p.y - s.x : max(p.y - s.x, 0.0) + 0.75;
+}
+// Where between ta and tb the ray crosses the surface of the height field's water (or, inside,
+// leaves the water): -1 if it does not. Steps as far as a surface no steeper than 1 allows.
+// g_hfLeft: the steps ran out at this distance, before tb (-1: they did not).
+float g_hfLeft = -1.0;
+float hfTrace(vec3 ro, vec3 rd, float ta, float tb, bool inside) {
+  g_hfLeft = -1.0;
+  float per = 1.0 / (length(rd.xz) + abs(rd.y));
+  float t = ta;
+  float g = hfSide(ro + rd * t, inside);
+  // (inside: the caller has made sure of it; the ray may start on the surface itself)
+  if (g <= 0.0) { if (!inside) return ta; g = 0.05; }
+  for (int k = 0; k < 40; k++) {
+    if (t >= tb) return -1.0;
+    float tn = min(t + clamp(g * per, 0.3 + 0.003 * t, 12.0 + 0.01 * t), tb);
+    float gn = hfSide(ro + rd * tn, inside);
+    if (gn <= 0.0) {
+      float a = t, b = tn, ga = g, gb = gn;
+      for (int j = 0; j < 5; j++) {
+        // (where the water just ends there is no slope to go by)
+        float m = gb > -0.5 ? a + (b - a) * ga / (ga - gb) : 0.5 * (a + b);
+        float gm = hfSide(ro + rd * m, inside);
+        if (gm > 0.0) { a = m; ga = gm; } else { b = m; gb = gm; }
+      }
+      return gb > -0.5 ? a + (b - a) * ga / (ga - gb) : b;
+    }
+    t = tn;
+    g = gn;
+  }
+  if (t < tb) g_hfLeft = t;
+  return -1.0;
+}
 // First place after t0 where the density crosses 0.5, away from the side the ray starts on
 // (inside: in liquid); -1 if there is none before tEnd. Adds up the density met in air (mist)
 // and, with uOverlay, lines along the edges of the stored bricks the ray enters.
@@ -220,7 +349,32 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
       }
     }
     if (s < 0) {
-      if (!stored && uWaterN > 0) {
+      if (!stored && uHfMap.w > 0.5) {
+        // nothing solved here: the water of the height field, if it has any in this block
+        vec2 yr = hfRange(lo, size);
+        // (the range is a few steps old: a bore that has come into the block since stands
+        // higher than it says, and was drawn with holes in its crest)
+        float y0 = max(lo.y, yr.x - 1.0), y1 = min(lo.y + size, yr.y + 8.0);
+        bool any = yr.x < yr.y && y0 < y1;
+        vec2 tw = any ? boxHit(ro, inv, vec3(lo.x, y0, lo.z), vec3(lo.x + size, y1, lo.z + size)) : vec2(1.0, 0.0);
+        float wa = max(tw.x, t), wb = min(min(tw.y, tOut), tEnd);
+        if (inside) {
+          // (the block was picked 2e-3 further along the ray; and the ray may start on the surface itself)
+          if (wa >= wb || wa > t + 3.0e-3 || hfSide(ro + rd * (t + 0.05), true) <= -0.1) return t;
+          float te = hfTrace(ro, rd, t + 0.05, wb, true);
+          if (te >= 0.0) return te;
+          if (g_hfLeft >= 0.0) { t = g_hfLeft; continue; }
+          if (wb < min(tOut, tEnd) - 1.0e-3) return wb;
+          prev = 1.0;
+          t = tOut;
+          continue;
+        }
+        if (wa < wb) {
+          float te = hfTrace(ro, rd, wa, wb, false);
+          if (te >= 0.0) { g_mapped = true; return te; }
+          if (g_hfLeft >= 0.0) { prev = 0.0; t = g_hfLeft; continue; }
+        }
+      } else if (!stored && uWaterN > 0) {
         // nothing solved here: the water at rest of the bodies of water, if this is in one
         if (inside) {
           float surf;
@@ -261,6 +415,14 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
     // out of steps (a long way over stored bricks): what is left is the water at rest
     float te = waterEnter(ro, rd, inv, vec3(-1.0e9), vec3(1.0e9), t, tEnd);
     if (te >= 0.0 && te < tEnd) { g_mapped = true; return te; }
+  }
+  if (!inside && uHfMap.w > 0.5 && t < tEnd) {
+    // out of steps (a long way low over the water of a height field, brick by brick where
+    // some are stored): what is left is that water, and if the steps run out once more the
+    // ray is as good as on it. (Without this: holes behind the crests, with the sea bed in them.)
+    float te = hfTrace(ro, rd, t, tEnd, false);
+    if (te < 0.0 && g_hfLeft >= 0.0 && hfSide(ro + rd * g_hfLeft, false) < 4.0) te = g_hfLeft;
+    if (te >= 0.0) { g_mapped = true; return te; }
   }
   return -1.0;
 }
@@ -352,6 +514,17 @@ vec3 liquidNormal(vec3 p, bool mapped) {
   ivec3 b = ivec3(floor(p / float(BS)));
   int s = mapped ? -1 : brickSlot(b);
   if (s < 0 || g_state > 1.5) {
+    if (uHfMap.w > 0.5) {
+      // (the level as it is: hfIso() has a ripple of its own, one per cell of height)
+      float e = 0.5 / uHfMap.z;
+      float c = hfSurf(p.xz, false).x;
+      vec2 xa = hfSurf(p.xz - vec2(e, 0.0), false), xb = hfSurf(p.xz + vec2(e, 0.0), false);
+      vec2 za = hfSurf(p.xz - vec2(0.0, e), false), zb = hfSurf(p.xz + vec2(0.0, e), false);
+      // (towards dry ground: the slope on the side that has water)
+      float dx = xa.y > 0.0 && xb.y > 0.0 ? (xb.x - xa.x) / (2.0 * e) : xb.y > 0.0 ? (xb.x - c) / e : xa.y > 0.0 ? (c - xa.x) / e : 0.0;
+      float dz = za.y > 0.0 && zb.y > 0.0 ? (zb.x - za.x) / (2.0 * e) : zb.y > 0.0 ? (zb.x - c) / e : za.y > 0.0 ? (c - za.x) / e : 0.0;
+      return normalize(vec3(-dx, 1.0, -dz));
+    }
     vec4 m = swellAt(p.xz);
     return normalize(vec3(-m.b, 1.0, -m.a));
   }
@@ -407,7 +580,8 @@ vec3 shadeOpaque(vec3 p, float idx, float t) {
       : kind < 2.5 ? vec3(0.95, 0.60, 0.20)
       : kind < 3.5 ? vec3(0.90, 0.33, 0.35)
       : kind < 4.5 ? vec3(0.42, 0.78, 0.50)
-      : vec3(0.68, 0.55, 0.93);
+      : kind < 5.5 ? vec3(0.68, 0.55, 0.93)
+      : vec3(0.17, 0.155, 0.14) * (0.8 + 0.4 * fract(sin(floor(p.y / 5.0 + 0.6 * sin(p.x * 0.05) + 0.6 * sin(p.z * 0.07)) * 12.9898) * 43758.5453));
   }
   float dif = max(dot(n, uLight), 0.0) * groundShadow(p + n * 0.3);
   vec3 c = base * (0.26 + 0.20 * (n.y * 0.5 + 0.5) + 1.0 * dif);
@@ -444,6 +618,14 @@ void main() {
     float tEnd2 = op2.x > 0.0 ? op2.x : 400.0;
     float te = crossing(ph, rr, 0.05, tEnd2, true, 0.0, none, noLines);
     float thick = te >= 0.0 ? te : tEnd2;
+    if (te >= 0.0 && rr.y < 0.0 && uHfMap.w > 0.5) {
+      // Out of the back of a crest of the height field, with its water below: the ray goes into
+      // that next, and what it lands on is seen through it. (One stretch of water is all that
+      // is followed: without this the sea bed showed behind every steep crest as if it were dry.)
+      vec3 pe = ph + rr * te;
+      vec2 sf = hfSurf(pe.xz, false);
+      if (sf.y > 0.0 && pe.y < sf.x + 12.0) thick = tEnd2;
+    }
     vec3 behind = op2.x > 0.0 ? shadeOpaque(ph + rr * op2.x, op2.y, tw + op2.x) : sky(rr);
     vec3 trans = exp(-vec3(0.075, 0.020, 0.010) * thick);
     float body = 1.0 - exp(-thick * 0.035);
@@ -488,8 +670,13 @@ void main() {
     }
     const kinds = new Float32Array(MAX_PRIMS);
     kinds.set(world.solidKinds());
+    const grp = sim.hf ? sim.hfGroups() : null;
+    const sea = world.sea ? world.sea() : null;
     return {
+      uHfSea: sea ? [sea.level, sea.amp, sea.k, sea.phase] : [0, 0, 0, 0],
+      uHfSeaDir: sea ? [sea.dir[0], sea.dir[1], sea.origin[0] * sea.dir[0] + sea.origin[1] * sea.dir[1], 1] : [0, 0, 0, 0],
       ...sim._U(L0), ...sim._solidUniforms(), ...(sim.swell && o.swell !== false ? sim.swell.uniforms : this.noSwell),
+      ...(grp ? { uHfGrp: grp.tex, uHfGrpMap: grp.map } : { uHfGrp: this.noSwell.uSwell, uHfGrpMap: [0, 0, 0, 0] }),
       uVol: this.vol, uVolInv: [1 / this.vol.w, 1 / this.vol.h], uVolRow: this.perRow,
       uS1: sim.R.s[1], uS2: sim.R.s[2],
       uTerMax: world.terrain ? world.terrain.max : 0,

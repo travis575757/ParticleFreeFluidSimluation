@@ -133,15 +133,55 @@ try {
     const m0 = err ? 0 : await page.evaluate(() => window.world.mass0);
     // (a scene with a sea keeps its books above the water at rest: World.balance; what it stores is
     // one island round whatever moves, which fills the box around itself, so sparsity is not asked of it)
-    const bal = err ? 0 : await page.evaluate(async () => { await window.world.sim.settleLedger(); return { off: window.world.balance(), stored: window.world.sim.books.stored, sea: window.world.sim.water.length > 0 }; });
+    // (with a height field: all the water there is, the height field's and the 3D solver's)
+    const bal = err ? 0 : await page.evaluate(async () => {
+      const w = window.world;
+      const off = await w.balanceSettled();
+      const tr = w.tiers();
+      let solved = 0;
+      if (tr) for (const t of tr.tier) if ((t & 3) === 3) solved++;
+      return { off, stored: w.sim.books.stored, sea: w.sim.water.length > 0, hf: !!w.hf, water: w.sim.hfWater, solved };
+    });
     const shown = err ? '' : await page.evaluate(() => document.querySelector('#panel').innerText.match(/Unaccounted for\s*([^\n]+)/)?.[1] || '');
     const perf = err ? '' : await page.evaluate(() => document.querySelector('#panel').innerText.match(/Step \/ frame\s*([^\n]+)/)?.[1] || '');
-    const off = !s ? 1 : bal.sea ? Math.abs(bal.off) / Math.max(bal.stored, 1) : Math.abs(m0 + s.added - s.removed - s.freed - s.mass) / Math.max(m0 + s.added, 1);
-    const ok = !err && Number.isFinite(s.mass) && s.cfl < 14 && off < 1e-4 && s.refused === 0 && s.bricks > 0 && (bal.sea || s.cells < 0.8 * s.box);
-    check(`scene "${sc}" runs`, ok, err || `${s.bricks} bricks = ${(s.cells / 1e6).toFixed(2)} M cells (${(100 * s.cells / s.box).toFixed(0)} % of the box around them), ` +
+    const off = !s ? 1 : bal.hf ? Math.abs(bal.off) / Math.max(bal.water, 1) : bal.sea ? Math.abs(bal.off) / Math.max(bal.stored, 1) : Math.abs(m0 + s.added - s.removed - s.freed - s.mass) / Math.max(m0 + s.added, 1);
+    // (a height field needs no brick at all while nothing in view asks for one)
+    const ok = !err && Number.isFinite(s.mass) && s.cfl < 14 && off < 1e-4 && s.refused === 0 && (bal.hf || s.bricks > 0) && (bal.sea || bal.hf || s.cells < 0.8 * s.box);
+    check(`scene "${sc}" runs`, ok, err || `${s.bricks} bricks = ${(s.cells / 1e6).toFixed(2)} M cells (${(100 * s.cells / Math.max(s.box, 1)).toFixed(0)} % of the box around them), ` +
+      (bal.hf ? `${(bal.water / 1e6).toFixed(2)} M cells of water on the map, ${bal.solved} columns of bricks solved in 3D, ` : '') +
       `books off by ${off.toExponential(1)} (shown: ${shown}), fastest ${s.cfl.toFixed(1)} cells per step, ${perf}`);
     await shot('scene_' + sc);
   }
+  // a height field: the water around the view target is solved in 3D, and goes back to the map
+  // when the view moves on (the target is set as a Ctrl-drag would set it)
+  // (what was pinned by the view stays solved for 2 s after it has left: pinHold)
+  await page.goto(`http://localhost:${port}/world3d.html?scene=surf&capture`, { waitUntil: 'load' });
+  await page.waitForFunction(() => window.world?.time > 2 || window.__error, { timeout: 300000 });
+  const solvedAround = (p) => page.evaluate((p) => {
+    const w = window.world, tr = w.tiers(), B = w.sim.B;
+    let n = 0;
+    for (let k = 0; k < tr.tier.length; k++) {
+      if ((tr.tier[k] & 3) !== 3) continue;
+      const i = k % tr.n[0], j = (k - i) / tr.n[0];
+      if (Math.hypot((tr.origin[0] + i + 0.5) * B - p[0], (tr.origin[1] + j + 0.5) * B - p[2]) < 100) n++;
+    }
+    return n;
+  }, p);
+  const t0 = await page.evaluate(() => window.app.camera.target.slice());
+  const here0 = await solvedAround(t0);
+  check('the water around the view target is solved in 3D', here0 > 50, `${here0} columns of bricks within 10 m of it`);
+  const t1 = [t0[0], t0[1], t0[2] + 220];
+  const tm = await page.evaluate((t) => { window.app.camera.target = t; return window.world.time; }, t1);
+  await page.waitForFunction((t) => window.world.time > t + 4 || window.__error, { timeout: 300000 }, tm);
+  const there = await solvedAround(t1), left = await solvedAround(t0);
+  check('it follows the view', there > 50 && left === 0, `4 s after the target moved 22 m along the beach: ${there} columns solved around it, ${left} left where it was`);
+  const hb = await page.evaluate(async () => {
+    const w = window.world;
+    return { off: await w.balanceSettled(), water: w.sim.hfWater, evicted: w.sim.evicted, refused: w.sim.refused };
+  });
+  check('handing the water over and back loses none', Math.abs(hb.off) < 1e-5 * hb.water && hb.refused === 0, `off by ${hb.off.toFixed(2)} of ${(hb.water / 1e6).toFixed(2)} M cells`);
+  await shot('handover');
+
   // the crate tool: a crate dropped into the open sea lands in it, and its water is stored
   await page.goto(`http://localhost:${port}/world3d.html?scene=sea&capture`, { waitUntil: 'load' });
   await page.waitForFunction(() => window.world?.time > 0.2 || window.__error, { timeout: 120000 });
@@ -156,6 +196,26 @@ try {
   });
   check('crate tool drops a crate into the sea', cr.n === n0 + 1 && Math.abs(cr.y) < 6 && cr.here, `${cr.n} bodies, the new one ${cr.y.toFixed(1)} cells above the surface, its water ${cr.here ? 'stored' : 'not stored'} (bodies awake: ${cr.shown})`);
   await shot('crate');
+
+  // ... and on water that is a height field: the lake of the spring scene, far from the view target.
+  // The water under it is solved for as long as it moves; it comes to rest at its float line.
+  await page.goto(`http://localhost:${port}/world3d.html?scene=spring&capture`, { waitUntil: 'load' });
+  await page.waitForFunction(() => window.world?.time > 1 || window.__error, { timeout: 120000 });
+  const lake = await page.evaluate(() => {
+    const w = window.world, level = w.scene.marks.lake;
+    window.__crate = w.addBody({ shape: 'box', pos: [280, level + 20, 60], half: [5, 4, 5], round: 1, density: 0.45, color: 1 });
+    return { level, t: w.time };
+  });
+  await page.waitForFunction((t) => window.world.time > t + 14 || window.__error, { timeout: 300000 }, lake.t);
+  const fl = await page.evaluate(async () => {
+    const w = window.world, b = window.__crate;
+    return { y: b.pos[1], v: Math.hypot(...b.vel), asleep: b.asleep, off: await w.balanceSettled(), water: w.sim.hfWater, refused: w.sim.refused };
+  });
+  // (8 cells high, 0.45 of the water's density: 3.6 cells of it under water)
+  const line = lake.level + 4 - 0.45 * 8;
+  check('a crate dropped on the lake of a height field floats', Math.abs(fl.y - line) < 0.5 && fl.v < 1 && Math.abs(fl.off) < 1e-5 * fl.water && fl.refused === 0,
+    `14 s later ${(fl.y - line).toFixed(2)} cells above its float line, ${fl.asleep ? 'asleep' : `moving at ${fl.v.toFixed(2)} cells/s`}; books off by ${fl.off.toFixed(2)} of ${(fl.water / 1e3).toFixed(0)} k cells`);
+  await shot('crate_lake');
   check('no page errors', errors.length === 0, errors.slice(0, 3).join(' | '));
 } catch (e) {
   console.log('FAIL  harness error: ' + (e.stack || e.message));

@@ -1,0 +1,313 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>the height field on its own (src/world/heightfield.js)</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// The shallow-water solver of the height field, without a 3D solver next to it:
+//   a lake over a rough bed with dry shores and islands stays at rest
+//   a dam break over a wet bed: the bore travels at the speed of Stoker's solution, behind it the
+//     depth of that solution; over a dry bed the front and the tail of Ritter's
+//   water sloshing in a parabolic bowl (Thacker's planar solution) keeps its period
+//   steady flow over a bump: the same discharge everywhere, the dip of Bernoulli's equation
+//   a film of a tenth of a cell on a slope of 45 degrees stays finite
+//   a round dam break on a map keeps its symmetry
+//   two lakes joined by a link under the ground equalise as the law of the link says
+//   and none of them loses or gains water
+// Lengths are cells of 10 cm, g = 98.1 cells / s^2, 60 steps per second.
+//   ?only=sum,lake,wet,dry,bowl,bump,film,round,link  &time=1 (ms per step at 256, 512 and 1024 texels)
+import { GLContext } from '../src/gl.js';
+import { HeightField } from '../src/world/heightfield.js';
+import { LOST } from '../src/shaders/heightfield.js';
+
+const q = new URLSearchParams(location.search);
+const log = (s) => console.log(s);
+let failed = 0;
+const check = (ok, what) => { if (!ok) failed++; log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); };
+const only = q.get('only') ? q.get('only').split(',') : null;
+const want = (k) => !only || only.includes(k);
+const g = 98.1, dt = 1 / 60;
+
+try {
+  if (document.readyState !== 'complete') await new Promise((r) => window.addEventListener('load', r));
+  const glc = new GLContext(document.getElementById('c'));
+  log(`readback ${glc.readback} | ${glc.renderer}`);
+  const make = (n, cell = 2, params = {}) => new HeightField(glc, { origin: [0, 0], n, cell, gravity: g, params: { sync: 1, ...params } });
+  const run = (hf, steps) => { for (let i = 0; i < steps; i++) hf.step(dt); };
+  // (tol: a film that trickles into deep water loses what is below the last bit of the deep texel's depth)
+  const books = (hf, v0, what, tol = 1e-6) => {
+    hf.readLedger();
+    const v = hf.volume();
+    const off = v - v0 - hf.added + hf.removed;
+    check(Math.abs(off) <= tol * Math.max(v0, hf.added, 1), `${what}: no water lost or gained (${off.toExponential(1)} of ${Math.max(v0, hf.added).toFixed(0)} cells, ${(off / Math.max(v0, hf.added, 1)).toExponential(1)})`);
+  };
+
+  if (want('sum')) {
+    // The books of the height field rest on this: what a sum in single precision loses can be
+    // had exactly, if the compiler leaves the arithmetic as it is written.
+    const P = glc.program('lostTest', `#version 300 es
+precision highp float;
+uniform float uA;
+uniform float uB;
+out vec4 o;
+${LOST}
+void main() { float s = uA + uB; o = vec4(s, lost(uA, uB, s), 0.0, 0.0); }`);
+    const T = glc.texture(1, 1, 'rgba32f');
+    let worst = 0, some = 0;
+    for (const [x, y] of [[12.3, 1e-8], [12.3, -4.1666e-3], [0.1, 0.2], [1e-3, 172.6], [24.625, -1.4375001], [3.0000002, 5e-8], [16, -1e-7]]) {
+      const fa = Math.fround(x), fb = Math.fround(y);
+      glc.draw(P, T, { uA: fa, uB: fb, uOne: 1 });
+      const d = glc.read(T);
+      worst = Math.max(worst, Math.abs(d[0] + d[1] - (fa + fb)) / Math.abs(fa + fb));
+      if (d[1] !== 0) some++;
+      if (q.get('v') === '1') log(`  ${fa} + ${fb}: sum ${d[0]}, remainder ${d[1]}; exact remainder ${fa + fb - Math.fround(fa + fb)}`);
+    }
+    check(worst < 1e-12 && some >= 5, `what a sum in single precision loses is kept: sum + remainder is the exact sum within ${worst.toExponential(1)} (${some} of 7 sums lose something)`);
+    glc.deleteTexture(T);
+  }
+
+  if (want('lake')) {
+    // a bowl with bumps in it: a shore all round, islands, shallows
+    const hf = make([160, 120]);
+    const bedOf = (x, z) => 0.0009 * ((x - 160) ** 2 + (z - 120) ** 2) + 2.5 * Math.sin(0.11 * x) * Math.sin(0.13 * z) + 1.5 * Math.sin(0.31 * x + 0.2 * z);
+    hf.setBed(bedOf);
+    hf.fill(12.3);
+    const v0 = hf.volume();
+    const a = hf.read();
+    run(hf, 600);
+    const b = hf.read();
+    let vmax = 0, dh = 0, wet = 0, dry = 0;
+    for (let i = 0; i < a.h.length; i++) {
+      vmax = Math.max(vmax, Math.abs(b.u[i]), Math.abs(b.w[i]));
+      dh = Math.max(dh, Math.abs(b.h[i] - a.h[i]));
+      if (a.h[i] > 0) wet++; else dry++;
+    }
+    check(vmax < 1e-5 && dh < 1e-5, `a lake over a rough bed is at rest after 10 s: fastest ${vmax.toExponential(1)} cells/s (${(0.1 * vmax).toExponential(1)} m/s), depths within ${dh.toExponential(1)} cells (${wet} texels wet, ${dry} dry)`);
+    books(hf, v0, 'lake');
+    hf.dispose();
+  }
+
+  // the state of Stoker's solution between the fan and the bore
+  const stoker = (hL, hR) => {
+    const cL = Math.sqrt(g * hL);
+    const f = (hm) => 2 * (cL - Math.sqrt(g * hm)) - (hm - hR) * Math.sqrt(g * (hm + hR) / (2 * hm * hR));
+    let lo = hR, hi = hL;
+    for (let i = 0; i < 60; i++) { const m = 0.5 * (lo + hi); if (f(m) > 0) lo = m; else hi = m; }
+    const hm = 0.5 * (lo + hi), um = 2 * (cL - Math.sqrt(g * hm));
+    return { hm, um, S: um * hm / (hm - hR) };
+  };
+
+  if (want('wet')) {
+    const hf = make([512, 1]);
+    hf.setBed(() => 0);
+    const hL = 20, hR = 5, x0 = 512;
+    hf.setState((x) => (x < x0 ? hL : hR));
+    const v0 = hf.volume();
+    const steps = 150, t = steps * dt;
+    run(hf, steps);
+    const s = hf.read();
+    const { hm, um, S } = stoker(hL, hR);
+    // the bore: where the depth crosses the middle between the plateau and the water ahead
+    let front = 0;
+    for (let i = 0; i < 512; i++) if (s.h[i] > 0.5 * (hm + hR)) front = i;
+    const xf = (front + 1) * 2 - x0;
+    // the plateau: half way between the end of the fan and the bore
+    const xa = (um - Math.sqrt(g * hm)) * t, xm = x0 + 0.5 * (xa + S * t);
+    const im = Math.round(xm / 2);
+    check(Math.abs(xf / (S * t) - 1) < 0.1, `dam break over water (20 on 5 cells): the bore is ${xf.toFixed(0)} cells out after ${t.toFixed(1)} s, Stoker ${(S * t).toFixed(0)} (${((xf / (S * t) - 1) * 100).toFixed(1)} %)`);
+    check(Math.abs(s.h[im] / hm - 1) < 0.05 && Math.abs(s.u[im] / um - 1) < 0.05, `... behind it ${s.h[im].toFixed(2)} cells deep at ${s.u[im].toFixed(1)} cells/s, Stoker ${hm.toFixed(2)} at ${um.toFixed(1)}`);
+    books(hf, v0, 'dam break over water');
+    hf.dispose();
+  }
+
+  if (want('dry')) {
+    const hf = make([512, 1]);
+    hf.setBed(() => 0);
+    const hL = 20, x0 = 400;
+    hf.setState((x) => (x < x0 ? hL : 0));
+    const v0 = hf.volume();
+    const steps = 120, t = steps * dt;
+    run(hf, steps);
+    const s = hf.read();
+    const cL = Math.sqrt(g * hL);
+    // Ritter: h = (2 cL - x / t)^2 / (9 g) between x = -cL t and x = 2 cL t
+    const at = (h) => t * (2 * cL - 3 * Math.sqrt(g * h));
+    const where = (h) => { let k = 0; for (let i = 0; i < 512; i++) if (s.h[i] > h) k = i; return (k + 1) * 2 - x0; };
+    let tail = 0;
+    for (let i = 0; i < 512; i++) { if (s.h[i] < 0.99 * hL) { tail = i * 2 - x0; break; } }
+    const r = [0.5, 0.2, 0.05].map((f) => [f, where(f * hL), at(f * hL)]);
+    check(r.every(([, a, b]) => Math.abs(a / b - 1) < 0.1) && Math.abs(tail / (-cL * t) - 1) < 0.1,
+      `dam break over a dry bed after ${t.toFixed(1)} s: ` + r.map(([f, a, b]) => `${f * hL} cells deep at ${a.toFixed(0)} (Ritter ${b.toFixed(0)})`).join(', ') +
+      `; the tail at ${tail.toFixed(0)} (${(-cL * t).toFixed(0)}); the tip at ${where(0.001).toFixed(0)} (${(2 * cL * t).toFixed(0)})`);
+    let neg = 0;
+    for (const v of s.h) if (!(v >= 0)) neg++;
+    check(neg === 0, `... no depth below zero (${neg})`);
+    books(hf, v0, 'dam break over a dry bed');
+    hf.dispose();
+  }
+
+  if (want('bowl')) {
+    // Thacker: bed h0 ((x - xc)^2 / a^2 - 1), a flat surface that tilts back and forth; omega = sqrt(2 g h0) / a
+    const hf = make([512, 1]);
+    const h0 = 10, a = 300, xc = 512, B = 0.2 * Math.sqrt(2 * g * h0);
+    const om = Math.sqrt(2 * g * h0) / a, T = 2 * Math.PI / om;
+    hf.setBed((x) => h0 * (((x - xc) / a) ** 2 - 1));
+    const r = B / Math.sqrt(2 * g * h0);
+    hf.setState((x) => -h0 * (((x - xc) / a + r) ** 2 - 1));
+    const v0 = hf.volume();
+    const steps = Math.round(3.25 * T / dt), cross = [];
+    let prev = null, amp = [0, 0];
+    for (let i = 1; i <= steps; i++) {
+      hf.step(dt);
+      if (i % 4) continue;
+      const s = hf.read();
+      let m = 0, mx = 0;
+      for (let k = 0; k < 512; k++) { m += s.h[k]; mx += s.h[k] * ((k + 0.5) * 2 - xc); }
+      const c = mx / m;
+      // (the centre of the water is at -a r cos(omega t): upward crossings of zero are a period apart)
+      if (prev !== null && prev < 0 && c >= 0) cross.push((i - 4 * c / (c - prev)) * dt);
+      if (i * dt < T) amp[0] = Math.max(amp[0], Math.abs(c));
+      if (i * dt > steps * dt - T) amp[1] = Math.max(amp[1], Math.abs(c));
+      prev = c;
+    }
+    const periods = cross.slice(1).map((t, i) => t - cross[i]);
+    const mean = periods.reduce((x, y) => x + y, 0) / Math.max(periods.length, 1);
+    check(periods.length >= 2 && Math.abs(mean / T - 1) < 0.02, `water sloshing in a parabolic bowl: period ${mean.toFixed(2)} s over ${periods.length} swings, Thacker ${T.toFixed(2)} (${((mean / T - 1) * 100).toFixed(2)} %); ` +
+      `the swing is ${(amp[1] / amp[0] * 100).toFixed(0)} % of the first after three`);
+    books(hf, v0, 'bowl');
+    hf.dispose();
+  }
+
+  if (want('bump')) {
+    const hf = make([512, 1]);
+    const d0 = 20, bump = 4, xb = 512, wb = 120;
+    const bedOf = (x) => Math.max(bump * (1 - ((x - xb) / wb) ** 2), 0);
+    hf.setBed(bedOf);
+    hf.fill(d0);
+    const v0 = hf.volume();
+    const qin = 0.4 * Math.sqrt(g * d0) * d0;
+    // a source at the upstream end, a level held at the other
+    hf.sources = [{ box: [0, 0, 16, 2], rate: qin / 16 }, { box: [1000, 0, 1024, 2], level: d0, pull: 0.3 }];
+    let s = null, worst = 1, steps = 0;
+    for (let round = 0; round < 40 && worst > 0.002; round++) {
+      run(hf, 600); steps += 600;
+      s = hf.read();
+      // discharge through the faces between the source and the far end
+      let lo = Infinity, hi = -Infinity;
+      for (let i = 20; i < 490; i++) { const f = s.u[i] * (s.u[i] > 0 ? s.h[i - 1] : s.h[i]); lo = Math.min(lo, f); hi = Math.max(hi, f); }
+      worst = (hi - lo) / qin;
+      s.q = 0.5 * (lo + hi);
+    }
+    // Bernoulli from the texel far downstream to the one on the crest: h + q^2 / (2 g h^2) + b
+    const iD = 440, iC = 255;
+    const bC = hf.bed[iC], E = s.h[iD] + s.q ** 2 / (2 * g * s.h[iD] ** 2) + hf.bed[iD] - bC;
+    let h = s.h[iD];
+    for (let k = 0; k < 60; k++) h = E - s.q ** 2 / (2 * g * h * h);
+    check(worst <= 0.01, `flow over a bump after ${(steps * dt).toFixed(0)} s: the discharge is the same everywhere within ${(worst * 100).toFixed(2)} % (${s.q.toFixed(1)} cells^2/s, ${qin.toFixed(1)} put in)`);
+    check(Math.abs(s.h[iC] / h - 1) < 0.01, `... over the crest ${s.h[iC].toFixed(3)} cells deep, Bernoulli ${h.toFixed(3)} (${((s.h[iC] / h - 1) * 100).toFixed(2)} %); the surface dips ${(s.h[iD] + hf.bed[iD] - s.h[iC] - bC).toFixed(2)} cells`);
+    books(hf, v0, 'bump');
+    hf.dispose();
+  }
+
+  if (want('film')) {
+    // a slope of 45 degrees into a flat basin, a tenth of a cell of water on the slope
+    const hf = make([512, 1]);
+    hf.setBed((x) => Math.max(700 - x, 0));
+    hf.setState((x) => (x < 600 ? 0.1 : 0));
+    const v0 = hf.volume();
+    let bad = 0, vmax = 0;
+    for (let i = 0; i < 20; i++) {
+      run(hf, 30);
+      const s = hf.read();
+      for (let k = 0; k < 512; k++) { if (!Number.isFinite(s.h[k]) || !Number.isFinite(s.u[k]) || s.h[k] < 0) bad++; vmax = Math.max(vmax, Math.abs(s.u[k])); }
+    }
+    const s = hf.read();
+    let basin = 0;
+    for (let k = 350; k < 512; k++) basin += s.h[k] * 2;
+    check(bad === 0, `a film of 0.1 cells on a slope of 45 degrees: finite for 10 s (fastest ${vmax.toFixed(0)} cells/s in ${hf.subSteps} sub-steps), ${(basin / v0 * 100).toFixed(0)} % of it in the basin at the end`);
+    books(hf, v0, 'film', 5e-6);
+    hf.dispose();
+  }
+
+  if (want('round')) {
+    const hf = make([192, 192]);
+    hf.setBed(() => 0);
+    hf.setState((x, z) => (Math.hypot(x - 192, z - 192) < 60 ? 16 : 4));
+    const v0 = hf.volume();
+    run(hf, 90);
+    const s = hf.read();
+    const H = (i, j) => s.h[j * 192 + i];
+    let asym = 0, hi = 0;
+    for (let j = 0; j < 96; j++) {
+      for (let i = 0; i < 96; i++) {
+        const a = H(i, j);
+        asym = Math.max(asym, Math.abs(a - H(191 - i, j)), Math.abs(a - H(i, 191 - j)), Math.abs(a - H(j, i)));
+        hi = Math.max(hi, a);
+      }
+    }
+    // along an axis and along the diagonal: where the ring of the bore is
+    const ring = (di, dj) => { let k = 0; for (let r = 0; r < 96; r++) { const i = Math.round(96 + r * di), j = Math.round(96 + r * dj); if (i < 192 && j < 192 && H(i, j) > 5) k = r * Math.hypot(di, dj); } return 2 * k; };
+    const ra = ring(1, 0), rd = ring(Math.SQRT1_2, Math.SQRT1_2);
+    check(asym < 1e-3 && Math.abs(rd / ra - 1) < 0.05, `a round dam break on a map: mirror images agree within ${asym.toExponential(1)} cells; the bore is ${ra.toFixed(0)} cells out along the axes, ${rd.toFixed(0)} along the diagonals`);
+    books(hf, v0, 'round dam break');
+    hf.dispose();
+  }
+
+  if (want('link')) {
+    // Two lakes with a ridge between them, joined under the ground by a pipe: the flow is
+    // c sqrt(dH), so the root of the difference of their levels falls in a straight line.
+    const hf = make([128, 64]);
+    hf.setBed((x) => (Math.abs(x - 128) < 8 ? 40 : 0));
+    const lake = (x) => (x < 120 ? 0 : x > 136 ? 1 : -1);
+    hf.setState((x) => [20, 10, 0][lake(x) < 0 ? 2 : lake(x)]);
+    const area = 150, A = 120 * 128;
+    hf.links = [{ a: [28, 32, 92, 96], b: [164, 32, 228, 96], area }];
+    const c = 0.6 * area * Math.sqrt(2 * g), rate = 0.5 * c * (2 / A);
+    const v0 = hf.volume();
+    const levels = () => {
+      const s = hf.read(), sum = [0, 0], n = [0, 0];
+      for (let j = 0; j < 64; j++) for (let i = 0; i < 128; i++) { const k = lake(hf.center(i, j)[0]); if (k >= 0) { sum[k] += s.h[j * 128 + i]; n[k]++; } }
+      return [sum[0] / n[0], sum[1] / n[1]];
+    };
+    let worst = 0;
+    const seen = [];
+    for (let i = 1; i <= 2700; i++) {
+      hf.step(dt);
+      if (i % 300 === 0) {
+        const [a, b] = levels(), t = i * dt;
+        const exact = Math.max(Math.sqrt(10) - rate * t, 0) ** 2;
+        worst = Math.max(worst, Math.abs(a - b - exact));
+        seen.push(`${t.toFixed(0)} s: ${(a - b).toFixed(3)} (${exact.toFixed(3)})`);
+      }
+    }
+    const [a, b] = levels();
+    log(`  difference of the levels, and what it should be: ${seen.join(', ')}`);
+    check(worst < 0.1, `two lakes joined by a pipe: the difference of their levels follows the curve within ${worst.toFixed(3)} cells (of 10 at the start)`);
+    check(Math.abs(a - b) < 0.02 && Math.abs(a + b - 30) < 1e-3, `they end level, at the mean of the two: ${a.toFixed(4)} and ${b.toFixed(4)} cells`);
+    hf.readLedger();
+    check(Math.abs(hf.linkLost) < 1e-6 * v0 && hf.linked > 0, `what left one lake arrived in the other: ${hf.linked.toFixed(0)} cells moved, ${hf.linkLost.toExponential(1)} unaccounted for`);
+    books(hf, v0, 'two lakes');
+    hf.dispose();
+  }
+
+  if (q.get('time') === '1') {
+    for (const n of [256, 512, 1024]) {
+      const hf = make([n, n]);
+      hf.setBed((x, z) => 2 * Math.sin(0.02 * x) * Math.sin(0.03 * z));
+      hf.setState((x, z) => 20 + 4 * Math.exp(-((x - n) ** 2 + (z - n) ** 2) / 5000));
+      run(hf, 20);
+      glc.read(hf.H[0], 0, 0, 1, 1);
+      const t0 = performance.now();
+      run(hf, 200);
+      glc.read(hf.H[0], 0, 0, 1, 1);
+      log(`${n} x ${n} texels: ${((performance.now() - t0) / 200).toFixed(3)} ms per step (${hf.subSteps} sub-steps, ${glc.passCount} passes so far)`);
+      hf.dispose();
+    }
+  }
+  log(failed ? `${failed} check(s) failed` : 'all checks passed');
+} catch (e) {
+  console.log('ERROR ' + (e.stack || e));
+  window.__error = String(e);
+}
+window.__done = true;
+</script>

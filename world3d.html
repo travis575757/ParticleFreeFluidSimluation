@@ -10,12 +10,20 @@
   #stage { padding: 0; }
   #view { width: 100%; height: 100%; border-radius: 0; box-shadow: none; cursor: grab; }
   #hud { left: 12px; top: 10px; }
+  #tiers { position: absolute; left: 12px; bottom: 12px; image-rendering: pixelated; border: 1px solid rgba(255, 255, 255, 0.25);
+    background: rgba(8, 12, 18, 0.72); display: none; pointer-events: none; }
+  #tiersKey { position: absolute; left: 12px; bottom: 12px; font: 11px/1.4 system-ui, sans-serif; color: #c9d4de; display: none;
+    pointer-events: none; text-shadow: 0 1px 2px #000; }
+  #tiersKey i { display: inline-block; width: 9px; height: 9px; margin: 0 4px 0 10px; vertical-align: -1px; }
+  #tiersKey i:first-child { margin-left: 0; }
 </style>
 </head>
 <body>
 <main id="stage">
   <canvas id="view"></canvas>
   <div id="hud"></div>
+  <canvas id="tiers"></canvas>
+  <div id="tiersKey"><i style="background:#2f6fa3"></i>height field<i style="background:#e8a33d"></i>its copy next to solved water<i style="background:#7fe3f5"></i>solved in 3D<i style="background:#e0524d"></i>should be, no budget<i style="background:#8d6fd1"></i>source or link</div>
   <div id="notice"></div>
   <div id="error"></div>
 </main>

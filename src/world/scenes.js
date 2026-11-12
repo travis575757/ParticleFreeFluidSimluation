@@ -157,4 +157,276 @@ export const WORLD_SCENES = {
       };
     },
   },
+
+  // 6. A river comes down a valley in pools and steps, over three falls, and into the sea.
+  //    The water is a height field (two numbers per 2 x 2 cells of ground) except where that
+  //    will not do: at the falls, and around what the camera looks at.
+  river: {
+    title: 'Mountain river to the sea',
+    blurb: 'Most of a kilometre of river in pools, chutes and three falls, down to the sea. All of it moves as shallow water on a map, two numbers per 20 cm of ground; the falls and the water around the view target are solved in 3D, and handed back when the view moves on.',
+    build({ pools = 16 } = {}) {
+      const sea = 24, half = 256;
+      // the pools from the head down: each ends in a sill, then a chute or (every fifth) a fall
+      const P = [];
+      for (let i = 0, x = 96; i < pools; i++) {
+        const len = Math.round(400 + 110 * Math.sin(1.7 * i + 0.4));
+        const fall = i % 5 === 3 ? 30 + 4 * Math.sin(i) : 6 + 2.5 * Math.sin(2.3 * i + 1);
+        P.push({ x0: x, x1: x + len, xc: x + len - 16, fall, steep: i % 5 === 3 });
+        x += len;
+      }
+      let y = sea - 2;
+      for (let i = pools - 1; i >= 0; i--) { y += P[i].fall; P[i].crest = y; }
+      const end = P[pools - 1].x1;
+      const length = Math.ceil((end + 620) / 64) * 64;
+      const poolAt = (x) => { let i = 0; while (i < pools - 1 && x >= P[i].x1) i++; return i; };
+      // height of the river bed along its middle
+      const thal = (x) => {
+        if (x >= end) return sea - 2 - 60 * ss(0, 560, x - end);
+        const i = poolAt(x), p = P[i];
+        const u = clamp((x - p.x0) / (p.xc - p.x0), 0, 1);
+        // the pool: deepest below the step it comes from, shallow towards its sill
+        const deep = (3 + (i > 0 && P[i - 1].steep ? 12 : 7) * Math.sin(Math.PI * Math.sqrt(u)) ** 0.8) * ss(-2, 26, x - p.x0) * (1 - ss(p.xc - 44, p.xc - 6, x));
+        const down = p.steep ? ss(p.xc + 3, p.xc + 6, x) : clamp((x - p.xc - 2) / (1.8 * p.fall), 0, 1);
+        return p.crest - deep - p.fall * down;
+      };
+      const mid = (x) => 84 * Math.sin(x / 520) + 36 * Math.sin(x / 190 + 1.3);
+      const wide = (x) => 46 + 9 * Math.sin(x / 140) + 190 * ss(end - 60, end + 420, x);
+      const height = (x, z) => {
+        const d = Math.abs(z - mid(x) * (1 - ss(end - 200, end + 300, x))), w = wide(x);
+        const t = thal(clamp(x, 0, length));
+        const rough = 3 * Math.sin(x * 0.043 + 1.7 * Math.sin(z * 0.031)) + 2 * Math.sin(z * 0.057 + x * 0.011);
+        let h = t + 14 * Math.min(d / w, 1) ** 2.5 + (70 + 2 * rough) * ss(0.9 * w, w + 90, d) + rough * ss(0.6 * w, w, d);
+        // the head of the valley
+        h += 60 * (1 - ss(30, 96, x));
+        return h;
+      };
+      // the water it starts with: every pool up to a little over its sill, a sheet on the steps, the sea
+      const level = (i) => P[i].crest + 2.6;
+      const depth = (x, z, bed) => {
+        if (x >= end) return Math.max(sea - bed, 0);
+        const i = poolAt(x), p = P[i];
+        if (x < p.x0) return 0;
+        const below = i + 1 < pools ? level(i + 1) : sea;
+        // (on the step: a sheet in the middle of the channel)
+        if (x > p.xc) return Math.max(below - bed, Math.min(Math.max(level(i) - bed, 0), Math.max(thal(x) + 2.4 - bed, 0)), 0);
+        return Math.max(level(i) - bed, 0);
+      };
+      const head = P[0].x0 + 24, flow = 3600;
+      const falls = P.filter((p) => p.steep);
+      const look = falls[falls.length - 1];
+      return {
+        h: 0.1,
+        terrain: { origin: [0, -half], spacing: 2, n: [length / 2 + 1, half + 1], height },
+        liquid: [],
+        heightfield: {
+          origin: [0, -half], n: [length / 2, half], cell: 2, depth,
+          sources: [
+            { box: [head - 16, mid(head) - 20, head + 16, mid(head) + 20], rate: flow / (32 * 40) },
+            { box: [length - 32, -half, length, half], level: sea, pull: 0.2 },
+          ],
+        },
+        // (falls and jumps are solved within 60 m of what the camera looks at)
+        params: { hfPromoteRadius: 600 },
+        world: { focusRadius: 56 },
+        camera: { target: [look.xc + 30, look.crest - 22, mid(look.xc + 30)], dist: 560, yaw: 0.9, pitch: 0.42 },
+        marks: { pools: P, end, length, sea, mid },
+      };
+    },
+  },
+
+  // 7. Swell runs up a beach of 1 in 20 between two headlands. The sea is a height field; the
+  //    swell comes in through a strip along its seaward edge that is held at the level of a
+  //    long wave, and beyond that edge the same wave is drawn and nothing else. On the way in
+  //    the waves steepen until the height field cannot hold them.
+  surf: {
+    title: 'Surf on a beach',
+    blurb: 'Swell of 0.7 m runs in over a beach of 1 in 20. Out at sea it is shallow water on a map; where a wave has steepened into a front, around the view target, it is handed to the 3D solver, breaks there, and the water behind it goes back to the map.',
+    build({ amp = 3.5, period = 7 } = {}) {
+      const sea = 40, deep = 30, half = 384, length = 1024, shore = 120 + 20 * deep;
+      const height = (x, z) => {
+        // level offshore, then the beach with a bar on it, the dunes behind
+        const bar = 2.2 * Math.exp(-(((x - 470 - 30 * Math.sin(z / 110)) / 34) ** 2));
+        let y = sea - deep + Math.max(x - 120, 0) / 20 + bar + 1.2 * Math.sin(z / 60) * ss(560, 700, x);
+        y += 10 * ss(shore + 80, shore + 180, x) + 3 * Math.sin(z / 37 + x / 90) * ss(shore + 60, shore + 140, x);
+        // a headland at either end of the beach
+        const hd = ss(296, 332, Math.abs(z) + 14 * Math.sin(x / 45)) * ss(250, 340, x);
+        return y + Math.max(sea + 22 + 6 * Math.sin(x / 31 + z / 53) - y, 0) * hd;
+      };
+      const strip = (x0, x1, pull) => ({ box: [x0, -half, x1, half], swell: true, pull });
+      return {
+        h: 0.1,
+        terrain: { origin: [-512, -640], spacing: 4, n: [417, 321], height },
+        liquid: [],
+        heightfield: {
+          origin: [0, -half], n: [length / 2, half], cell: 2,
+          depth: (x, z, bed) => (x < shore + 40 ? Math.max(sea - bed, 0) : 0),
+          // (the first strip is the swell; the others take out what the beach sends back)
+          sources: [strip(0, 16, 1), strip(16, 48, 0.04), strip(48, 80, 0.04)],
+          sea: { level: sea, wave: { amp, period, depth: deep, dir: [1, 0], origin: [8, 0] } },
+        },
+        // (the surf is solved within 10 m of what the camera looks at: about what the budget of bricks covers)
+        params: { hfPromoteRadius: 64 },
+        world: { focusRadius: 48 },
+        camera: { target: [600, sea + 2, 0], dist: 330, yaw: 1.0, pitch: 0.26 },
+        marks: { sea, shore, half },
+      };
+    },
+  },
+
+  // 8. A reservoir behind a dam, a river valley below it. After three seconds the gate in the
+  //    dam is pulled up. Reservoir and valley are a height field; the water around the gate is
+  //    solved while the gate moves, and so is the front of the flood wherever it is.
+  dam: {
+    title: 'Dam failure',
+    blurb: 'Three seconds in, the gate of a dam is pulled out of the way and 3.6 m of water goes down a valley with 40 cm in it. Reservoir and valley are shallow water on a map; the water around the gate and the flood near the view target are solved in 3D, and the flood runs on down the valley as a wave on the map.',
+    build({ at = 3 } = {}) {
+      const base = 40, full = 76, low = 44, crest = 86, xd = 640, thick = 24, gate = 24, end = 2048, half = 192;
+      const xg = xd + thick / 2;
+      // the valley winds below the dam
+      const zc = (x) => 70 * Math.sin((x - xd) / 240) * ss(xd + 40, xd + 360, x);
+      const wide = (x) => 150 - 70 * ss(xd - 260, xd - 20, x) - 16 * ss(xd, xd + 200, x);
+      const height = (x, z) => {
+        const d = Math.abs(z - zc(x));
+        const floor = base + 30 * (1 - ss(40, 420, x));
+        const rough = 2.5 * Math.sin(x * 0.037 + 1.3 * Math.sin(z * 0.029)) + 1.5 * Math.sin(z * 0.061 + x * 0.013);
+        // (the sides no steeper than 1 in 1: water that runs back down them stays on the ground)
+        let y = floor + (64 + 2 * rough) * ss(wide(x), wide(x) + 110, d) + rough * ss(0.7 * wide(x), wide(x) + 20, d);
+        // the dam, with the opening the gate stands in
+        const ridge = ss(xd - 3, xd, x) * (1 - ss(xd + thick, xd + thick + 3, x));
+        y += Math.max(crest - y, 0) * ridge * ss(gate, gate + 2, Math.abs(z));
+        return y;
+      };
+      const lift = (t) => 54 * ss(at, at + 1.2, t);
+      const house = (x, side) => box([x - 10, base - 2, zc(x) + side * 30 - 9], [x + 10, base + 20, zc(x) + side * 30 + 9]);
+      return {
+        h: 0.1,
+        terrain: { origin: [0, -half], spacing: 2, n: [end / 2 + 1, half + 1], height },
+        solids: [house(1010, 1), house(1230, -1), house(1500, 1)],
+        liquid: [],
+        kinematic: (t) => [{ shape: 'box', pos: [xg, base + 23 + lift(t), 0], half: [7, 24, gate + 3], round: 0.5 }],
+        heightfield: {
+          origin: [0, -half], n: [end / 2, half], cell: 2,
+          depth: (x, z, bed) => Math.max((x < xg ? full : low) - bed, 0),
+          // (the gate is a wall to the height field until it goes)
+          blocked: (x, z, world) => !(world.time >= at) && Math.abs(z) < gate + 3 && Math.abs(x - xg) < 7,
+          sources: [{ box: [end - 48, -half, end, half], level: low, pull: 0.2 }],
+        },
+        events: [{ at, run: (world) => world.setBed() }],
+        // (the flood is solved within 8 m of what the camera looks at, which is what the budget
+        // of bricks covers of water this deep, and is the map's beyond)
+        params: { hfPromoteRadius: 48 },
+        world: { focusRadius: 32 },
+        camera: { target: [xd + 150, base + 12, 10], dist: 520, yaw: -0.9, pitch: 0.4 },
+        marks: { xd, xg, base, full, low, at, zc },
+      };
+    },
+  },
+
+  // 9. A cliff with a slot cut into it that narrows to nothing under a slab of rock, and a
+  //    hole in the slab over its end. The swell that runs into the slot has nowhere to go but
+  //    up. The sea is a height field; the slot is solved always: water under a roof is
+  //    nothing a height field could hold.
+  cave: {
+    title: 'Sea cave and blowhole',
+    blurb: 'Swell of 1.2 m runs into a slot in a shelf of rock that narrows under a roof, and comes out of a hole in the roof. The sea is shallow water on a map; the slot and the water in front of it are always solved in 3D. (The air is not simulated: what spouts is the water itself.)',
+    build({ amp = 6, period = 8 } = {}) {
+      // (the roof is low: the swell fills the slot up to it, and what comes in after that has one way out)
+      const sea = 40, deep = 30, half = 320, length = 832, xc = 600, top = 56, roof = sea + 4, lid = roof + 8, xe = 764;
+      const slotHalf = (x) => 30 - 22 * ss(xc + 20, xe - 4, x);
+      const height = (x, z) => {
+        const az = Math.abs(z);
+        const bed = sea - deep + 8 * ss(200, 560, x);
+        // the cliff, straight where the slot is and ragged elsewhere
+        const edge = xc + (18 * Math.sin(z / 70) + 8 * Math.sin(z / 23)) * ss(44, 110, az);
+        const land = ss(edge - 5, edge, x);
+        // (a shelf of rock where the slot is, above what the swell reaches and falling 1 in 50 to
+        // the sea: what the hole throws out runs back, most of it along the roof, which lies in
+        // a trench half a metre below the shelf; higher ground to either side and behind)
+        const high = top + 0.02 * (x - xc) + 18 * ss(56, 150, az) + 14 * ss(xe + 30, xe + 120, x) + 2 * Math.sin(x / 41 + z / 67) * ss(70, 120, az);
+        let y = bed + (high - bed) * land;
+        // the slot: its floor rises towards its end
+        const floor = sea - 22 + 14 * ss(xc, xe - 4, x);
+        const cut = (1 - ss(slotHalf(x), slotHalf(x) + 3, az)) * (1 - ss(xe, xe + 4, x));
+        return y + Math.min(floor - y, 0) * cut;
+      };
+      const strip = (x0, x1, pull) => ({ box: [x0, -half, x1, half], swell: true, pull });
+      return {
+        h: 0.1,
+        terrain: { origin: [-448, -576], spacing: 4, n: [353, 289], height },
+        // the roof, in four slabs around the hole (a metre square: a fifth of what the slot is wide at its mouth)
+        solids: [
+          box([xc + 36, roof, -36], [xe - 16, lid, 36]),
+          box([xe - 16, roof, -36], [xe - 6, lid, -5]),
+          box([xe - 16, roof, 5], [xe - 6, lid, 36]),
+          box([xe - 6, roof, -36], [xe + 12, lid, 36]),
+        ].map((s) => ({ ...s, rock: true })),
+        liquid: [],
+        heightfield: {
+          origin: [0, -half], n: [length / 2, half], cell: 2,
+          depth: (x, z, bed) => (x < xe + 8 ? Math.max(sea - bed, 0) : 0),
+          sources: [strip(0, 16, 1), strip(16, 48, 0.04), strip(48, 80, 0.04), strip(80, 112, 0.04)],
+          sea: { level: sea, wave: { amp, period, depth: deep, dir: [1, 0], origin: [8, 0] } },
+        },
+        solve: [{ lo: [xc - 24, 0, -48], hi: [xe + 16, 112, 48] }],
+        // (the cliff to either side is left to the map: the swell that slams into it would use up the bricks)
+        params: { hfPromoteRadius: 56 },
+        world: { focusRadius: 0 },
+        // (seen from the sea: the mouth of the slot, the roof, the hole at its far end)
+        camera: { target: [xc + 90, sea + 8, 0], dist: 320, yaw: -1.15, pitch: 0.38 },
+        marks: { sea, xc, xe, roof },
+      };
+    },
+  },
+
+  // 10. A lake on high ground loses its water through a hole in its floor; the water comes out
+  //     again at the foot of the slope, 6 m lower, and runs down a channel and over a ledge
+  //     into a pond. The way under the ground is not simulated: it is a link that takes water
+  //     out at one end and puts the same water in at the other, as much as the difference in
+  //     level drives through it.
+  spring: {
+    title: 'Sinkhole and spring',
+    blurb: 'A lake drains through a hole in its floor and comes out again as a spring 6 m lower, which runs over a ledge into a pond. The way under the ground is a link between two patches of the map: what goes in at one end comes out at the other, driven by the difference in level. The fall and the water around the view target are solved in 3D.',
+    build({ flow = 3000, area = 45 } = {}) {
+      const lake = 120, pond = 32, half = 256, length = 1024, xs = 584, xl = 780;
+      const zs = (x) => 30 * Math.sin((x - xs) / 90);
+      const height = (x, z) => {
+        // the high ground with the lake in it, and the hole in the lake's floor
+        const rl = Math.hypot((x - 280) / 1.5, z);
+        let up = 128 - 22 * (1 - ss(60, 130, rl)) + 4 * Math.sin(x / 57) * Math.sin(z / 43) * ss(130, 180, rl);
+        up -= 10 * (1 - ss(4, 22, Math.hypot(x - 380, z)));
+        // the low ground: the spring's hollow, the channel, the ledge, the pond
+        let low = 70 - 26 * ss(520, 1000, x) + 3 * Math.sin(x / 47 + z / 61) * ss(24, 70, Math.abs(z - zs(x)));
+        low -= 8 * (1 - ss(8, 16, Math.abs(z - zs(x)))) * ss(xs - 30, xs - 10, x);
+        low -= 10 * (1 - ss(8, 24, Math.hypot(x - xs, z)));
+        // (the ledge is sharp where the channel crosses it and a slope further off)
+        const run = 2 + 70 * ss(30, 130, Math.abs(z - zs(x)));
+        low -= 14 * ss(xl - run, xl + run, x);
+        // (the pond lies in a hollow of its own: at its level it stays where it is)
+        low = Math.max(low, 37 * ss(860, 900, x));
+        const rp = Math.hypot(x - 900, z);
+        low -= Math.max(low - 22, 0) * (1 - ss(50, 95, rp));
+        const scarp = 508 + 26 * Math.sin(z / 130);
+        return up + (low - up) * ss(scarp - 16, scarp + 16, x);
+      };
+      return {
+        h: 0.1,
+        terrain: { origin: [0, -half], spacing: 2, n: [length / 2 + 1, half + 1], height },
+        liquid: [],
+        heightfield: {
+          origin: [0, -half], n: [length / 2, half], cell: 2,
+          // (the lake in its basin and the pond in its own: nothing on the slope between them)
+          depth: (x, z, bed) => (Math.hypot((x - 280) / 1.5, z) < 140 ? Math.max(lake - bed, 0) : Math.hypot(x - 900, z) < 100 ? Math.max(pond - bed, 0) : 0),
+          sources: [
+            { box: [150, -20, 182, 20], rate: flow / (32 * 40) },
+            { box: [930, -30, 960, 30], level: pond, pull: 0.2 },
+          ],
+          links: [{ a: [372, -8, 388, 8], b: [xs - 8, -8, xs + 8, 8], area }],
+        },
+        params: { hfPromoteRadius: 400 },
+        world: { focusRadius: 48 },
+        camera: { target: [xl - 40, 50, zs(xl - 40)], dist: 520, yaw: 0.5, pitch: 0.5 },
+        marks: { lake, pond, xs, xl, zs },
+      };
+    },
+  },
 };

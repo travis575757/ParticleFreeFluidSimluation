@@ -204,6 +204,10 @@ bool g_live = true;
 bool g_held = false;       // that brick is held: its cells keep the state of the water at rest (see FAR)
 int g_sponge = 0;          // a solved brick: which of its face neighbours are held (bit 2 d: low side of axis d, bit 2 d + 1: high side)
 uniform float uSponge;     // damping per step at a held face
+// 1: the density passes move no liquid between two held cells, and a held cell hands a solved one
+// what it asks for (see "advGather" in sim.js). Set where the held cells are copies of a height
+// field, which moves their water itself.
+uniform int uHeldKeep;
 ivec2 slotTexel(ivec2 tiles, int s, ivec3 l) {
 #if DIM == 2
   return ivec2((s % tiles.x) * TW + l.x, (s / tiles.x) * BS + l.y);
@@ -268,6 +272,11 @@ int slotOf(Grid g, ivec3 c) {
 #endif
 }
 bool hasCell(Grid g, ivec3 c) { return slotOf(g, c) < g.tiles.x * g.tiles.y; }
+// c lies in a held brick
+bool heldCell(Grid g, ivec3 c) {
+  int s = slotOf(g, c);
+  return s < g.tiles.x * g.tiles.y && texelFetch(uSl0, ivec2(s % g.tiles.x, s / g.tiles.x), 0).w > 1.5;
+}
 // c is not stored and nothing is known about it (hasCell is false for bricks marked solid too)
 bool unknownCell(Grid g, ivec3 c) { return slotOf(g, c) == g.tiles.x * g.tiles.y; }
 ivec2 texelOf(Grid g, ivec3 c) { return slotTexel(g.tiles, slotOf(g, c), c & BM); }
@@ -556,14 +565,71 @@ vec3 vel${P}(int i, vec3 x) {
 // Water at rest (src/world/water.js), for the sparse backend: up to MAX_WATER bodies, each a level
 // and an extent in x and z. farState(c) of world cell c: x = rho' (how full the cell is),
 // y = pressure. Outside every body both are zero.
+//
+// A height field (src/world/heightfield.js) is water "at rest" too, with a level and a velocity
+// of its own in every column: where its map lies, it says what the state of rest is.
+//   farFill(c, V)  what cell c holds of that water, V being the share of the cell that is not solid
+//   farVel(c)      its velocity at the low faces of cell c (zero without a height field)
 export const MAX_WATER = 4;
 export const FAR = `
 uniform int uWaterN;
 uniform vec4 uWaterBox[${MAX_WATER}];   // x0, z0, x1, z1 in cells, measured as the primitives are
 uniform vec4 uWaterLvl[${MAX_WATER}];   // level, row of the top liquid cell, its pressure, pressure step per row
+uniform sampler2D uHf;        // per texel: depth, velocity through the low-x face, through the low-z face, 1 where the 3D solver owns the column
+uniform sampler2D uHfBed;     // per texel: height of the bed, 1 where the texel is no part of the height field
+uniform sampler2D uHfCols;    // per column of bricks: lowest bed, highest level of the water (not above the bed: dry), first stored brick row, one past the last
+uniform vec4 uHfMap;          // x and z of the corner of texel (0, 0) (cells, as the primitives), texels per cell, 1 if there is a height field
+uniform vec4 uHfG;            // pressure step per row, thetaMin
+uniform ivec4 uHfColsMap;     // brick x and z of texel (0, 0) of uHfCols, its size
+#define FAR_ON (uWaterN > 0 || uHfMap.w > 0.5)
+// the texel of the height field over cell r (measured from the anchor); false outside the map
+bool hfTexel(ivec3 r, out ivec2 t) {
+  t = ivec2(0);
+  if (uHfMap.w < 0.5) return false;
+  ivec2 n = textureSize(uHf, 0);
+#if DIM == 2
+  t = ivec2(int(floor((float(r.x) + 0.5 - uHfMap.x) * uHfMap.z)), 0);
+#else
+  t = ivec2(floor((vec2(r.xz) + 0.5 - uHfMap.xy) * uHfMap.z));
+#endif
+  return t.x >= 0 && t.y >= 0 && t.x < n.x && t.y < n.y;
+}
+// x = level of the water in texel t, y = its bed, z = 1 if the level is that of the water next
+// to it. The bed is the mean of the ground under the texel. A texel at a shore is dry because
+// that mean is above the water, while part of its ground is below: for the 3D solver that part
+// is under water, up to the level of the texel next to it, and a copy of the height field that
+// left it dry would have the solved water beside it run into the gap for good.
+vec3 hfLevel(ivec2 t) {
+  float b = texelFetch(uHfBed, t, 0).r;
+  float h = texelFetch(uHf, t, 0).r;
+  if (h >= 0.05) return vec3(b + h, b, 0.0);
+  ivec2 n = textureSize(uHf, 0);
+  float best = -1.0e30;
+  for (int k = 0; k < 4; k++) {
+    ivec2 u = t + ivec2(k == 0 ? 1 : k == 1 ? -1 : 0, k == 2 ? 1 : k == 3 ? -1 : 0);
+    if (u.x < 0 || u.y < 0 || u.x >= n.x || u.y >= n.y) continue;
+    vec2 c = texelFetch(uHfBed, u, 0).rg;
+    float hu = texelFetch(uHf, u, 0).r;
+    // (water that stands below this bed: water above it is on its way here by itself)
+    if (c.y < 0.5 && hu >= 0.05 && c.x + hu < b + 0.05) best = max(best, c.x + hu);
+  }
+  // (within four cells below the bed: under a cliff the water is not the cliff's)
+  return best > b + h - 4.0 ? vec3(max(best, b + h), b, 1.0) : vec3(b + h, b, 0.0);
+}
 // does the brick whose corner cell is c hold water at rest? (SparseSim._farWet is the same test)
 bool farWetBrick(ivec3 c) {
   vec3 r = vec3(c - uAnchor);
+  if (uHfMap.w > 0.5) {
+#if DIM == 2
+    ivec2 k = ivec2(c.x >> LB, 0) - uHfColsMap.xy;
+#else
+    ivec2 k = (c.xz >> LB) - uHfColsMap.xy;
+#endif
+    if (k.x >= 0 && k.y >= 0 && k.x < uHfColsMap.z && k.y < uHfColsMap.w) {
+      vec2 q = texelFetch(uHfCols, k, 0).rg;
+      return q.g > q.r && r.y < q.g && r.y + float(BS) > q.r;
+    }
+  }
   for (int i = 0; i < ${MAX_WATER}; i++) {
     if (i >= uWaterN) break;
     vec4 b = uWaterBox[i];
@@ -578,6 +644,16 @@ bool farWetBrick(ivec3 c) {
 }
 vec2 farState(ivec3 c) {
   ivec3 r = c - uAnchor;
+  ivec2 t;
+  if (hfTexel(r, t)) {
+    vec3 lb = hfLevel(t);
+    if (lb.x <= lb.y && lb.z < 0.5) return vec2(0.0);
+    // (as farLevel() of src/world/water.js)
+    float top = floor(lb.x - 0.5);
+    float a = min(lb.x - top, 1.0), b = max(lb.x - top - 1.0, 0.0);
+    float rows = top - float(r.y);
+    return vec2(clamp(lb.x - float(r.y), 0.0, 1.0), rows >= 0.0 ? uHfG.x * (max((a - 0.5) / (a - b), uHfG.y) + rows) : 0.0);
+  }
   vec3 x = vec3(r) + 0.5;
   for (int i = 0; i < ${MAX_WATER}; i++) {
     if (i >= uWaterN) break;
@@ -591,6 +667,41 @@ vec2 farState(ivec3 c) {
     return vec2(clamp(L.x - float(r.y), 0.0, 1.0), rows >= 0.0 ? L.z + rows * L.w : 0.0);
   }
   return vec2(0.0);
+}
+float farFill(ivec3 c, float V) {
+  ivec3 r = c - uAnchor;
+  ivec2 t;
+  if (hfTexel(r, t)) {
+    // Over a height field a cell fills from its floor: what is solid of it is taken to be its
+    // lower part, the ground. A column then holds exactly (level - its bed) for any level above
+    // the bed, and nothing at the bed. (V * rho' puts water into a cell the bed runs through
+    // before the level has reached the bed.)
+    vec3 lb = hfLevel(t);
+    return lb.x <= lb.y && lb.z < 0.5 ? 0.0 : clamp(lb.x - float(r.y) - (1.0 - V), 0.0, V);
+  }
+  return V * farState(c).x;
+}
+vec3 farVel(ivec3 c) {
+  vec3 v = vec3(0.0);
+  if (uHfMap.w < 0.5) return v;
+  ivec3 r = c - uAnchor;
+  ivec2 n = textureSize(uHf, 0);
+  // the low corner of the cell, in texels: the face velocities of a texel are those of its low
+  // faces, and vary linearly to those of the next texel
+#if DIM == 2
+  vec2 x = vec2((float(r.x) - uHfMap.x) * uHfMap.z, 0.0);
+#else
+  vec2 x = (vec2(r.xz) - uHfMap.xy) * uHfMap.z;
+#endif
+  ivec2 t = ivec2(floor(x + 1.0e-4));
+  if (t.x < 0 || t.y < 0 || t.x >= n.x || t.y >= n.y) return v;
+  vec2 f = clamp(x - vec2(t), 0.0, 1.0);
+  vec4 s = texelFetch(uHf, t, 0);
+  v.x = mix(s.g, t.x + 1 < n.x ? texelFetch(uHf, t + ivec2(1, 0), 0).g : 0.0, f.x);
+#if DIM == 3
+  v.z = mix(s.b, t.y + 1 < n.y ? texelFetch(uHf, t + ivec2(0, 1), 0).b : 0.0, f.y);
+#endif
+  return v;
 }
 `;
 

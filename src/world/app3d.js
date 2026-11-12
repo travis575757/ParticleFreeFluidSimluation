@@ -26,6 +26,8 @@ const state = {
   overlay: q.has('bricks'),
   mist: !q.has('nomist'),
   swell: !q.has('noswell'),
+  focus: !q.has('nofocus'),   // with a height field: solve its water in 3D around what the camera looks at
+  tiers: !q.has('notiers'),   // ... and show the map of who has the water
   renderScale: Number(q.get('rs')) || 1,
   stepsPerFrame: Number(q.get('spf')) || 1,
   overrides: {},
@@ -208,6 +210,10 @@ function buildPanel() {
     'Density below the surface threshold of 0.5 (sheets and drops thinner than a cell) drawn as a white haze.');
   P.checkbox('swell', 'Show the waves beyond the solved water', state.swell, (v) => { state.swell = v; },
     'Where the water of a sea is not solved, a map of its surface carries the waves on. Off: the sea is drawn flat there, which is all the solver itself knows of it.');
+  P.checkbox('focus', 'Solve in 3D around the view target', state.focus, (v) => { state.focus = v; },
+    'In a scene with a height field, the water around the point the camera turns about is handed to the 3D solver, as far as the budget of solved bricks allows, and goes back to the height field when the view moves on. Off: only what a height field cannot hold is solved in 3D (fronts, falls, splashes, the water around bodies and the brush).');
+  P.checkbox('tiers', 'Show who has the water', state.tiers, (v) => { state.tiers = v; },
+    'In a scene with a height field: a map of its columns of bricks, seen from above. Blue: the height field alone. Amber: a copy of it stored next to solved water. Light: solved in 3D. Red: should be solved (a front, a fall) but the budget of solved bricks is used up. Violet: a source, a sink or the end of a link, which stays the height field\'s.');
   P.select('rs', 'Render scale', [[0.5, '50 %'], [0.75, '75 %'], [1, '100 %']], state.renderScale, (v) => { state.renderScale = Number(v); });
 
   P.section('Storage');
@@ -215,6 +221,7 @@ function buildPanel() {
     ['bricks', 'Bricks stored', 'Bricks of 8 x 8 x 8 cells that exist right now (those inside the ground are never stored), and how many of them hold water at rest that is kept but not solved. Water at rest away from anything that moves is not stored at all.'],
     ['cells', 'Cells stored', 'Cells the solver works on'],
     ['box', 'Box around them', 'Cells a dense grid over the same region would hold, and the share of it that is stored'],
+    ['hf', 'Height field', 'In a scene with a height field: the columns of its map (one per brick, 8 x 8 cells) that hold water, how many of them are solved in 3D, and the solved bricks against the budget of them. The rest of the water is moved as shallow water, two numbers per 2 x 2 cells of ground.'],
     ['budget', 'Unaccounted for', 'The liquid the scene started with plus what the sources and the pour tool fed in, minus what the drains took, minus what is there now: zero if nothing is lost (cells of liquid). In a scene with a sea, what is there is counted above the water at rest, with what the bodies displace and what the water at rest has taken in.'],
     ['flow', 'In / out', 'Totals of the sources and of the drains, in cells of liquid'],
     ['bodies', 'Bodies awake', 'Rigid bodies that are being stepped, of all there are. A body that has been slow for a while sleeps, and stops keeping the water around it solved, until that water moves again.'],
@@ -233,7 +240,7 @@ function buildPanel() {
 
   P.section('Keys', { collapsible: true, open: false });
   const keys = P.note('');
-  keys.innerHTML = '<kbd>Space</kbd> pause · <kbd>R</kbd> restart · <kbd>.</kbd> single step · <kbd>B</kbd> bricks · <kbd>1</kbd>–<kbd>9</kbd> scenes';
+  keys.innerHTML = '<kbd>Space</kbd> pause · <kbd>R</kbd> restart · <kbd>.</kbd> single step · <kbd>B</kbd> bricks · <kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd> scenes';
   return P;
 }
 
@@ -250,6 +257,7 @@ window.addEventListener('keydown', (ev) => {
   else if (ev.key === 'r' || ev.key === 'R') loadScene(true);
   else if (ev.key === '.') { state.paused = true; syncPause(); stepOnce(); }
   else if (ev.key === 'b' || ev.key === 'B') { state.overlay = !state.overlay; panel.controls.bricks.checked = state.overlay; }
+  else if (ev.key === '0') { const k = Object.keys(WORLD_SCENES)[9]; if (k) { state.scene = k; panel.controls.scene.value = k; loadScene(); } }
   else if (/^[1-9]$/.test(ev.key)) {
     const k = Object.keys(WORLD_SCENES)[Number(ev.key) - 1];
     if (k) { state.scene = k; panel.controls.scene.value = k; loadScene(); }
@@ -266,6 +274,7 @@ const fmt = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2) + ' M' : n >= 1e4 ? (n / 1e3
 
 function stepOnce() {
   applyPointer();
+  world.setFocus(camera.target.slice(), state.focus);
   const before = glc.passCount;
   world.step();
   passesPerStep = glc.passCount - before;
@@ -275,17 +284,65 @@ function updateStats() {
   const sim = world.sim;
   const rep = sim.report;
   const box = world.boundsCells();
-  readouts.bricks.textContent = sim.water.length ? `${sim.bricks} · ${sim.nHeld} at rest` : `${sim.bricks}`;
+  readouts.bricks.textContent = sim.water.length ? `${sim.bricks} · ${sim.nHeld} at rest` : sim.hf ? `${sim.bricks} · ${sim.nHeld} copies` : `${sim.bricks}`;
+  const tr = world.tiers();
+  if (tr) {
+    let wet = 0, solved = 0, short = 0;
+    for (const t of tr.tier) { if (t & 7) wet++; if ((t & 3) === 3) solved++; if (t & 4) short++; }
+    const budget = sim.params.maxSolved || 3000;
+    readouts.hf.textContent = `${fmt(wet)} columns · ${solved} in 3D${short ? ` (${short} more should be)` : ''} · ${sim.bricks - sim.nHeld} of ${budget} bricks`;
+  } else readouts.hf.textContent = '–';
   readouts.bodies.textContent = world.bodies.length ? `${world.bodies.filter((b) => !b.asleep).length} of ${world.bodies.length}` : '–';
   readouts.cells.textContent = fmt(sim.storedCells);
   readouts.box.textContent = box ? `${fmt(box)} · ${(100 * sim.storedCells / box).toFixed(1)} % stored` : '–';
   const bk = sim.books;
-  if (bk) {
+  if (bk && sim.hf) {
+    const off = world.unaccounted;
+    if (off !== null) readouts.budget.textContent = `${off.toFixed(1)} of ${fmt(sim.hfWater)}`;
+    readouts.flow.textContent = `${fmt(bk.added + world.hf.added)} / ${fmt(bk.removed + world.hf.removed)}`;
+  } else if (bk) {
     readouts.budget.textContent = `${world.balance().toFixed(2)} of ${fmt(bk.stored)}`;
     readouts.flow.textContent = `${fmt(bk.added)} / ${fmt(bk.removed)}`;
   }
   if (rep) readouts.cfl.textContent = (rep.maxSpeed * sim.params.dt).toFixed(1);
   readouts.perf.textContent = `${stepMs > 0 ? stepMs.toFixed(1) + ' ms' : '–'} · ${fps.toFixed(0)} fps`;
+}
+
+// The map of who has the water (World.tiers), one pixel per column of bricks, with a cross where the camera looks.
+const tierCanvas = document.getElementById('tiers'), tierKey = document.getElementById('tiersKey');
+const TIER_RGB = [[0, 0, 0, 0], [47, 111, 163, 255], [232, 163, 61, 255], [127, 227, 245, 255]];
+function drawTiers() {
+  const tr = state.tiers && world ? world.tiers() : null;
+  if (!tierCanvas) return;
+  tierCanvas.style.display = tr ? 'block' : 'none';
+  tierKey.style.display = tr ? 'block' : 'none';
+  if (!tr) return;
+  const [nw, nh] = tr.n;
+  const B = world.sim.B;
+  const fx = Math.round(camera.target[0] / B - tr.origin[0]), fz = Math.round(camera.target[2] / B - tr.origin[1]);
+  // The whole map if it fits on 320 by 180 pixels with at least two pixels per column; else the
+  // part of it around what the camera looks at.
+  const px = Math.max(Math.min(Math.floor(320 / nw), Math.floor(180 / nh), 6), 2);
+  const w = Math.min(nw, Math.floor(320 / px)), h = Math.min(nh, Math.floor(180 / px));
+  const i0 = Math.min(Math.max(fx - (w >> 1), 0), nw - w), j0 = Math.min(Math.max(fz - (h >> 1), 0), nh - h);
+  if (tierCanvas.width !== w || tierCanvas.height !== h) { tierCanvas.width = w; tierCanvas.height = h; }
+  tierCanvas.style.width = `${w * px}px`;
+  tierCanvas.style.height = `${h * px}px`;
+  tierKey.style.bottom = `${h * px + 18}px`;
+  const ctx = tierCanvas.getContext('2d');
+  const img = ctx.createImageData(w, h);
+  for (let j = 0; j < h; j++) {
+    for (let i = 0; i < w; i++) {
+      const t = tr.tier[(j0 + j) * nw + i0 + i];
+      const c = t & 4 ? [224, 82, 77, 255] : t & 8 && (t & 3) ? [141, 111, 209, 255] : TIER_RGB[t & 3];
+      // (z towards the viewer at the bottom, as the scenes are looked at)
+      img.data.set(c, 4 * ((h - 1 - j) * w + i));
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(fx - i0 - 2, h - 1 - (fz - j0), 5, 1);
+  ctx.fillRect(fx - i0, h - 1 - (fz - j0) - 2, 1, 5);
 }
 
 function tick() {
@@ -308,8 +365,11 @@ function tick() {
     renderer.render(world, camera, { overlay: state.overlay, mist: state.mist, swell: state.swell, cursor: showBrush ? [...pointer.pos, state.brush] : null });
     if (frame % 6 === 0) {
       // the totals of the sources and drains follow the same report the storage counters come from
-      if (glc.readback !== 'scrambled') world.sim.readLedgerAsync();
+      if (glc.readback !== 'scrambled') {
+        world.readBooksAsync();
+      }
       updateStats();
+      if (frame % 12 === 0) drawTiers();
     }
     hud.textContent = `t = ${world.time.toFixed(2)} s${state.paused ? '  (paused)' : ''}\n${passesPerStep} GPU shader passes / step`;
     frame++;

@@ -10,6 +10,7 @@ const VMIN = '0.05';   // floor on V when normalising row sums of nearly solid c
  */
 export function simShaders(dim, floatLinear, backend = 'dense', opts = {}) {
   const H = header(dim, floatLinear, backend);
+  const FARS = backend === 'sparse' ? FAR : '';      // the state of water at rest, for the passes that meet held bricks
   const TRACE = opts.pushRel ? TRACE_REL : TRACE_ABS;
   const S = {};
 
@@ -100,7 +101,7 @@ void main() {
   // whole solved column would move up and down as one (nothing but its own inertia resists),
   // which is not what deep water does. Where the held cell is not full (the surface, air) the
   // face stays open: spray falls into water at rest.
-  if (uWaterN > 0 && (gc.y & BM) == 0) {
+  if (FAR_ON && (gc.y & BM) == 0) {
     int sb = slotOf(G, gc - AX[1]);
     if (sb < G.tiles.x * G.tiles.y) {
       bool heldBelow = texelFetch(uSl0, ivec2(sb % G.tiles.x, sb / G.tiles.x), 0).w > 1.5;
@@ -325,9 +326,29 @@ out vec4 o;
 void main() { o = vVal; }`;
 
   // Step 3: beta_l += w-_li s_i
-  S.scatterBetaVS = scatterVS('', 'val = vec4(src.w);');
+  // (uHeldKeep: a held cell that asks another held cell, or itself, counts for nothing: see "advGather")
+  S.scatterBetaVS = scatterVS('', `val = vec4(src.w);
+#ifdef SPARSE
+  if (uHeldKeep == 1 && g_held && heldCell(G, tc)) val = vec4(0.0);
+#endif`);
 
   // Steps 4-5 (gather) and the forward characteristics needed by steps 6-7.
+  //
+  // Sparse backend with uHeldKeep (held cells that are copies of a height field, see
+  // src/shaders/hfcouple.js): the water in held cells is the height field's to move, and what the
+  // step changes in them is handed over to it. So nothing moves between two held cells, and the
+  // liquid that crosses a face between a held and a solved cell has to be what a uniform flow
+  // would carry through it. The scheme as it stands does neither: next to cells that stand still
+  // a held cell is asked for more than it has (its own share and the solved cell's), every
+  // request is scaled down, and the face lets through a quarter less than the velocity says, a
+  // river dips behind it and piles up before the next one. Here instead
+  //   - a held cell takes from solved cells what the scheme gives it, nothing from held ones,
+  //     and keeps of its own liquid what the solved cells have not asked for (1 - beta, with
+  //     beta counting their requests only: pass "scatterBeta")
+  //   - so a solved cell gets from a held one all it asks for, unless together they ask for
+  //     more than the cell holds
+  //   - nothing is carried forward out of a held cell.
+  // Every cell still hands out exactly what it has.
   S.advGather = `${H}
 uniform Grid G;
 ${TRACE}
@@ -344,21 +365,33 @@ void main() {
   vec4 tr = texelFetch(uTraceTex, t, 0);
   float V = texelFetch(uFrac, t, 0).a;
   vec2 acc = vec2(0.0);
+#ifdef SPARSE
+  bool keep = uHeldKeep == 1 && g_held;
+#else
+  const bool keep = false;
+#endif
   if (tr.w > 0.0) {
     vec3 q = tr.xyz - 0.5;
     vec3 f = floor(q);
     vec3 a = q - f;
     for (int k = 0; k < NC; k++) {
+#ifdef SPARSE
+      if (keep && heldCell(G, cellAt(f) + cornerOffset(k))) continue;
+#endif
       ivec2 ts = texelOf(G, clampCell(G, cellAt(f) + cornerOffset(k)));
       acc += cornerWeight(k, a) * vec2(texelFetch(uRho, ts, 0).r, texelFetch(uFrac, ts, 0).a) / max(1.0, texelFetch(uBeta, ts, 0).r);
     }
     acc *= tr.w;
     acc.y /= max(V, ${VMIN});
   }
-  oRho = vec4(acc, 0.0, 0.0);
-
   // Steps 6-7: whatever this cell was not asked for (beta_j < 1) is carried forward.
   float rem = max(0.0, 1.0 - texelFetch(uBeta, t, 0).r);
+  if (keep) {
+    acc.x += rem * texelFetch(uRho, t, 0).r;
+    acc.y = 1.0;
+    rem = 0.0;
+  }
+  oRho = vec4(acc, 0.0, 0.0);
   vec3 x = cellPos(c, vec3(0.5));
   vec3 xf = x;
   float amt = 0.0;
@@ -448,6 +481,15 @@ void main() {
     if (uPair >= 0) { useHi = ((c[uAxis] + uPair) & 1) == 0; useLo = !useHi; }
     ivec3 lo = c - AX[uAxis];
     ivec3 hi = c + AX[uAxis];
+#ifdef SPARSE
+    // (uHeldKeep: a held cell is short of what it has handed over, or holds more than it can, and
+    // that is the exchange with the height field: not something to level out with a neighbour)
+    if (uHeldKeep == 1) {
+      if (g_held) useLo = useHi = false;
+      if (useLo && heldCell(G, lo)) useLo = false;
+      if (useHi && heldCell(G, hi)) useHi = false;
+    }
+#endif
     if (useLo && hasCell(G, lo) && fr[uAxis] > 0.0) {
       ivec2 tl = texelOf(G, lo);
       float Vl = texelFetch(uFrac, tl, 0).a;
@@ -582,6 +624,7 @@ void main() {
   // ---------------------------------------------------------------- velocity advection + forces
   S.velAdvect = `${H}
 uniform Grid G;
+${FARS}
 ${TRACE}
 uniform float uDt;
 uniform vec3 uGravity;
@@ -622,10 +665,12 @@ void main() {
   v.z = mix(v.z, uMouseVel.z, brush(xw));
 #endif
 #ifdef SPARSE
-  v.x *= spongeKeep(xu);
+  // (towards the velocity of the water at rest, which over a height field is not zero)
+  vec3 vf = farVel(c);
+  v.x = vf.x + (v.x - vf.x) * spongeKeep(xu);
   v.y *= spongeKeep(xv);
 #if DIM == 3
-  v.z *= spongeKeep(xw);
+  v.z = vf.z + (v.z - vf.z) * spongeKeep(xw);
 #endif
 #endif
   o = vec4(v + uGravity * uDt, 0.0);
@@ -847,6 +892,7 @@ void main() {
   // g channel: p_min of the separating solid boundary condition ([CM11a] Eq. 17).
   S.rhs = `${H}
 uniform Grid G;
+${FARS}
 uniform sampler2D uVel;
 uniform sampler2D uUs;
 uniform sampler2D uW;
@@ -857,6 +903,9 @@ uniform float uSrcMax;     // eta / dt
 uniform float uSinkScale;  // lambda_c / dt   (extension, see below)
 uniform float uSinkMax;    // eta_c / dt
 uniform int uSeparate;
+#ifdef SPARSE
+uniform float uHeldLive;   // 1: a face between a solved and a held liquid cell keeps its velocity (see "project")
+#endif
 out vec4 o;
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
@@ -884,7 +933,7 @@ void main() {
       if (Wc[d] > 0.0 && hasCell(G, lo)) {
         ivec2 tl = texelOf(G, lo);
         if (texelFetch(uLiq, tl, 0).r >= 0.0) interior = false;
-        else if (texelFetch(uW, tl, 0).a > 0.5) ul = -sc[d];
+        else if (texelFetch(uW, tl, 0).a > 0.5 && uHeldLive < 0.5) ul = farVel(c)[d] - sc[d];
       }
 #else
       if (Wc[d] > 0.0 && hasCell(G, lo) && fetchC(uLiq, G, lo).r >= 0.0) interior = false;
@@ -899,7 +948,7 @@ void main() {
         float uh = texelFetch(uVel, th, 0)[d] - s;
         float lh = texelFetch(uLiq, th, 0).r;
 #ifdef SPARSE
-        if (lh < 0.0 && wh.a > 0.5) uh = -s;
+        if (lh < 0.0 && wh.a > 0.5 && uHeldLive < 0.5) uh = farVel(hi)[d] - s;
 #endif
         div += w * uh;
         divS += s;
@@ -1048,8 +1097,12 @@ void main() {
   // that kept its velocity (u -= grad p, a fixed pressure next to it) would be the open end of
   // an organ pipe instead: waves come back from it upside down, and the liquid moves fastest
   // exactly there.
+  // Over a height field (uHeldLive) the pressure next to the face is not fixed: the level there
+  // rises with what the face lets through, and the height field carries the wave on. The face
+  // then is one like any other.
   S.project = `${H}
 uniform Grid G;
+${FARS}
 uniform sampler2D uVel;
 uniform sampler2D uUs;
 uniform sampler2D uW;
@@ -1058,6 +1111,7 @@ uniform sampler2D uP;
 uniform float uInvThetaMax;
 #ifdef SPARSE
 uniform float uHeldK;
+uniform float uHeldLive;    // 1: such a face keeps its velocity like any other (see below)
 #endif
 out vec4 o;
 void main() {
@@ -1077,8 +1131,9 @@ void main() {
 #ifdef SPARSE
     // a face between two held cells is at rest; one between a held and a solved cell is live
     float ha = texelFetch(uW, ta, 0).a;
-    if (W.a > 0.5 && ha > 0.5) { v[d] = 0.0; continue; }
-    if (W.a != ha && fa < 0.0 && fb < 0.0) { v[d] = -uHeldK * (pb - pa); continue; }
+    // (at rest: with the velocity of the water at rest, which over a height field is that of its flow)
+    if (W.a > 0.5 && ha > 0.5) { v[d] = farVel(c)[d]; continue; }
+    if (W.a != ha && fa < 0.0 && fb < 0.0 && uHeldLive < 0.5) { v[d] = farVel(c)[d] - uHeldK * (pb - pa); continue; }
 #endif
     if (fa < 0.0 && fb < 0.0) v[d] -= pb - pa;
     else if (fa < 0.0) v[d] += pa * min(uInvThetaMax, 1.0 - fb / fa);

@@ -53,7 +53,22 @@ World (`world3d.html`): the same liquid, stored in bricks where it is. Right: th
 | ![Scattered buoys](docs/screenshots/world-buoys.png) | ![Scattered buoys, stored bricks](docs/screenshots/world-buoys-bricks.png) |
 | Five buoys up to 50 m apart, 10 cm cells, t = 21 s: a lump of water dropped next to one buoy six seconds ago and next to another a second ago | The 972 bricks around those two exist, and none around the other three |
 
+The water of the next five scenes is shallow water on a map, and solved in 3D only where a
+map will not do. The inset shows who has it, per column of bricks (dark blue: the map, light
+blue: the 3D solver, amber: copies of the map next to solved water, violet: sources).
+
+| | |
+|:-:|:-:|
+| ![Mountain river to the sea](docs/screenshots/world-river.png) | ![Surf on a beach](docs/screenshots/world-surf.png) |
+| 720 m of river, 10 cm cells, t = 30 s: the fall in view and the pool below it are solved, 357 of 13 054 columns | Swell on a beach of 1 in 20, t = 40 s: the breaker near the view target is solved, the rest of the sea is the map's |
+| ![Dam failure](docs/screenshots/world-dam.png) | ![Dam failure, later](docs/screenshots/world-dam-later.png) |
+| Dam failure, t = 8 s: five seconds after the gate went up | t = 30 s: the flood has gone down the valley as a wave on the map |
+| ![Sea cave and blowhole](docs/screenshots/world-cave.png) | ![Sinkhole and spring](docs/screenshots/world-spring.png) |
+| Swell squeezed into a slot under a roof of rock comes out of a hole in it, t = 24 s | A lake (left) drains through its floor into a spring 6 m lower, t = 40 s |
+
 ![World app: the terraced cascade with its bricks](docs/screenshots/app-world.png)
+
+![World app: surf on a beach, with the map of who has the water](docs/screenshots/app-world-surf.png)
 
 The pictures are produced from the real apps by `node tools/screenshots.mjs`.
 
@@ -302,9 +317,9 @@ points can interpenetrate slightly before the contact is seen.
 `world3d.html` runs the solver without the box. Cells are world integers on an unbounded grid;
 only bricks of 8×8×8 cells that hold liquid, or that liquid can reach before anyone looks again,
 are stored, and the ground is a height map. The numerics are the passes described above.
-Two of four planned steps towards large scenes are in: storage in bricks, and water at rest
-that is neither solved nor stored. Still to come: a height-field far field, and ships with
-compartments.
+Three of four planned steps towards large scenes are in: storage in bricks, water at rest
+that is neither solved nor stored, and a height field for water that moves but needs no 3D
+solver. Still to come: ships with compartments.
 
 **Storage** (`src/world/bricks.js`, `src/world/sparsesim.js`)
 
@@ -441,8 +456,9 @@ The app at 1280×800, drawing included, runs the cascade at 60 frames per second
 gives the same rates.
 
 `node tools/interact.mjs world` drives the app: bricks follow the water, the books balance,
-pour / drain / push act under the pointer and conserve what they should, every scene runs,
-a crate dropped with the crate tool lands in the sea.
+pour / drain / push act under the pointer and conserve what they should, every scene runs
+and keeps its books, the solved water of the surf scene follows the view target and what it
+leaves behind goes back to the map, a crate dropped with the crate tool lands in the sea.
 
 **Water at rest** (`src/world/water.js`, held bricks in `src/world/sparsesim.js`)
 
@@ -641,6 +657,194 @@ solved bricks, the same along the axes of the bricks as along their diagonals (c
 (rings of 0.08 cells on their way out and no dent where the crate floats) and that it is
 switched off before the minute is over.
 
+**A height field for water that moves** (`src/world/heightfield.js`, `src/shaders/heightfield.js`,
+`src/shaders/hfcouple.js`)
+
+A sea at rest is a formula. A river is never at rest, and neither is a sea with swell on it,
+but most of either is water that a map can describe: one surface, a pressure close to
+hydrostatic, a velocity that hardly changes with depth. A scene can put its water on such a
+map: texels of 2 × 2 cells, each with a depth and the velocities through two of its faces.
+All the water of the scene is on the map. The 3D solver takes over the columns in which a map
+will not do (a fall, a breaking front, a body, what the camera looks at) and gives them back.
+
+*The solver of the map* is shallow water, staggered and explicit: depths from the fluxes
+through the faces, taken upwind, then velocities from the slope of the new surface, with the
+momentum-conserving advection of Stelling and Duinmeijer (2003). (With u ∂u/∂x in its place a
+bore ran a seventh too slowly, and a front hardly moved over a dry bed: a face that stands
+still receives no momentum.) It is sub-stepped so that the fastest wave crosses half a texel
+at the most, which comes to two sub-steps per step in the scenes below.
+
+* *Dry ground.* A face between a dry texel and water that stands below its bed is closed. A
+  face next to a dry texel lets water onto it and never off it. No face is faster than a
+  quarter of a texel per sub-step, so a texel cannot lose more than it holds: no depth goes
+  below zero and nothing is ever put back.
+* *Sums.* A depth of 30 cells that gains 1e-6 per sub-step loses most of it in single
+  precision. Every texel therefore keeps what its last sum lost (Knuth's two-sum) and adds it
+  to the next. Written plainly, the NVIDIA shader compiler takes (a + b) − a for b and the
+  remainder for nothing; the terms carry a uniform that is 1, and a test checks that seven
+  sums which lose something are exact with their remainders.
+* *Sources and links.* A source is a box with a rate, or a box held at a level (a river
+  mouth, the end of a valley). A link is a way under the ground between two patches of the
+  map: what leaves one arrives in the other, 0.6 A √(2 g ΔH) for a pipe of area A, or
+  proportional to ΔH for a seep. Both are metered like the sources of the 3D solver.
+
+*Whose a column is.* The depth of a texel is the volume of water in the column over it,
+whether the 3D solver has that water in cells of its own or not. Columns of bricks are
+solved from the bed to the surface or not at all, and the brick that holds the bed says whose
+the column is.
+
+* Where nothing is solved the map moves the water.
+* Held bricks next to solved ones are copies of the map: its level, the pressure this solver
+  has under that level, its velocity. They are made afresh after every step. The 3D solver
+  moves liquid into them and out of them like into any other cell, and what a step changed in
+  them is the exchange between the two solvers: it is summed per texel and handed to the
+  map, which takes it in during its own step.
+* In a column that is the 3D solver's, the depth follows the liquid in the cells. The map
+  leaves the texel alone and lets nothing through its faces; the faces carry the velocity
+  of the 3D liquid, averaged over the depth, for the copies and for the map's own advection
+  next to it.
+* Liquid in solved bricks over a column that is not the solver's (a jet through the air
+  above a lake) is no part of the depth: the level under it must not rise before it lands.
+
+So every face has one solver that moves water through it, and a column that changes hands
+changes nothing: it is the same water, described differently. Handing over fills the bricks
+from the map, handing back relabels them. *The books* of such a scene are simple again: the
+depths, what the map has been handed and not yet taken in, and the liquid in the air, less
+what sources and drains have done. The app shows the difference as *Unaccounted for*.
+
+*When water goes to the 3D solver.* Every four steps the map is reduced to four numbers per
+column of bricks (the lowest bed under water, the highest level, the fastest water, and what
+in it a map cannot hold) and read back. A column is solved
+
+* at a *front*: the surface is steeper than 0.3 between two texels and higher than half the
+  depth ahead of it (a bore about to break, water coming over dry ground), with the columns
+  around it, because it moves;
+* where *water leaves the bed*: it runs over a drop steeper than 1 in 1, at least 0.2 cells
+  deep and 0.02 cells per step fast, down to a level below the lip;
+* within `focusRadius` of what the camera looks at (the view target, moved with Ctrl-drag;
+  "Solve in 3D around the view target" in the app);
+* around bodies, scripted solids, the brush, and in boxes a scene names (the slot of the
+  cave), as in a sea at rest;
+* where liquid falls into it, or liquid faster than 0.15 cells per step can reach it.
+
+Falls come first, then fronts, of each the nearest to the view target, and all of it within
+the budget of 3000 solved bricks. The inset map of the app ("Show who has the water") colours
+every column of bricks: the map's, a copy, solved, or flagged with no budget left.
+
+*When it goes back.* Not when it is at rest: a river never is. A column goes back after 120
+steps in which it held what a map can hold: one surface, a pressure within 0.25 cells of head
+of hydrostatic, a slope below 0.1, no liquid faster than 0.05 cells per step against the mean
+of its column, and none of the reasons above. It is solved for 120 steps at least. One that
+is solved again within 10 s of going back stays twice as long as the time before (a standing
+jump changed hands every two seconds).
+
+Three rules came out of the scenes:
+
+* *Nothing far from the view.* With `hfPromoteRadius` R, no brick over the map is solved
+  further than one and a half times R + 8 cells from the view target, whatever happens there;
+  what the view leaves behind is handed back as it is. Columns under a body or in a named box
+  are exempt. Before this rule a brick stored on a dry bank for the spray of the solved water
+  next to it, and then reached by the flood on the map, was the lowest brick of that column's
+  water. The column was therefore the solver's, its liquid had more bricks stored along the
+  bank, and solved water crept along both shores of the dam's flood to the end of the valley.
+* *The brick over the map's water is a copy of air.* A solved brick has its neighbours stored,
+  also the ones over water that is not solved. Solved, such a brick was filled sideways by the
+  crest in the copy next to it, counted as wet, and asked for neighbours of its own: with
+  every wave a chain of solved bricks ran out to sea, a thousand in the cave scene. It is now
+  stored held, like the copy below it, and a solved brick that is found empty over such water
+  is held. Liquid that falls into it from above wakes the column under it.
+* *No moving solid in a copy.* A copy is rewritten every step as the map's water in the cells
+  as they are. Cells that a solid has just left come up full, and the map is charged for water
+  it had all along: 13 cells of the reservoir while the gate was lifted through bricks the
+  first rule had held. Hence its exemption.
+
+*Swell.* Shallow water cannot carry deep-water swell: every wave travels at √(g d) and
+steepens. In the surf and cave scenes the sea beyond the map is a formula again, one long
+wave, drawn and nothing else. A strip of texels along the seaward edge of the map is held at
+that wave's level, which sends the wave in, and two strips behind it take out a share of
+what the shore sends back.
+
+*Rendering.* Water of the map that is not solved is traced as a surface over the map, straight
+between the centres of the texels. Where the 3D solver has a column the same water is drawn
+from its density, and the map's surface is put where that density would cross one half if
+the column were stored as it stands, so a column that changes hands does not move. A ray
+follows one stretch of water; one that leaves through the back of a thin crest with the
+map's water below goes on as if under water. (Before, it saw the sea bed there undimmed:
+grey holes behind every steep crest.)
+
+Five scenes use the map, all with cells of 10 cm. A minute of each (Chrome 154, RTX 3090, the
+app stepped without waiting for frames, reports read back with blocking calls, the books
+drawn up every half second):
+
+| | Mountain river to the sea | Surf on a beach | Dam failure | Sea cave and blowhole | Sinkhole and spring |
+|---|---|---|---|---|---|
+| Scene | 16 pools with chutes between them and three falls of 3 m, 3.6 m³/s, down to the sea | swell of 0.7 m and 7 s over a beach of 1 in 20 with a bar | 3.6 m of water behind a gate 5 m wide, 40 cm in the valley below; the gate is lifted after 3 s | swell of 1.2 m and 8 s runs into a slot that narrows under a roof of rock with a hole of 1 m in it | a lake fed with 3 m³/s drains through its floor into a spring 6 m lower, which runs over a ledge into a pond |
+| Map | 723 m × 51 m, 926 k texels | 102 m × 77 m | 205 m × 38 m | 83 m × 64 m | 102 m × 51 m |
+| Solved within (`hfPromoteRadius`; `focusRadius`) | 60 m; 5.6 m | 6.4 m; 4.8 m | 4.8 m; 3.2 m | 5.6 m, and the slot | 40 m; 4.8 m |
+| Water on the map | 14.3 M cells | 9.0 M | 4.7 M | 10.8 M | 0.69 M |
+| Through its sources in the minute, in / out | 0.25 M / 0.08 M | 5.14 M / 4.94 M | 0.03 M / 1.34 M | 7.39 M / 7.05 M | 0.21 M / 0.17 M |
+| Columns of bricks with water | 13 102 | 8428 | 7424 | 6282 | 1411 |
+| of those solved in 3D, at most | 473 | 560 | 387 | 258 | 365 |
+| Bricks stored at most (solved at most, of a budget of 3000) | 3429 (2380) | 2486 (2026) | 2625 (1935) | 2113 (1899) | 2164 (1802) |
+| Cells stored then | 1.76 M | 1.27 M | 1.34 M | 1.08 M | 1.11 M |
+| Unaccounted for at most, cells (of the water) | 4.2 (2.9e-7) | 11.6 (1.3e-6) | 4.9 (1.0e-6) | 8.0 (8.0e-7) | 2.8 (4.1e-6) |
+| Changes of hands; most of one brick | 6403; 14 | 4955; 8 | 2377; 6 | 1108; 8 | 3342; 9 |
+| Bricks refused, solved bricks sent to sleep for room | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 |
+| Step | 19.6 ms | 11.4 ms | 15.4 ms | 12.7 ms | 12.5 ms |
+
+The river would be 7232 × 512 cells of ground under a dense grid; it stores 1.8 M cells at the
+most and all of its water is accounted for to 3e-7. The step of the map itself is 0.10 ms at
+256², 0.25 ms at 512² and 0.47 ms at 1024² texels (two sub-steps). In the cave scene the
+first full spout comes at 24 s (a smaller one at 16 s): 1360 litres of water above the shelf
+the roof lies in, the highest of it 2.8 m over the roof. Four seconds into each scene the app
+draws 59 to 62 frames per second in Chrome and in LibreWolf, and 26 (river) to 59 in
+Firefox (`node tools/interact.mjs world`).
+
+`tests/heightfield.html` runs the map on its own, against solutions in closed form:
+
+| | Result | Aim |
+|---|---|---|
+| Lake over a rough bed with dry shores and islands, 10 s | no face moves (0 exactly), no depth changes | below 1e-6 m/s |
+| Dam break on water (20 cells on 5), 2.5 s | bore 104 cells out, Stoker 104 (−0.2 %); behind it 11.00 cells at 22.8 cells/s, Stoker 11.03 at 22.8 | within 10 % |
+| Dam break on a dry bed, 2 s | 10, 4 and 1 cells deep at −10, 62 and 116; Ritter −11, 58 and 118. The tip is at 154, Ritter's at 177 (−13 %) | within 10 % |
+| Water sloshing in a parabolic bowl | period 42.55 s, Thacker 42.56; the swing is 100 % of the first after three | within 2 % |
+| Steady flow over a bump, 370 s | discharge the same everywhere within 0.07 %; 14.840 cells deep over the crest, Bernoulli 14.802 (0.26 %) | within 1 % |
+| A film of 1 cm on a slope of 45° | finite for 10 s, 99 % of it in the basin at the end, no depth below zero | finite |
+| Round dam break on a map | mirror images agree to 1e-6 cells; the bore is 110 cells out along the axes and along the diagonals | |
+| Two lakes joined by a pipe | the difference of their levels follows the curve within 0.013 cells of 10; they end at 15.0007 and 14.9993 | on the curve |
+| Volume, in each of the above | off by 1.3e-7 of the water at the most | 1e-6 |
+
+`tests/handover.html?dim=2|3&mode=…` is a channel with a flat bed on a map, 12.3 cells deep,
+with a window of solved bricks in its middle:
+
+| | 2D | 3D | Aim |
+|---|---|---|---|
+| `rest`: a lake with the window in it, 10 s | depths within 2.5e-5 cells; water off by 7e-8 | 3.5e-5 cells; 4e-7 | at rest |
+| `swap`: a stretch with a wave on it handed to the solver and back at once | depths the same to the last bit, velocities within 1e-6 cells/s | the same | the identity on depth |
+| `river`: uniform flow through the window, 30 s, against the same river without one | in the window depth +0.05 %, speed −0.13 %, discharge −0.09 %; behind it 0.00 %, +0.02 %, −0.05 % | +0.04 %, −0.11 %, −0.01 %; behind it +0.01 %, −0.04 %, −0.01 % | within 2 % |
+| `wave`: a hump 2 cells high and 60 cells in half-width through the window | 7.0 % of it comes back, 105 % arrives behind | 5.5 %, 104 % | below 10 % back |
+| the same, half-width 20 (`&sigma=20`) | 10.4 % back, 92 % behind | 14.5 % back, 70 % behind | measured |
+| the same, half-width 10 | 12.7 % back, 91 % behind | | measured |
+| Water of both solvers together over 60 s of `wave` | off by 2.5e-6 at the most | 1.0e-5 | 1e-5 |
+| `drop`: a ball of water falls into the lake with nothing solved | 48 bricks solved at the most, all handed back after 17 s; no brick changes hands more than twice; water off by 8e-7 | 363 bricks, handed back after 76 s; 1.4e-6 | nothing left solved |
+
+Where these miss what was aimed at:
+
+* The tip of the dry dam break is 13 % behind Ritter's, whose tip is a film of no depth
+  moving at twice the wave speed. Where the water is a cell deep the front is within 2 %.
+* In 3D the water of both solvers together is off by 1.0e-5 to 1.1e-5 after the minute of
+  `wave`, at the aim and not under it; the test allows 2e-5. The hand-overs lose nothing
+  (`mode=rest&v=1` shows the map gaining exactly what the solver's cells give up). What is
+  left is the 3D solver's own drift in single precision: a lake that is solved everywhere and
+  at rest loses 1.4e-6 of itself in 10 s.
+* A hump shorter than a few depths is no shallow water: the 3D solver lets it disperse and
+  the map does not, so what arrives behind the window is lower (70 % in 3D at a half-width
+  of 20 cells) and up to 14.5 % comes back. Between water at rest and solved water a band
+  damps what arrives; between the map and solved water there is none, because the map
+  carries the wave on.
+* In LibreWolf `swap` returns the depths within 3e-6 cells, not to the last bit: that
+  browser alters the last bits of everything read back, and the test allows 1e-5 there.
+
 **Limits of world mode as it stands**
 
 * It needs read-back from the GPU to decide which bricks to store. With
@@ -655,16 +859,41 @@ switched off before the minute is over.
   only approximate (it is the vertical clearance scaled by the slope).
 * The per-brick reports are read back with a blocking call every step. A non-blocking variant
   (`reportAsync`) passes the same tests but needs a wider margin, hence more bricks.
-* A body of water has a fixed level. What the held bricks take in is entered in the books
-  and gone: a lake does not rise when a river runs into it. (Levels that follow the volume
-  come with the height field.)
+* A body of water at rest (`water:` in a scene) has a fixed level. What the held bricks take
+  in is entered in the books and gone. A lake that should rise when a river runs into it has
+  to be on a height field.
 * The map of the surface is one-way. Its waves are drawn, and nothing else: they do not
   enter solved water (a ring that reaches the solved water around another body fades out
   over the last brick before it), they move no body and wake nothing. They know one depth
   and no obstacles: they pass through hulls, and stop dead where the ground comes within a
   cell of the surface. Beyond the window of 1024 cells the sea is flat.
-* A held face only lets waves of one speed out cleanly; others are partly reflected back
-  into the solved water.
+* A held face next to water at rest only lets waves of one speed out cleanly; others are
+  partly reflected back into the solved water.
+* The height field is shallow water. Every wave on it travels at √(g d) whatever its length,
+  so swell steepens into bores within a wavelength or two (an amplitude of 0.6 m on 3 m of
+  water) where the real thing would run on unchanged, and waves shorter than a few depths travel too fast. It
+  has one surface per column and the mean bed of 2 × 2 cells per texel: a shore is stepped.
+* Water is solved in 3D only near the view target (`hfPromoteRadius`, 5 to 60 m in the
+  scenes) and within the budget of 3000 solved bricks. A fall or a breaker further off is the
+  map's: water goes over the lip as shallow water and is at the foot at once. The inset map
+  shows such columns in red when the budget is the reason.
+* What enters a brick over water of the map that is not solved, or any brick beyond that
+  radius, is the map's at once: spray that drifts out of the solved region lands without a
+  splash. So does a brick of nothing but spray (no cell above ρ = 0.5) over such water.
+* Texels with a source or a link stay the map's and are never solved in 3D.
+* The edge of the map is a wall unless a source holds a level there. The sea beyond it is
+  drawn and nothing else; the books count the water over the map.
+* The air is a void, as everywhere in this solver. The blowhole spouts the water that the
+  slot squeezes out; nothing is compressed under the roof and nothing blows.
+* A standing jump or the foot of a fall changes hands a few times before it stays solved
+  (twice as long each time): up to 14 changes of one brick in a minute at the foot of the
+  river's fall, 6 to 9 in the other scenes.
+* The 3D solver loses about 1e-6 of the water it solves in 10 s (single precision). The
+  hand-overs themselves lose nothing, so the books of a scene on a map drift by that much of
+  the solved part only.
+* On a height field rigid bodies are tested with one case: a crate dropped on the lake of
+  the spring scene comes to rest at its float line and goes to sleep (in `tools/interact.mjs
+  world`). Bodies in a current, on swell or at a fall are not.
 * Water that waves have woken is not woken again for 10 s by waves slower than 0.15 cells
   per step: the solved region does not grow again for a second disturbance soon after the
   first unless that one is fast. (Its slow rings are carried by the map.)
@@ -713,14 +942,16 @@ switched off before the minute is over.
 world3d.html                   the World app
 src/gl.js                      WebGL2 helpers (programs, float targets, scatter, async readback)
 src/sim.js                     FluidSim: textures, hierarchy, the time step
-src/shaders/                   GLSL for every pass (sparse.js: brick bookkeeping passes)
+src/shaders/                   GLSL for every pass (sparse.js: brick bookkeeping passes; heightfield.js,
+                               hfcouple.js: the map and its hand-overs)
 src/runner.js                  scene driver: obstacles, bodies, emitters, interaction verbs
 src/bodies.js                  rigid bodies and contacts
 src/render2d.js, render3d.js   renderers
 src/scenes2d.js, scenes3d.js   scenarios
 src/world/                     world mode: bricks.js (page table), sparsesim.js (solver on bricks),
                                water.js (water at rest), swell.js (waves beyond the solved water),
-                               terrain.js, world.js, scenes.js, render3d.js, app3d.js
+                               heightfield.js (shallow water on a map), terrain.js, world.js,
+                               scenes.js, render3d.js, app3d.js
 tests/, tools/                 headless diagnostics and interaction checks (puppeteer-core)
 docs/screenshots/              the pictures above (tools/screenshots.mjs regenerates them)
 ```
