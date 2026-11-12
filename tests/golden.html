@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>field hashes</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// Runs app scenes through the Runner and prints a bit-exact hash and the L1 norm of the density,
+// velocity and pressure fields at a few steps. Used to check that a change to the solver's
+// plumbing leaves its arithmetic alone: the lines must not change (Chrome and Firefox read back
+// exactly; LibreWolf flips last bits, so compare the norms there).
+//   ?dim=2|3  &scenes=a,b,...  &n=64  &at=1,10,60  &p.<param>=value
+import { GLContext } from '../src/gl.js';
+import { Runner } from '../src/runner.js';
+import { SCENES2D, buildScene } from '../src/scenes2d.js';
+import { SCENES3D, buildScene3D } from '../src/scenes3d.js';
+
+const q = new URLSearchParams(location.search);
+const dim = Number(q.get('dim') || 2);
+const table = dim === 2 ? SCENES2D : SCENES3D;
+const names = (q.get('scenes') || Object.keys(table).join(',')).split(',');
+const N = Number(q.get('n') || (dim === 2 ? 64 : 32));
+const at = (q.get('at') || '1,10,60').split(',').map(Number);
+const params = {};
+for (const [k, v] of q) if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
+
+function hash(f) {
+  const u = new Uint32Array(f.buffer, f.byteOffset, f.length);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < u.length; i++) { h ^= u[i]; h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+const norm = (f) => { let s = 0; for (let i = 0; i < f.length; i++) s += Math.abs(f[i]); return s.toPrecision(9); };
+
+try {
+  const glc = new GLContext(document.getElementById('c'));
+  console.log(`readback ${glc.readback} | float linear ${glc.floatLinear}`);
+  for (const name of names) {
+    const scene = dim === 2 ? buildScene(table[name], N) : buildScene3D(table[name], N);
+    const runner = new Runner(glc, dim, scene, params);
+    const sim = runner.sim;
+    for (let i = 1; i <= Math.max(...at); i++) {
+      runner.step();
+      if (runner.bodies.length) await runner.forcesReady;
+      if (!at.includes(i)) continue;
+      const f = { rho: glc.read(sim.rho), vel: glc.read(sim.vel), p: glc.read(sim.pressure) };
+      console.log(`GOLD ${dim}D ${name} n=${N} step ${i}: ` +
+        Object.entries(f).map(([k, v]) => `${k} ${hash(v)} ${norm(v)}`).join('  '));
+    }
+    runner.dispose();
+  }
+  window.__done = true;
+} catch (e) {
+  console.log(String(e.stack || e));
+  window.__error = String(e.message || e);
+}
+</script>

@@ -9,6 +9,10 @@ in 2D and 3D. The whole solver runs on the GPU as WebGL2 shader passes over floa
 (about 190–215 passes per time step). JavaScript only sequences the passes, integrates the
 few rigid bodies and sums a small reduced texture for the on-screen statistics.
 
+A third app, **World** (`world3d.html`), runs the same passes on an unbounded grid of which
+only the 8×8×8 bricks around the liquid are stored, over a height-map terrain: see
+[World mode](#world-mode).
+
 ![3D simulator: dam break in a 192×96×96 tank](docs/screenshots/app-3d.png)
 
 ## Screenshots
@@ -31,13 +35,25 @@ few rigid bodies and sums a small reduced texture for the on-screen statistics.
 
 ![2D simulator: rigid bodies falling into a pool](docs/screenshots/app-2d.png)
 
+World (`world3d.html`): the same liquid, stored in bricks where it is. Right: the stored bricks
+(blue: holding liquid, grey: kept around it).
+
+| | |
+|:-:|:-:|
+| ![Waterfall](docs/screenshots/world-waterfall.png) | ![Waterfall, stored bricks](docs/screenshots/world-waterfall-bricks.png) |
+| High waterfall: 16 m fall, 10 cm cells, t = 7 s | 1.95 M cells stored of the 11.2 M in the box around them |
+| ![Terraced cascade](docs/screenshots/world-cascade.png) | ![Terraced cascade, stored bricks](docs/screenshots/world-cascade-bricks.png) |
+| Terraced cascade: six basins, 5 cm cells, t = 15 s | 1.83 M cells stored of 6.9 M |
+
+![World app: the terraced cascade with its bricks](docs/screenshots/app-world.png)
+
 The pictures are produced from the real apps by `node tools/screenshots.mjs`.
 
 ## Run
 
 ```sh
 node tools/serve.mjs          # or: python3 -m http.server 8080
-# open http://localhost:8080/   (2d.html, 3d.html)
+# open http://localhost:8080/   (2d.html, 3d.html, world3d.html)
 ```
 
 ES modules do not load from `file://`, so the folder has to be served. Requirements: WebGL2
@@ -121,9 +137,10 @@ any 2D scene for a long time and reports rest, residuals and rigid body motion, 
 drops one body into a pool, `contact2d.html` floats bodies that touch each other and reports
 whether they settle, `glinfo.html` prints the browser's WebGL2 limits and whether
 float read-back is exact) and with `node tools/interact.mjs 2d|3d`, which drives the real
-apps with synthetic mouse input. Both tools take `--browser chrome|firefox|librewolf`;
-`npm test` runs the interaction checks in Chrome, `npm run test:firefox` and
-`npm run test:librewolf` in the other two.
+apps with synthetic mouse input (`2d|3d|world`). Both tools take
+`--browser chrome|firefox|librewolf`; `npm test` runs the interaction checks in Chrome,
+`npm run test:firefox` and `npm run test:librewolf` in the other two. The pages for world mode
+(`golden.html`, `sparse.html`, `world.html`) are described [there](#world-mode).
 
 ## Where the paper leaves a choice open
 
@@ -184,6 +201,7 @@ These are interpretations, not things the paper states. Each was decided by expe
 * **Two-way rigid bodies.** The paper couples solids to the liquid one way; bodies here also
   feel the liquid. The next section describes how.
 * **Rendering.** The surface is ray-marched instead of meshed with marching cubes.
+* **World mode.** Sparse storage, a terrain, metered sources and drains: its own section below.
 
 ## Rigid bodies
 
@@ -271,6 +289,151 @@ the pressure system as in [BBB07]; the consequences are listed under the limitat
 Because contacts use surface sample points, two boxes meeting edge to edge between sample
 points can interpenetrate slightly before the contact is seen.
 
+## World mode
+
+`world3d.html` runs the solver without the box. Cells are world integers on an unbounded grid;
+only bricks of 8×8×8 cells that hold liquid, or that liquid can reach before anyone looks again,
+are stored, and the ground is a height map. The numerics are the passes described above,
+unchanged. This is the first of four planned steps towards large scenes (still to come: water
+at rest that is not solved, a height-field far field, ships with compartments), so for now
+every stored cell is solved in full 3D in every step.
+
+**Storage** (`src/world/bricks.js`, `src/world/sparsesim.js`)
+
+* A brick is one tile of a pool texture: in 3D its eight z-slices side by side (64×8 texels),
+  in 2D 16×16. Every field of every multigrid level has a pool; the pools double when they
+  are full, up to 16384 bricks (8.4 million cells).
+* A two-level page table, kept by the CPU, maps a brick coordinate to its slot: a wrapped top
+  table with one entry per group of 16³ bricks, then that group's leaf. Two fetches, no search.
+* From the page table the GPU builds a neighbour table: for every slot, the slots of the 5×5×5
+  bricks around it. The solver passes read nothing else, so a cell access costs one extra
+  fetch wherever the cell lies. It also sets the speed limit of world mode: what a pass reads
+  must lie within two bricks of the brick it writes, so liquid moves at most 14.5 cells per step.
+* Every pool has two extra tiles that hold the field's default value. A brick that is not
+  stored resolves to one of them, so no pass has to ask whether a neighbour exists before
+  reading it. For the liquid a missing brick is a wall: the faces towards it are closed.
+* Positions inside a shader are measured from the corner of the brick being written, so their
+  precision is the same anywhere in the world.
+
+**One set of pass sources.** `header(dim, floatLinear, backend)` in `src/shaders/common.js`
+emits either the dense or the sparse version of a dozen helpers (is this cell present, texel
+of a cell, capacity of a deposit target, where a scatter point comes from and goes to, …) and
+`src/shaders/sim.js` is written against those. Two checks keep this honest:
+
+* `tests/golden.html` prints hashes of density, velocity and pressure of the dense solver for
+  the app scenes. They are bit for bit what they were before the helpers went in.
+* `tests/sparse.html?dim=2|3` stores every brick of a box and steps the dense and the sparse
+  solver side by side, comparing every field after every pass: at most 1e-5 apart after one
+  step, 1e-3 after 30 steps in 2D (dam break, pool, splash, ball) and 10 in 3D (dam break,
+  splash), same mass, same residual after the V-cycles. `?mode=run` then stores only the
+  bricks around the liquid and checks the mass and the per-brick reports.
+
+In world mode itself three things differ from the dense solver, each for a reason:
+
+1. A deposit of the advection or the sharpening whose stencil reaches a missing brick is
+   normalised over the corners that exist, as at a wall.
+2. The multigrid coarsens until the *longest* side of the stored region is under four cells
+   (the dense solver stops at the shortest): a river is long and thin. Level l consists of the
+   parents of the bricks of level l − 1, kept by reference counts; the scenes below have 8 or 9.
+3. Coarse cells that are solid throughout are walls. The dense solver treats them as air with
+   no volume, which is harmless for a tank with thin walls and made the V-cycle converge badly
+   over terrain, where a large part of every coarse level is ground.
+
+**Which bricks exist.** After every step two passes reduce each brick to eight numbers: its
+mass, its fastest liquid, how many of its cells are wet, the bounding box of those, how many
+wet cells sit on a face towards a missing brick, and two flags (a brick my liquid could reach
+is missing; a neighbour's liquid can reach me). The CPU reads these back, two texels per
+brick, and looks only at bricks that raised a flag, about two per step in the scenes below.
+
+* *Stored:* every brick within ⌈speed · Δt⌉ cells times the number of steps until the next
+  report is acted on, plus a margin of 5 cells, of a wet cell.
+* *Dropped:* a brick without a wet cell that has been out of reach for 40 reports.
+* *Wet* means ρ > 1e-6. Advection and sharpening leave traces of 1e-9 and less around every
+  splash; counting those as liquid stored the whole waterfall scene within seconds. What is
+  left in a brick when it is dropped is added to an "evaporated" total, so the books below
+  still close: it came to 1e-3 cells of liquid out of 185 000 in the cascade run.
+* *Never stored:* bricks that lie at least a cell and a half inside the ground or a fixed
+  obstacle everywhere. They are marked in the page table so that the reports do not keep
+  asking for them.
+* *Pool full:* the brick is refused and counted, and the liquid meets a wall there.
+
+**Ground, sources, drains** (`src/world/terrain.js`, `src/world/world.js`). The terrain is a
+texture of height and slope per sample, read with the same bilinear formula in the `solid`
+pass and in JavaScript; the distance to it is the vertical clearance divided by
+√(1 + slope²). Sources and drains are boxes that are filled or emptied before each step, on
+the tiles of the bricks they touch only. They are metered on the GPU: the change of every
+cell is summed by three 8×8 reductions into a one-texel ledger. (Blending thousands of small
+per-cell changes straight into one float lost 1.5e-4 of them.) The app shows
+*in − out − stored*; the tests require in = stored + out + evaporated to 1e-5.
+
+**Rendering** (`src/world/render3d.js`). The density is copied into a second pool with a
+one-cell apron around every brick (10³ texels, half float), so that two hardware-filtered
+fetches give a trilinear sample without looking anything up. A ray steps through the page
+table and skips empty space on three levels: groups of 16³ bricks, bricks, and the bounding
+box of the wet cells inside a brick. The terrain is traced directly from its height map.
+Density below the 0.5 surface is drawn as white haze ("Show spray").
+
+**Measured** (Chrome 154, RTX 3090)
+
+Every brick of a box stored, against the dense solver on the same box (`?mode=perf`, the
+fastest of five turns of 20 steps):
+
+| Grid | Dense | Sparse, all bricks | Ratio | Sparse per million cells |
+|---|---|---|---|---|
+| 128 × 64 × 64 | 4.0 ms | 5.5 ms | 1.4 | 10.5 ms |
+| 128³ | 8.2 ms | 12.9 ms | 1.6 | 6.1 ms |
+| 256 × 128 × 128 | 15.0 ms | 23.2 ms | 1.5 | 5.5 ms |
+
+(Interpolating by hand instead of with hardware filtering is the smaller part of the
+difference: the dense solver with its filtering switched off takes 15.6 ms on the largest grid.)
+
+The two scenes (`tests/world.html?scene=…&time=1`, without drawing):
+
+| | High waterfall | Terraced cascade |
+|---|---|---|
+| Cell size | 10 cm | 5 cm |
+| Scene | 16 m fall, river 3 m wide, 44 m × 22 m of terrain | six basins of 3.2 m × 3.6 m, 1.1 m apart in height |
+| After | 10 s | 15 s |
+| Bricks stored | 3961 | 3582 |
+| of those without a wet cell (the margin) | 1993 | 1815 |
+| Cells stored | 2.03 M | 1.83 M |
+| Cells in the box around them | 14.2 M (14 % stored) | 6.9 M (27 % stored) |
+| Bricks left out because they are in the ground | 1311 | 739 |
+| Step | 17.3 ms | 15.3 ms |
+| Per million stored cells | 8.6 ms | 8.8 ms |
+| in − (stored + out + evaporated), relative | 5.0e-6 | 2.4e-6 |
+| Fastest liquid | 6.5 cells per step | 3.5 cells per step |
+| Wet cells at the edge of the stored bricks, bricks refused | 0, 0 | 0, 0 |
+
+A stored cell costs about 9 ms per million in a real scene against 5.5 for a full box and 3.6
+for the dense solver: there are more multigrid levels, the slots of neighbouring bricks are
+scattered over the pool, and the per-brick reports are read back every step. On top of that
+half of the stored bricks are margin: dry, but within reach. While the set of bricks changes
+quickly (water arriving in a new basin) a step costs up to 15 ms per million cells.
+
+The app at 1280×800, drawing included, runs the cascade at 60 frames per second up to
+1.7 million stored cells and at 37–52 beyond 2 million, the waterfall at 47–51; LibreWolf 156
+gives the same rates.
+
+`node tools/interact.mjs world` drives the app: bricks follow the water, the books balance,
+pour / drain / push act under the pointer and conserve what they should, every scene runs.
+
+**Limits of world mode as it stands**
+
+* It needs read-back from the GPU to decide which bricks to store. With
+  `privacy.resistFingerprinting` on, the page says so and does not start.
+* Liquid cannot move more than 14.5 cells per step (see the neighbour table).
+* A sheet of falling water thins as it accelerates. Once it is thinner than a cell it is
+  density below 0.5, which this method moves with a velocity extrapolated from the nearest
+  liquid instead of letting it fall (the "mist" item under the limitations below). The
+  waterfall is sized so that its sheet stays about two cells thick; one that falls much
+  further turns into spray that drifts. Even so, about a quarter of its bricks hold spray only.
+* The terrain is a height map: no overhangs or caves, and the distance to a steep face is
+  only approximate (it is the vertical clearance scaled by the slope).
+* The per-brick reports are read back with a blocking call every step. A non-blocking variant
+  (`reportAsync`) passes the same tests but needs a wider margin, hence more bricks.
+* No rigid bodies yet, and no 2D app (2D exists in the tests).
+
 ## Known limitations
 
 * Verified on Linux with an NVIDIA GPU only (Chrome 154, Firefox 159, LibreWolf 156). Firefox
@@ -302,13 +465,16 @@ points can interpenetrate slightly before the contact is seen.
 
 ```
 2d.html, 3d.html, index.html   apps and landing page
+world3d.html                   the World app
 src/gl.js                      WebGL2 helpers (programs, float targets, scatter, async readback)
 src/sim.js                     FluidSim: textures, hierarchy, the time step
-src/shaders/                   GLSL for every pass
+src/shaders/                   GLSL for every pass (sparse.js: brick bookkeeping passes)
 src/runner.js                  scene driver: obstacles, bodies, emitters, interaction verbs
 src/bodies.js                  rigid bodies and contacts
 src/render2d.js, render3d.js   renderers
 src/scenes2d.js, scenes3d.js   scenarios
+src/world/                     world mode: bricks.js (page table), sparsesim.js (solver on bricks),
+                               terrain.js, world.js, scenes.js, render3d.js, app3d.js
 tests/, tools/                 headless diagnostics and interaction checks (puppeteer-core)
 docs/screenshots/              the pictures above (tools/screenshots.mjs regenerates them)
 ```

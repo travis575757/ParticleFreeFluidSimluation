@@ -1,0 +1,153 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>world scenes: storage and the liquid budget</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// Runs a world scene (src/world/scenes.js) without drawing it and checks the books:
+//   what the sources put in = what is stored + what the drains took out (+ the traces of
+//   density that were in bricks when they were dropped, "evaporated")
+//   the liquid never reaches the edge of the stored bricks, no brick is refused or dropped wet
+// and prints how many cells are stored against the box around them.
+//   ?scene=waterfall|cascade  &steps=600  &every=100  &p.<param>=value  &time=1 (ms per step, synced)
+//   &until=seconds (the sources stop then)  &pour=x,y,z,radius,first step,last step  &erase=...
+import { GLContext } from '../src/gl.js';
+import { World } from '../src/world/world.js';
+import { WORLD_SCENES } from '../src/world/scenes.js';
+
+const q = new URLSearchParams(location.search);
+const steps = Number(q.get('steps') || 600);
+const every = Number(q.get('every') || Math.max(1, Math.floor(steps / 6)));
+const params = {};
+for (const [k, v] of q) if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
+const log = (s) => console.log(s);
+let failed = 0;
+const check = (ok, what) => { if (!ok) failed++; log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); };
+
+try {
+  // (a long run must not hold up the page's load event, which the test runner waits for)
+  if (document.readyState !== 'complete') await new Promise((r) => window.addEventListener('load', r));
+  const glc = new GLContext(document.getElementById('c'));
+  log(`readback ${glc.readback} | ${glc.renderer}`);
+  const name = q.get('scene') || 'waterfall';
+  const scene = WORLD_SCENES[name].build();
+  // &until=seconds: the sources stop then
+  if (q.get('until')) for (const e of scene.emitters) e.until = Number(q.get('until'));
+  const world = new World(glc, 3, scene, { params });
+  const sim = world.sim;
+  const m0 = sim.measureSync().mass;
+  log(`${name}: ${sim.bricks} bricks at the start, liquid ${m0.toFixed(1)} cells`);
+  let edge = 0, worst = 0, peakBricks = sim.bricks, peakSpeed = 0, tSum = 0, tN = 0, tPart = 0, nPart = 0, cPart = 0;
+  let looked = 0, changed = 0, churn = 0, version = sim.levels[0].set.version;
+  const timed = q.get('time') === '1';
+  for (let i = 1; i <= steps; i++) {
+    const t0 = performance.now();
+    // &pour=x,y,z,radius,first step,last step and &erase=... : the tools of the app, by hand
+    for (const [key, f] of [['pour', (c, r) => world.pour(c, [0, -20, 0], r)], ['erase', (c, r) => world.erase(c, r)]]) {
+      const a = q.get(key)?.split(',').map(Number);
+      if (a && i >= a[4] && i <= a[5]) f(a.slice(0, 3), a[3]);
+    }
+    world.step();
+    if (timed) {
+      glc.read(sim.rho, 0, 0, 1, 1);
+      const t = performance.now() - t0;
+      if (i > 20) { tSum += t; tN++; }
+      tPart += t; nPart++; cPart += sim.storedCells;
+    }
+    if (sim.report) { edge += sim.report.edge; peakSpeed = Math.max(peakSpeed, sim.report.maxSpeed * sim.params.dt); looked += sim.report.looked; }
+    if (sim.levels[0].set.version !== version) { changed++; churn += sim.levels[0].set.version - version; version = sim.levels[0].set.version; }
+    peakBricks = Math.max(peakBricks, sim.bricks);
+    if (i % every === 0 || i === steps) {
+      sim.readLedger();
+      const s = sim.measureSync();
+      const err = Math.abs(s.mass + sim.freedMass - (m0 + sim.added - sim.removed)) / Math.max(m0 + sim.added, 1);
+      worst = Math.max(worst, err);
+      const box = world.boundsCells();
+      log(`step ${i} (t = ${world.time.toFixed(2)} s): ${sim.bricks} bricks = ${(sim.storedCells / 1e6).toFixed(3)} M cells stored, ${(box / 1e6).toFixed(2)} M in the box around them (${(100 * sim.storedCells / box).toFixed(1)} %), ` +
+        `${sim.levels[0].set.marks.size} bricks in the ground | in ${sim.added.toFixed(1)} out ${sim.removed.toFixed(1)} stored ${s.mass.toFixed(1)} evaporated ${sim.freedMass.toExponential(1)} (off by ${err.toExponential(2)}) | ` +
+        `fastest ${(s.maxSpeed * sim.params.dt).toFixed(2)} cells/step, ${sim.nlev} levels, residual ${s.residual.toExponential(1)}` +
+        (timed ? ` | ${(tPart / nPart).toFixed(1)} ms per step since the last line, ${(1e6 * tPart / cPart).toFixed(1)} ms per million stored cells` : ''));
+      tPart = nPart = cPart = 0;
+      if (q.get('debug') === '1') {
+        // how full the wet bricks are: by the largest density in each
+        const set = sim.levels[0].set;
+        const r = glc.read(sim.R.s[0]);
+        const edges = [1e-9, 1e-6, 1e-4, 1e-2, 0.5, Infinity];
+        const n = edges.map(() => 0), mass = edges.map(() => 0);
+        let dry = 0;
+        const bb = { lo: [1e9, 1e9, 1e9], hi: [-1e9, -1e9, -1e9] };
+        for (let k = 0; k < set.high; k++) {
+          if (!set.used[k]) continue;
+          const peak = r[4 * k + 3];
+          if (!(peak > 0)) { dry++; continue; }   // (no cell above wetMin)
+          const j = edges.findIndex((e) => peak < e);
+          n[j]++; mass[j] += r[4 * k];
+          if (peak >= 0.5) [set.bx[k], set.by[k], set.bz[k]].forEach((v, d) => { bb.lo[d] = Math.min(bb.lo[d], v * 8); bb.hi[d] = Math.max(bb.hi[d], v * 8 + 8); });
+        }
+        log(`  bricks by peak density: dry ${dry} | ` + edges.map((e, j) => `<${e}: ${n[j]} (mass ${mass[j].toExponential(2)})`).join(' | ') + ` | box of the bricks with liquid: ${bb.lo} .. ${bb.hi}`);
+      }
+      if (!Number.isFinite(s.mass)) { worst = Infinity; break; }
+      await new Promise((r) => setTimeout(r));
+    }
+  }
+  if (timed) log(`${(tSum / tN).toFixed(2)} ms per step over the run`);
+  log(`most bricks at once ${peakBricks}; fastest liquid ${peakSpeed.toFixed(2)} cells per step; the brick set changed in ${changed} of ${steps} steps ` +
+    `(${(churn / steps).toFixed(1)} bricks stored or dropped per step); the CPU looked at ${(looked / steps).toFixed(1)} bricks per step`);
+  if (q.get('profile') === '1') {
+    // where the time of a step goes: each part followed by a one-texel read-back (waits for the GPU)
+    const wait = () => glc.read(sim.rho, 0, 0, 1, 1);
+    const dt = sim.params.dt;
+    const parts = {
+      'sources and drains': () => { for (const e of world.emitters) sim.editLiquid([e.prim], 1, { meter: true }); for (const d of world.drains) sim.editLiquid([d.prim], 2, { meter: true }); },
+      'lifecycle (CPU)': () => sim._lifecycle(),
+      'new bricks': () => sim._syncBricks(),
+      extrapolate: () => sim._extrapolate(),
+      solids: () => sim._updateSolids(),
+      'advect density': () => sim._advectDensity(dt),
+      sharpen: () => sim._sharpen(dt),
+      'advect velocity': () => sim._advectVelocity(dt),
+      project: () => sim._project(dt),
+      report: () => { sim.time += dt; sim.frame++; sim.makeReport(); },
+    };
+    const t = {}, cpu = {};
+    const k = 30;
+    for (let i = 0; i < k; i++) {
+      for (const [name, f] of Object.entries(parts)) {
+        const t0 = performance.now();
+        f();
+        const t1 = performance.now();
+        wait();
+        cpu[name] = (cpu[name] || 0) + (t1 - t0) / k;
+        t[name] = (t[name] || 0) + (performance.now() - t0) / k;
+      }
+    }
+    log(`of which in JS (issuing the passes, bookkeeping): ` + Object.entries(cpu).map(([n, v]) => `${n} ${v.toFixed(2)}`).join(' | ') +
+      ` | total ${Object.values(cpu).reduce((a, b) => a + b, 0).toFixed(2)}`);
+    { const p0 = glc.passCount; world.step(); log(`${glc.passCount - p0} passes per step`); }
+    {
+      // the report: its two passes, and reading two small textures back
+      const set = sim.levels[0].set, R = sim.R;
+      const time = (f) => { wait(); const t0 = performance.now(); for (let i = 0; i < 20; i++) f(); wait(); return ((performance.now() - t0) / 20).toFixed(2); };
+      const U = sim._U(sim.levels[0]);
+      const rows = Math.max(1, Math.ceil(set.high / set.perRow));
+      log(`report in parts, ms: slotStats ${time(() => glc.draw(sim.prog.slotStats, R.s, { ...U, uRho: sim.T.rho[0], uVel: sim.T.vel[0], uWet: sim.params.wetMin, uEdge: sim.params.edgeMin }))} | ` +
+        `slotFlags ${time(() => glc.draw(sim.prog.slotFlags, R.f, { ...U, uS0: R.s[0], uS1: R.s[1], uS2: R.s[2], uDt: dt, uSteps: 2, uMargin: 5 }))} | ` +
+        `2 read-backs of ${set.perRow} x ${rows} ${time(() => R.f.map((x) => glc.read(x, 0, 0, set.perRow, rows)))} | pool ${set.perRow} x ${set.rows} slots, highest in use ${set.high}`);
+    }
+    const total = Object.values(t).reduce((a, b) => a + b, 0);
+    log(`ms per step by part, ${sim.bricks} bricks (${(sim.storedCells / 1e6).toFixed(2)} M cells), ${sim.nlev} levels: ` +
+      Object.entries(t).map(([n, v]) => `${n} ${v.toFixed(2)}`).join(' | ') + ` | total ${total.toFixed(2)}`);
+  }
+  check(worst <= 1e-5, `in = stored + out + evaporated (largest relative difference ${worst.toExponential(2)})`);
+  check(sim.added > 0, `the source ran (${sim.added.toFixed(1)} cells of liquid)`);
+  check(edge === 0, `the liquid never touched the edge of the stored bricks (${edge} cell reports)`);
+  check(sim.refused === 0, `no brick was refused (${sim.refused})`);
+  check(sim.freedMass <= 1e-7 * (m0 + sim.added), `next to no density in the bricks that were dropped (${sim.freedMass.toExponential(2)} cells of liquid)`);
+  log(failed ? `${failed} check(s) failed` : 'all checks passed');
+  if (failed) window.__error = `${failed} check(s) failed`;
+  window.__done = true;
+} catch (e) {
+  console.log(String(e.stack || e));
+  window.__error = String(e.message || e);
+}
+</script>

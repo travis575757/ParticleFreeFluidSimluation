@@ -2,6 +2,7 @@
 // cached framebuffers, fullscreen passes, point-scatter passes and async readback.
 
 const FORMATS = {
+  r16f: { internal: 'R16F', format: 'RED', channels: 1, half: true },   // filters linearly without an extension
   r32f: { internal: 'R32F', format: 'RED', channels: 1 },
   rg32f: { internal: 'RG32F', format: 'RG', channels: 2 },
   rgba32f: { internal: 'RGBA32F', format: 'RGBA', channels: 4 },
@@ -10,6 +11,20 @@ const FORMATS = {
 const VS_FULLSCREEN = `#version 300 es
 void main() {
   vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// Vertex shader of a pass that only covers some tiles of its target: one instanced quad per
+// tile, the tile's index in aSlot (see GLContext.drawTiles).
+export const VS_TILES = `#version 300 es
+layout(location = 0) in float aSlot;
+uniform vec2 uTileSize;     // texels
+uniform int uTilesPerRow;
+uniform vec2 uTargetInv;    // 1 / target size
+void main() {
+  int s = int(aSlot);
+  vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+  vec2 p = (vec2(float(s % uTilesPerRow), float(s / uTilesPerRow)) + corner) * uTileSize * uTargetInv;
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
@@ -155,7 +170,7 @@ export class GLContext {
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl[F.internal], w, h, 0, gl[F.format], gl.FLOAT, data);
-    const filt = linear && this.floatLinear ? gl.LINEAR : gl.NEAREST;
+    const filt = linear && (this.floatLinear || F.half) ? gl.LINEAR : gl.NEAREST;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -214,6 +229,47 @@ export class GLContext {
     this.passCount++;
   }
 
+  /** A list of tile indices for drawTiles(). `set(indices)` replaces its contents. */
+  tileList() {
+    const gl = this.gl;
+    const vao = gl.createVertexArray();
+    const buf = gl.createBuffer();
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(0, 1);
+    gl.bindVertexArray(this._emptyVao);
+    const list = {
+      vao, buf, count: 0,
+      set: (indices) => {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, indices instanceof Float32Array ? indices : new Float32Array(indices), gl.DYNAMIC_DRAW);
+        list.count = indices.length;
+      },
+      dispose: () => { gl.deleteBuffer(buf); gl.deleteVertexArray(vao); },
+    };
+    return list;
+  }
+
+  /**
+   * Fragment pass over the tiles in `list` only (program built with VS_TILES); the rest of the
+   * target keeps its contents. `tile` = { size: [w, h] texels, perRow }.
+   */
+  drawTiles(p, target, uniforms, list, tile) {
+    const gl = this.gl;
+    if (!list.count) return;
+    this._bindTarget(target);
+    const t0 = Array.isArray(target) ? target[0] : target;
+    gl.useProgram(p.prog);
+    this._setUniforms(p, { ...uniforms, uTileSize: tile.size, uTilesPerRow: tile.perRow, uTargetInv: [1 / t0.w, 1 / t0.h] });
+    gl.disable(gl.BLEND);
+    gl.bindVertexArray(list.vao);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, list.count);
+    gl.bindVertexArray(this._emptyVao);
+    this.passCount++;
+  }
+
   /**
    * Additive point-scatter pass: `count` attribute-less points. The vertex shader takes the
    * point's index from `gl_VertexID + uBase`: browsers cap the number of vertices in one draw
@@ -260,6 +316,25 @@ export class GLContext {
     this._bindTarget(target);
     gl.clearColor(r, g, b, a);
     gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+
+  /** Clear a rectangle of `target` (all of its attachments) to one value. */
+  clearRect(target, x, y, w, h, r = 0, g = 0, b = 0, a = 0) {
+    const gl = this.gl;
+    this._bindTarget(target);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(x, y, w, h);
+    gl.clearColor(r, g, b, a);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.SCISSOR_TEST);
+  }
+
+  /** Replace a rectangle of a texture with `data` (Float32Array, `channels` values per texel). */
+  upload(t, data, x = 0, y = 0, w = t.w, h = t.h) {
+    const gl = this.gl;
+    const F = FORMATS[t.fmt];
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl[F.format], gl.FLOAT, data);
   }
 
   // ---- readback -----------------------------------------------------------

@@ -49,6 +49,10 @@ export const DEFAULT_PARAMS = {
   thetaMin: 0.01,        // ghost-fluid clamp
   airLeak: 1,            // coarse levels keep the p = 0 condition of air pockets that averaging phi erases
   pminLevels: 3,         // "S" of [CM11a]
+
+  // 1 = interpolate in the shader with exact weights instead of the GPU's texture filtering (which
+  // rounds the weights to 8 bits). Slower; the reference the sparse solver is compared against.
+  manualFilter: 0,
 };
 
 /** Atlas layout for an nx*ny*nz grid: z-slices tiled tx across. */
@@ -105,9 +109,12 @@ export function packPrims(list, P, dim) {
 }
 
 export class FluidSim {
-  constructor(glc, { dim = 2, nx, ny, nz = 1, params = {} }) {
+  constructor(glc, options) {
+    const { dim = 2, nx, ny, nz = 1, params = {}, backend = 'dense' } = options;
     this.glc = glc;
     this.dim = dim;
+    this.backend = backend;
+    this.options = options;
     this.params = { ...DEFAULT_PARAMS, ...params };
     this.time = 0;
     this.frame = 0;
@@ -125,12 +132,14 @@ export class FluidSim {
   // ------------------------------------------------------------------ setup
   _buildPrograms() {
     const glc = this.glc;
-    const S = simShaders(this.dim, glc.floatLinear);
+    const S = simShaders(this.dim, glc.floatLinear && !this.params.manualFilter, this.backend);
+    const vs = this._passVS();
     const P = {};
     const fragmentPasses = ['solid', 'liq', 'extrapInit', 'extrapPull', 'extrapPush', 'advTrace',
       'advGather', 'advPlain', 'diffuse', 'sharpen', 'velAdvect', 'downsample', 'coef', 'rhs', 'smooth', 'restrict',
-      'prolong', 'residual', 'project', 'stats', 'sourceRho', 'sourceVel'];
-    for (const name of fragmentPasses) P[name] = glc.program(name, S[name]);
+      'prolong', 'residual', 'project', 'sourceRho', 'sourceVel'];
+    for (const name of fragmentPasses) P[name] = glc.program(name, S[name], vs);
+    P.stats = glc.program('stats', S.stats);
     P.scatterBeta = glc.program('scatterBeta', S.scatterFS, S.scatterBetaVS);
     P.scatterFwd = glc.program('scatterFwd', S.scatterFS, S.scatterFwdVS);
     P.scatterSharp = glc.program('scatterSharp', S.scatterFS, S.scatterSharpVS);
@@ -138,36 +147,38 @@ export class FluidSim {
     this.prog = P;
   }
 
-  _buildGrid(nx, ny, nz) {
+  // How the passes reach the grid. The sparse solver (src/world/sparsesim.js) overrides these.
+  /** Vertex shader of the per-cell fragment passes (null = one triangle over the whole target). */
+  _passVS() { return null; }
+  /** Grid uniforms of a pass on level L that also reads level L2 (the next finer or coarser one). */
+  _U(L, L2 = L) { return { G: L.grid, GF: L2.grid, GC: L2.grid }; }
+  /** Per-cell fragment pass over every cell of level L. */
+  _draw(p, target, L, uniforms, L2 = L) { this.glc.draw(p, target, { ...this._U(L, L2), ...uniforms }); }
+  /** Scatter pass with `perCell` points for every cell of level L. */
+  _scatter(p, target, L, uniforms, perCell, opts) {
+    this.glc.scatter(p, target, { ...this._U(L), ...uniforms }, L.grid.cells * perCell, opts);
+  }
+
+  /** Textures of multigrid level l (L.grid must be set). */
+  _allocLevel(L, l) {
     const glc = this.glc;
-    const dim = this.dim;
-    // multigrid / extrapolation hierarchy
-    const levels = [];
-    let n = [nx, ny, nz];
-    for (;;) {
-      const grid = makeGrid(n[0], n[1], n[2]);
-      if (grid.w > glc.maxTextureSize || grid.h > glc.maxTextureSize) throw new Error('grid too large for this GPU');
-      levels.push({ grid });
-      const active = dim === 2 ? [n[0], n[1]] : n;
-      if (active.some((v) => v % 2 !== 0 || v / 2 < (this.params.coarsest || 2))) break;
-      n = [n[0] / 2, n[1] / 2, dim === 2 ? 1 : n[2] / 2];
-    }
-    levels.forEach((L, l) => {
-      const { w, h } = L.grid;
-      L.W = glc.texture(w, h, 'rgba32f');
-      L.liq = glc.texture(w, h, 'rg32f', { linear: l === 0 });
-      L.cA = glc.texture(w, h, 'rgba32f');
-      L.cB = glc.texture(w, h, 'rgba32f');
-      L.p = [glc.texture(w, h, 'r32f'), glc.texture(w, h, 'r32f')];
-      L.rhs = glc.texture(w, h, 'rg32f');
-      L.exA = glc.texture(w, h, 'rgba32f');
-      L.exB = glc.texture(w, h, 'rgba32f');
-      if (l > 0) L.exF = glc.texture(w, h, 'rgba32f');
-      glc.clear(L.p[0]);
-      glc.clear(L.p[1]);
-    });
-    this.levels = levels;
-    const g = (this.grid = levels[0].grid);
+    const { w, h } = L.grid;
+    L.W = glc.texture(w, h, 'rgba32f');
+    L.liq = glc.texture(w, h, 'rg32f', { linear: l === 0 });
+    L.cA = glc.texture(w, h, 'rgba32f');
+    L.cB = glc.texture(w, h, 'rgba32f');
+    L.p = [glc.texture(w, h, 'r32f'), glc.texture(w, h, 'r32f')];
+    L.rhs = glc.texture(w, h, 'rg32f');
+    L.exA = glc.texture(w, h, 'rgba32f');
+    L.exB = glc.texture(w, h, 'rgba32f');
+    if (l > 0) L.exF = glc.texture(w, h, 'rgba32f');
+    glc.clear(L.p[0]);
+    glc.clear(L.p[1]);
+  }
+
+  /** Textures that only exist on the finest level. */
+  _allocFields(g) {
+    const glc = this.glc;
     const T = (this.T = {});
     T.vel = [glc.texture(g.w, g.h, 'rgba32f', { linear: true }), glc.texture(g.w, g.h, 'rgba32f', { linear: true })];
     T.rho = [glc.texture(g.w, g.h, 'rg32f', { linear: true }), glc.texture(g.w, g.h, 'rg32f', { linear: true })];
@@ -184,10 +195,31 @@ export class FluidSim {
     T.stats = [glc.texture(sw, sh, 'rgba32f'), glc.texture(sw, sh, 'rgba32f')];
     T.force = [0, 1, 2].map(() => glc.texture(MAX_PRIMS, 1, 'rgba32f'));
     for (const t of [...T.vel, ...T.rho, T.res]) glc.clear(t);
-    this.nc = dim === 2 ? 4 : 8;
+    this.nc = this.dim === 2 ? 4 : 8;
     this.baseline = null;
     this.stats = null;
     this._statsBusy = false;
+  }
+
+  _buildGrid(nx, ny, nz) {
+    const glc = this.glc;
+    const dim = this.dim;
+    // multigrid / extrapolation hierarchy
+    const levels = [];
+    let n = [nx, ny, nz];
+    for (;;) {
+      const grid = makeGrid(n[0], n[1], n[2]);
+      if (grid.w > glc.maxTextureSize || grid.h > glc.maxTextureSize) throw new Error('grid too large for this GPU');
+      levels.push({ grid });
+      const active = dim === 2 ? [n[0], n[1]] : n;
+      if (active.some((v) => v % 2 !== 0 || v / 2 < (this.params.coarsest || 2))) break;
+      n = [n[0] / 2, n[1] / 2, dim === 2 ? 1 : n[2] / 2];
+    }
+    levels.forEach((L, l) => this._allocLevel(L, l));
+    this.levels = levels;
+    this.nlev = levels.length;       // levels in use
+    this.grid = levels[0].grid;
+    this._allocFields(this.grid);
   }
 
   get vel() { return this.T.vel[0]; }
@@ -203,24 +235,31 @@ export class FluidSim {
   }
 
   _updateSolids() {
-    const { glc, prog: P, T, grid: G } = this;
-    glc.draw(P.solid, [T.sdf, T.us, T.frac, this.levels[0].W], { G, uVthr: this.params.closeSlivers ? this.params.vthr : 0, ...packPrims(this.solids, 'S', this.dim) });
+    const { prog: P, T } = this;
+    const L0 = this.levels[0];
+    this._draw(P.solid, [T.sdf, T.us, T.frac, L0.W], L0,
+      { uVthr: this.params.closeSlivers ? this.params.vthr : 0, ...packPrims(this.solids, 'S', this.dim), ...this._solidUniforms() });
   }
 
+  /** What the backend adds to the solids (the sparse one: a terrain). */
+  _solidUniforms() { return {}; }
+
   _computeLiq() {
-    const { glc, prog: P, T, grid: G } = this;
-    glc.draw(P.liq, this.levels[0].liq, { G, uRho: T.rho[0], uFrac: T.frac, uVthr: this.params.vthr });
+    const { prog: P, T } = this;
+    const L0 = this.levels[0];
+    this._draw(P.liq, L0.liq, L0, { uRho: T.rho[0], uFrac: T.frac, uVthr: this.params.vthr });
   }
 
   /** Initialise the liquid from primitives (grid units, with velocities). */
   reset(solids, liquid) {
-    const { glc, prog: P, T, grid: G } = this;
+    const { glc, prog: P, T } = this;
+    const L0 = this.levels[0];
     this.setSolids(solids);
     this._updateSolids();
     const L = packPrims(liquid, 'L', this.dim);
-    glc.draw(P.sourceRho, T.rho[1], { G, ...L, uRho: T.rho[0], uFrac: T.frac, uOp: 0 });
+    this._draw(P.sourceRho, T.rho[1], L0, { ...L, uRho: T.rho[0], uFrac: T.frac, uOp: 0 });
     this._swap(T.rho);
-    glc.draw(P.sourceVel, T.vel[1], { G, ...L, uVel: T.vel[0], uOp: 0 });
+    this._draw(P.sourceVel, T.vel[1], L0, { ...L, uVel: T.vel[0], uOp: 0 });
     this._swap(T.vel);
     for (const lv of this.levels) { glc.clear(lv.p[0]); glc.clear(lv.p[1]); }
     glc.clear(T.res);
@@ -234,12 +273,13 @@ export class FluidSim {
 
   /** Add (op = 1) or remove (op = 2) liquid inside primitives; added liquid gets their velocity. */
   editLiquid(prims, op = 1) {
-    const { glc, prog: P, T, grid: G } = this;
+    const { prog: P, T } = this;
+    const L0 = this.levels[0];
     const L = packPrims(prims, 'L', this.dim);
-    glc.draw(P.sourceRho, T.rho[1], { G, ...L, uRho: T.rho[0], uFrac: T.frac, uOp: op });
+    this._draw(P.sourceRho, T.rho[1], L0, { ...L, uRho: T.rho[0], uFrac: T.frac, uOp: op });
     this._swap(T.rho);
     if (op === 1) {
-      glc.draw(P.sourceVel, T.vel[1], { G, ...L, uVel: T.vel[0], uOp: 1 });
+      this._draw(P.sourceVel, T.vel[1], L0, { ...L, uVel: T.vel[0], uOp: 1 });
       this._swap(T.vel);
     }
     this._computeLiq();
@@ -262,19 +302,18 @@ export class FluidSim {
 
   // 1. velocity extrapolation -------------------------------------------------
   _extrapolate() {
-    const { glc, prog: P, T, levels: L } = this;
-    glc.draw(P.extrapInit, [L[0].exA, L[0].exB], { G: L[0].grid, uVel: T.vel[0], uLiq: L[0].liq, uW: L[0].W });
-    for (let l = 1; l < L.length; l++) {
-      glc.draw(P.extrapPull, [L[l].exA, L[l].exB], { G: L[l].grid, GF: L[l - 1].grid, uA: L[l - 1].exA, uB: L[l - 1].exB });
+    const { prog: P, T, levels: L } = this;
+    this._draw(P.extrapInit, [L[0].exA, L[0].exB], L[0], { uVel: T.vel[0], uLiq: L[0].liq, uW: L[0].W });
+    for (let l = 1; l < this.nlev; l++) {
+      this._draw(P.extrapPull, [L[l].exA, L[l].exB], L[l], { uA: L[l - 1].exA, uB: L[l - 1].exB }, L[l - 1]);
     }
-    const top = L.length - 1;
+    const top = this.nlev - 1;
     if (top === 0) {
-      glc.draw(P.extrapPush, T.vel[1], { G: L[0].grid, GC: L[0].grid, uA: L[0].exA, uB: L[0].exB, uFc: L[0].exA, uTop: 1 });
+      this._draw(P.extrapPush, T.vel[1], L[0], { uA: L[0].exA, uB: L[0].exB, uFc: L[0].exA, uTop: 1 });
     } else {
-      glc.draw(P.extrapPush, L[top].exF, { G: L[top].grid, GC: L[top].grid, uA: L[top].exA, uB: L[top].exB, uFc: L[top].exA, uTop: 1 });
+      this._draw(P.extrapPush, L[top].exF, L[top], { uA: L[top].exA, uB: L[top].exB, uFc: L[top].exA, uTop: 1 });
       for (let l = top - 1; l >= 0; l--) {
-        glc.draw(P.extrapPush, l === 0 ? T.vel[1] : L[l].exF,
-          { G: L[l].grid, GC: L[l + 1].grid, uA: L[l].exA, uB: L[l].exB, uFc: L[l + 1].exF, uTop: 0 });
+        this._draw(P.extrapPush, l === 0 ? T.vel[1] : L[l].exF, L[l], { uA: L[l].exA, uB: L[l].exB, uFc: L[l + 1].exF, uTop: 0 }, L[l + 1]);
       }
     }
     this._swap(T.vel);
@@ -282,21 +321,21 @@ export class FluidSim {
 
   // 2a. conservative density advection -----------------------------------------
   _advectDensity(dt) {
-    const { glc, prog: P, T, grid: G, params: p } = this;
-    const count = G.cells * this.nc;
+    const { prog: P, T, params: p } = this;
+    const L0 = this.levels[0];
     const tr = { uVel: T.vel[0], uSdf: T.sdf, uTraceSteps: p.traceSteps };
-    glc.draw(P.advTrace, T.trace, { G, ...tr, uRho: T.rho[0], uFrac: T.frac, uDt: dt, uMode: p.advection });
-    glc.scatter(P.scatterBeta, T.beta, { G, uSrc: T.trace }, count, { clear: true });
-    glc.draw(P.advGather, [T.rho[1], T.fwd],
-      { G, ...tr, uRho: T.rho[0], uTraceTex: T.trace, uBeta: T.beta, uFrac: T.frac, uDt: dt });
-    glc.scatter(P.scatterFwd, T.rho[1], { G, uSrc: T.fwd, uRho: T.rho[0], uFrac: T.frac }, count);
+    this._draw(P.advTrace, T.trace, L0, { ...tr, uRho: T.rho[0], uFrac: T.frac, uDt: dt, uMode: p.advection });
+    this._scatter(P.scatterBeta, T.beta, L0, { uSrc: T.trace }, this.nc, { clear: true });
+    this._draw(P.advGather, [T.rho[1], T.fwd], L0,
+      { ...tr, uRho: T.rho[0], uTraceTex: T.trace, uBeta: T.beta, uFrac: T.frac, uDt: dt });
+    this._scatter(P.scatterFwd, T.rho[1], L0, { uSrc: T.fwd, uRho: T.rho[0], uFrac: T.frac }, this.nc);
     this._swap(T.rho);
     const pairs = p.diffusionPairs ? [0, 1] : [-1];
     for (let it = 0; it < p.diffusionIters; it++) {
       for (let axis = 0; axis < this.dim; axis++) {
         for (const pair of pairs) {
-          glc.draw(P.diffuse, T.rho[1],
-            { G, uRho: T.rho[0], uFrac: T.frac, uAxis: axis, uPair: pair, uLimit: p.diffusionLimit, uKappa: p.kappa });
+          this._draw(P.diffuse, T.rho[1], L0,
+            { uRho: T.rho[0], uFrac: T.frac, uAxis: axis, uPair: pair, uLimit: p.diffusionLimit, uKappa: p.kappa });
           this._swap(T.rho);
         }
       }
@@ -304,31 +343,33 @@ export class FluidSim {
   }
 
   _advectDensityPlain(dt) {
-    const { glc, prog: P, T, grid: G, params: p } = this;
-    glc.draw(P.advPlain, T.rho[1],
-      { G, uVel: T.vel[0], uSdf: T.sdf, uTraceSteps: p.traceSteps, uRho: T.rho[0], uFrac: T.frac, uDt: dt });
+    const { prog: P, T, params: p } = this;
+    this._draw(P.advPlain, T.rho[1], this.levels[0],
+      { uVel: T.vel[0], uSdf: T.sdf, uTraceSteps: p.traceSteps, uRho: T.rho[0], uFrac: T.frac, uDt: dt });
     this._swap(T.rho);
   }
 
   // 2b. sharpening + solid excess ----------------------------------------------
   _sharpen(dt) {
-    const { glc, prog: P, T, grid: G, params: p } = this;
+    const { prog: P, T, params: p } = this;
+    const L0 = this.levels[0];
     this._computeLiq();
-    glc.draw(P.sharpen, [T.rho[1], T.fwd], {
-      G, uSdf: T.sdf, uRho: T.rho[0], uLiq: this.levels[0].liq, uFrac: T.frac,
+    this._draw(P.sharpen, [T.rho[1], T.fwd], L0, {
+      uVel: T.vel[0], uTraceSteps: p.traceSteps,
+      uSdf: T.sdf, uRho: T.rho[0], uLiq: L0.liq, uFrac: T.frac,
       uCs: (p.sharpenK * dt) / p.h, uTau: p.tau, uD: p.D, uS: p.S, uEps: p.eps, uSharpen: p.sharpen,
     });
-    glc.scatter(P.scatterSharp, T.rho[1], { G, uSrc: T.fwd, uFrac: T.frac }, G.cells * this.nc);
+    this._scatter(P.scatterSharp, T.rho[1], L0, { uSrc: T.fwd, uFrac: T.frac }, this.nc);
     this._swap(T.rho);
     this._computeLiq();
   }
 
   // 3. velocity advection + forces ---------------------------------------------
   _advectVelocity(dt) {
-    const { glc, prog: P, T, grid: G, params: p, mouse: m } = this;
+    const { prog: P, T, params: p, mouse: m } = this;
     const g = p.gravity;
-    glc.draw(P.velAdvect, T.vel[1], {
-      G, uVel: T.vel[0], uTraceSteps: p.traceSteps, uDt: dt,
+    this._draw(P.velAdvect, T.vel[1], this.levels[0], {
+      uVel: T.vel[0], uTraceSteps: p.traceSteps, uDt: dt,
       uGravity: [g[0] / p.h, g[1] / p.h, this.dim === 2 ? 0 : g[2] / p.h],
       uMouse: [m.pos[0], m.pos[1], m.pos[2], m.radius],
       uMouseVel: [m.vel[0], m.vel[1], m.vel[2], m.strength],
@@ -339,11 +380,11 @@ export class FluidSim {
 
   // 4. pressure projection ------------------------------------------------------
   _smooth(l, sweeps) {
-    const { glc, prog: P } = this;
+    const { prog: P } = this;
     const L = this.levels[l];
     for (let i = 0; i < sweeps; i++) {
       for (let color = 0; color < 2; color++) {
-        glc.draw(P.smooth, L.p[1], { G: L.grid, uP: L.p[0], uRhs: L.rhs, uCA: L.cA, uCB: L.cB, uColor: color });
+        this._draw(P.smooth, L.p[1], L, { uP: L.p[0], uRhs: L.rhs, uCA: L.cA, uCB: L.cB, uColor: color });
         this._swap(L.p);
       }
     }
@@ -352,53 +393,53 @@ export class FluidSim {
   _vcycle(l) {
     const { glc, prog: P, params: p, levels } = this;
     const L = levels[l];
-    if (l === levels.length - 1) { this._smooth(l, p.coarseSweeps); return; }
+    if (l === this.nlev - 1) { this._smooth(l, p.coarseSweeps); return; }
     const C = levels[l + 1];
     this._smooth(l, p.preSweeps);
-    glc.draw(P.restrict, C.rhs,
-      { G: C.grid, GF: L.grid, uP: L.p[0], uRhs: L.rhs, uCA: L.cA, uCB: L.cB, uUsePmin: l < p.pminLevels ? 1 : 0 });
+    this._draw(P.restrict, C.rhs, C,
+      { uP: L.p[0], uRhs: L.rhs, uCA: L.cA, uCB: L.cB, uUsePmin: l < p.pminLevels ? 1 : 0 }, L);
     glc.clear(C.p[0]);
     this._vcycle(l + 1);
-    glc.draw(P.prolong, L.p[1], { G: L.grid, GC: C.grid, uP: L.p[0], uPc: C.p[0], uCA: L.cA });
+    this._draw(P.prolong, L.p[1], L, { uP: L.p[0], uPc: C.p[0], uLiqC: C.liq, uCA: L.cA }, C);
     this._swap(L.p);
     this._smooth(l, p.postSweeps);
   }
 
   /** Matrix coefficients on every level of the hierarchy, from the current liquid and solids. */
   _buildMatrix() {
-    const { glc, prog: P, levels, params: p } = this;
+    const { prog: P, levels, params: p } = this;
     const invThetaMax = 1 / p.thetaMin;
     const L0 = levels[0];
     // (the finer-level inputs are unused on level 0; any texture that is not a target of the pass will do)
-    glc.draw(P.coef, [L0.cA, L0.cB], {
-      G: L0.grid, uLiq: L0.liq, uW: L0.W, uInvThetaMax: invThetaMax,
-      uCoarse: 0, GF: L0.grid, uLiqF: L0.liq, uWF: L0.W, uCBF: L0.exB,
+    this._draw(P.coef, [L0.cA, L0.cB], L0, {
+      uLiq: L0.liq, uW: L0.W, uInvThetaMax: invThetaMax,
+      uCoarse: 0, uLiqF: L0.liq, uWF: L0.W, uCBF: L0.exB,
     });
-    for (let l = 1; l < levels.length; l++) {
+    for (let l = 1; l < this.nlev; l++) {
       const L = levels[l];
       const F = levels[l - 1];
-      glc.draw(P.downsample, [L.liq, L.W], { G: L.grid, GF: F.grid, uLiqF: F.liq, uWF: F.W });
-      glc.draw(P.coef, [L.cA, L.cB], {
-        G: L.grid, uLiq: L.liq, uW: L.W, uInvThetaMax: invThetaMax,
-        uCoarse: p.airLeak, GF: F.grid, uLiqF: F.liq, uWF: F.W, uCBF: F.cB,
-      });
+      this._draw(P.downsample, [L.liq, L.W], L, { uLiqF: F.liq, uWF: F.W }, F);
+      this._draw(P.coef, [L.cA, L.cB], L, {
+        uLiq: L.liq, uW: L.W, uInvThetaMax: invThetaMax,
+        uCoarse: p.airLeak, uLiqF: F.liq, uWF: F.W, uCBF: F.cB,
+      }, F);
     }
   }
 
   _project(dt) {
-    const { glc, prog: P, T, levels, params: p } = this;
+    const { prog: P, T, levels, params: p } = this;
     const invThetaMax = 1 / p.thetaMin;
     const L0 = levels[0];
     this._buildMatrix();
-    glc.draw(P.rhs, L0.rhs, {
-      G: L0.grid, uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uSdf: T.sdf,
+    this._draw(P.rhs, L0.rhs, L0, {
+      uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uSdf: T.sdf,
       uSrcScale: p.lambda / dt, uSrcMax: p.eta / dt, uSinkScale: p.compress / dt, uSinkMax: p.compressMax / dt,
       uSeparate: p.separate,
     });
     const cycles = this.twoWay ? Math.max(p.vcycles, p.vcyclesBodies) : p.vcycles;
     for (let i = 0; i < cycles; i++) this._vcycle(0);
-    glc.draw(P.project, T.vel[1],
-      { G: L0.grid, uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uP: L0.p[0], uInvThetaMax: invThetaMax });
+    this._draw(P.project, T.vel[1], L0,
+      { uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uP: L0.p[0], uInvThetaMax: invThetaMax });
     this._swap(T.vel);
   }
 
@@ -406,8 +447,8 @@ export class FluidSim {
   _drawStats() {
     const { glc, prog: P, T, levels } = this;
     const L0 = levels[0];
-    glc.draw(P.residual, T.res, { G: L0.grid, uP: L0.p[0], uRhs: L0.rhs, uCA: L0.cA, uCB: L0.cB });
-    glc.draw(P.stats, T.stats, { G: L0.grid, uRho: T.rho[0], uLiq: L0.liq, uVel: T.vel[0], uRes: T.res, uB: this.statsBlock });
+    this._draw(P.residual, T.res, L0, { uP: L0.p[0], uRhs: L0.rhs, uCA: L0.cA, uCB: L0.cB });
+    glc.draw(P.stats, T.stats, { ...this._U(L0), uRho: T.rho[0], uLiq: L0.liq, uVel: T.vel[0], uRes: T.res, uB: this.statsBlock });
   }
 
   _reduceStats(a, b) {
@@ -455,13 +496,14 @@ export class FluidSim {
    * the mean liquid velocity over that wet band.
    */
   async measureBodyForces(prims) {
-    const { glc, prog: P, T, grid: G } = this;
+    const { glc, prog: P, T } = this;
+    const L0 = this.levels[0];
     if (this._forceBusy || prims.length === 0) return null;
     this._forceBusy = true;
     try {
-      glc.scatter(P.bodyForce, T.force,
-        { G, uP: this.levels[0].p[0], uLiq: this.levels[0].liq, uVel: T.vel[0], uSlots: MAX_PRIMS, ...packPrims(prims, 'B', this.dim) },
-        G.cells, { clear: true });
+      this._scatter(P.bodyForce, T.force, L0,
+        { uP: L0.p[0], uLiq: L0.liq, uVel: T.vel[0], uSlots: MAX_PRIMS, ...packPrims(prims, 'B', this.dim) },
+        1, { clear: true });
       const [a, b, c] = await Promise.all(T.force.map((tex) => glc.readAsync(tex)));
       // the weights are sums of O(1) terms: "none" is tested against a threshold because some
       // browsers return zeros with their last bits flipped (see GLContext._testReadback)

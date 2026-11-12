@@ -1,0 +1,462 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>sparse (brick) solver against the dense one</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// The sparse solver (src/world/sparsesim.js) runs the passes of the dense one on pooled bricks.
+//   ?mode=equiv   every brick of the dense box is stored: both solvers are stepped pass by pass
+//                 from the same start and their fields compared after each pass
+//   ?mode=run     the sparse solver stores bricks only around the liquid (the brick lifecycle
+//                 runs); checks conservation and the per-brick reports, and prints how far the
+//                 result is from the dense run of the same scene
+//   ?mode=perf    time per step: dense (hardware filtering), dense (manual), sparse (full box)
+//   ?mode=profile the same split by stage of the step
+//   ?dim=2|3  &scene=dam|pool|splash|ball  &n=64 [&nx= &nz=]  &steps=30  &tol=1e-5  &tolLate=1e-3
+//   &p.<param>=value (both solvers)  &s.<param>=value (sparse only)  &verbose=1
+//   mode=run: &veto=0 &initial= &max= &cmpAt= &l1=
+import { GLContext } from '../src/gl.js';
+import { FluidSim } from '../src/sim.js';
+import { SparseSim } from '../src/world/sparsesim.js';
+import { staticSolidTest } from '../src/world/terrain.js';
+
+const q = new URLSearchParams(location.search);
+const dim = Number(q.get('dim') || 2);
+const mode = q.get('mode') || 'equiv';
+const N = Number(q.get('n') || (dim === 2 ? 64 : 32));
+const steps = Number(q.get('steps') || 30);
+const tol = Number(q.get('tol') || 1e-5);
+const tolLate = Number(q.get('tolLate') || 1e-3);
+const verbose = q.get('verbose') === '1';
+const params = {}, sparams = {};
+for (const [k, v] of q) {
+  if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
+  if (k.startsWith('s.')) sparams[k.slice(2)] = Number(v);
+}
+const log = (s) => console.log(s);
+let failed = 0;
+const check = (ok, what) => { if (!ok) failed++; log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); };
+
+try {
+  const glc = new GLContext(document.getElementById('c'));
+  log(`readback ${glc.readback} | ${glc.renderer}`);
+
+  // Test scenes: a box of n cells with walls two cells thick; liquid in units of its interior.
+  // Fill heights are chosen off the cell boundaries of the coarse levels: a coarse cell cut
+  // exactly in half is liquid or air by the last bit of the density.
+  const name = q.get('scene') || 'dam';
+  const n = dim === 2 ? [Number(q.get('nx') || N), N, 1] : [Number(q.get('nx') || N), N, Number(q.get('nz') || N)];
+  const m = 2;
+  const h = 3.2 / n[1];
+  const I = (u) => [m + u[0] * (n[0] - 2 * m), m + u[1] * (n[1] - 2 * m), dim === 2 ? 0.5 : m + u[2] * (n[2] - 2 * m)];
+  const box = (lo, hi, v = [0, 0, 0]) => {
+    const a = I(lo), b = I(hi);
+    return { type: 'box', center: a.map((x, d) => (x + b[d]) / 2), half: a.map((x, d) => (dim === 2 && d === 2 ? 1 : (b[d] - x) / 2)), vel: v.map((x) => x / h) };
+  };
+  const ball = (c, r, v = [0, 0, 0]) => ({ type: 'ball', center: I(c), radius: r * (n[1] - 2 * m), vel: v.map((x) => x / h) });
+  const liquids = {
+    dam: [box([0, 0, 0], [0.37, 0.57, 0.63])],
+    pool: [box([0, 0, 0], [1, 0.37, 1])],
+    splash: [box([0, 0, 0], [1, 0.23, 1]), ball([0.5, 0.65, 0.5], 0.13, [0, -3, 0])],
+    ball: [ball([0.4, 0.6, 0.5], 0.2, [1, 0, 0])],
+  };
+  const liquid = liquids[name];
+  const solids = [{ type: 'box', inverted: true, center: n.map((v, d) => (dim === 2 && d === 2 ? 0.5 : v / 2)), half: n.map((v, d) => (dim === 2 && d === 2 ? 1 : v / 2 - m)) }];
+  const boxCells = n[0] * n[1] * n[2];
+  const denseSim = (extra = {}) => {
+    const s = new FluidSim(glc, { dim, nx: n[0], ny: n[1], nz: n[2], params: { h, ...params, manualFilter: 1, ...extra } });
+    s.reset(solids, liquid);
+    return s;
+  };
+  const head = `${dim}D ${name} ${n.slice(0, dim).join('x')}`;
+
+  // ------------------------------------------------------------------ equivalence
+  if (mode === 'equiv') {
+    const D = denseSim();
+    const dt = D.params.dt;
+    // (the two places where the sparse solver deliberately differs from the dense one are off)
+    const S = new SparseSim(glc, { dim, params: { h, ...params, lifecycle: 0, mgDeep: 0, coarseSolids: 0, ...sparams } });
+    S.ensureBox([0, 0, 0], n);
+    S.reset(solids, liquid, { keep: true });
+    log(`${head}: ${S.bricks} bricks, levels dense ${D.nlev} sparse ${S.nlev}`);
+    check(S.storedCells === boxCells, 'the stored bricks are exactly the dense box');
+    check(D.nlev === S.nlev, 'same number of multigrid levels');
+
+    const cellOf = (g, i) => {
+      const tx = i % g.w, ty = Math.floor(i / g.w);
+      return [tx % g.n[0], ty % g.n[1], Math.floor(tx / g.n[0]) + Math.floor(ty / g.n[1]) * g.tx];
+    };
+    // Cells within k cells of liquid. Velocities further out are extrapolations that the two
+    // solvers continue differently beyond the box (the dense one repeats its outermost cells,
+    // the sparse one has nothing there); the liquid cannot reach them within a step.
+    // (LibreWolf flips the last bits of what is read back: a zero does not arrive as exactly zero)
+    const TINY = 1e-30;
+    let near = null;
+    const findNear = (k = 4) => {
+      const g = D.grid;
+      const rho = glc.read(D.T.rho[0]);
+      let a = new Uint8Array(g.w * g.h);
+      for (let i = 0; i < a.length; i++) a[i] = rho[2 * i] > TINY ? 1 : 0;
+      const idx = (c) => (c[1] + Math.floor(c[2] / g.tx) * g.n[1]) * g.w + c[0] + (c[2] % g.tx) * g.n[0];
+      for (let d = 0; d < dim; d++) {
+        const b = new Uint8Array(a.length);
+        for (let i = 0; i < a.length; i++) {
+          if (!a[i]) continue;
+          const c = cellOf(g, i);
+          const c0 = c[d];
+          for (let v = Math.max(0, c0 - k); v <= Math.min(g.n[d] - 1, c0 + k); v++) { c[d] = v; b[idx(c)] = 1; }
+        }
+        a = b;
+      }
+      near = a;
+    };
+
+    // Largest |dense - sparse| of one field, against t * max(1, largest |value| of the field,
+    // `scale`). Step 1 is held to `tol` (the passes get the same input), later steps to
+    // `tolLate`, because rounding differences grow in a moving liquid.
+    //   ch     channels compared            frame  xyz are positions (see SparseSim.resolve)
+    //   faces  the field lives on the low faces of the cells; those on the low side of the box
+    //          are computed by the dense solver but never read (no cell lies beyond them)
+    //   skip   cells left out               mult   extra factor on the tolerance
+    //   open   only faces that are not closed by a solid (a closed face takes the solid's
+    //          velocity in the projection, whatever the advection left there)
+    const worst = {};
+    let stepNow = 0;
+    function cmp(label, pick, { frame = false, level = 0, ch = 0, skip = null, faces = false, scale = 0, mult = 1, open = false } = {}) {
+      const dTex = pick(D), sTex = pick(S);
+      const g = D.levels[level].grid;
+      const nch = dTex.channels;
+      const a = glc.read(dTex);
+      const b = glc.read(S.resolve(sTex, [0, 0, 0], g.n, { frame, level }));
+      const W = open ? glc.read(D.levels[0].W) : null;
+      let d = 0, big = 0, at = -1;
+      for (let i = 0, cells = g.w * g.h; i < cells; i++) {
+        if (skip && skip(i)) continue;
+        const cell = faces ? cellOf(g, i) : null;
+        for (let c = 0; c < (ch || nch); c++) {
+          if (faces && cell[c] === 0) continue;
+          if (open && !(W[i * 4 + c] > TINY)) continue;
+          const x = a[i * nch + c];
+          const e = Math.abs(x - b[i * 4 + c]);
+          if (Math.abs(x) > big && Math.abs(x) < 1e29) big = Math.abs(x);
+          if (!(e <= d)) { d = e; at = i * 4 + c; }
+        }
+      }
+      const late = stepNow > 1;
+      const key = (late ? 'later   ' : 'step 1  ') + label;
+      const w = worst[key] || (worst[key] = { rel: 0, late });
+      const rel = d / (mult * Math.max(1, big, scale));
+      if (!(rel <= w.rel)) {
+        w.rel = rel;
+        const i = at >> 2;
+        w.where = at < 0 ? '' : `step ${stepNow}, cell ${cellOf(g, i).slice(0, dim)} channel ${at & 3}: dense ${a[i * nch + (at & 3)]} sparse ${b[at]} (field up to ${big.toPrecision(3)})`;
+      }
+      if (verbose) log(`  ${stepNow} ${label}: ${d.toExponential(2)} (field ${big.toExponential(2)})`);
+    }
+    const both = (f) => { f(D); f(S); };
+    const maxOf = (tex, c = 0) => { const a = glc.read(tex); let v = 0; for (let i = c; i < a.length; i += tex.channels) if (Math.abs(a[i]) > v && Math.abs(a[i]) < 1e29) v = Math.abs(a[i]); return v; };
+
+    cmp('reset frac', (s) => s.T.frac);
+    cmp('reset W', (s) => s.levels[0].W, { ch: 3, faces: true });
+    cmp('reset liq', (s) => s.levels[0].liq);
+    cmp('reset rho', (s) => s.T.rho[0]);
+    cmp('reset vel', (s) => s.T.vel[0], { ch: 3 });
+    const far = (i) => !near[i];
+    // the ghost-fluid coefficients divide by the fill of a surface cell (down to thetaMin)
+    const ghost = 10;
+    let solid = null;
+    for (let i = 1; i <= steps; i++) {
+      stepNow = i;
+      findNear();
+      both((s) => s._extrapolate());
+      cmp('extrapolate vel', (s) => s.T.vel[0], { ch: 3, skip: far });
+      both((s) => s._updateSolids());
+      cmp('solid sdf', (s) => s.T.sdf);
+      cmp('solid us', (s) => s.T.us, { ch: 3 });
+      cmp('solid frac', (s) => s.T.frac);
+      cmp('solid W', (s) => s.levels[0].W, { ch: 3, faces: true });
+      // fully solid cells request nothing and hand nothing on: their characteristics are not used
+      { const f = glc.read(D.T.frac); solid = (c) => f[c * 4 + 3] <= TINY || !near[c]; }
+      both((s) => s._advectDensity(dt));
+      cmp('advect trace', (s) => s.T.trace, { frame: true, skip: solid });
+      cmp('advect beta', (s) => s.T.beta);
+      cmp('advect rho', (s) => s.T.rho[0]);
+      both((s) => s._sharpen(dt));
+      cmp('sharpen rho', (s) => s.T.rho[0]);
+      cmp('sharpen liq', (s) => s.levels[0].liq);
+      findNear();
+      both((s) => s._advectVelocity(dt));
+      cmp('velAdvect vel', (s) => s.T.vel[0], { ch: 3, skip: far, open: true });
+      both((s) => s._project(dt));
+      const pMax = maxOf(D.levels[0].p[0]);
+      for (let l = 0; l < D.nlev; l++) {
+        const lv = (f) => (s) => f(s.levels[l]);
+        if (l > 0) {
+          cmp(`project L${l} liq`, lv((L) => L.liq), { level: l });
+          cmp(`project L${l} W`, lv((L) => L.W), { level: l, ch: 3, faces: true });
+        }
+        cmp(`project L${l} cA`, lv((L) => L.cA), { level: l, mult: ghost });
+        cmp(`project L${l} cB`, lv((L) => L.cB), { level: l, mult: ghost });
+        // the coarse right-hand sides are residuals: differences of terms of size diagonal * p
+        cmp(`project L${l} rhs`, lv((L) => L.rhs), { level: l, ch: 1, scale: l ? pMax * maxOf(D.levels[l - 1].cA, 3) : 0, mult: l ? 1 : ghost });
+      }
+      cmp('project p', (s) => s.levels[0].p[0], { mult: ghost });
+      cmp('project vel', (s) => s.T.vel[0], { ch: 3, skip: far, scale: pMax, mult: ghost });
+      both((s) => { s.time += dt; s.frame++; });
+      if (i === 1 || i === steps) {
+        const a = D.measureSync(), b = S.measureSync();
+        log(`step ${i}: mass dense ${a.mass.toFixed(6)} sparse ${b.mass.toFixed(6)} | residual ${a.residual.toExponential(3)} / ${b.residual.toExponential(3)} | max speed ${a.maxSpeed.toFixed(4)} / ${b.maxSpeed.toFixed(4)}`);
+        check(Math.abs(a.mass - b.mass) <= tol * a.mass, `step ${i}: same mass`);
+        // (a pool that has come to rest has a right-hand side of rounding size)
+        check(Math.abs(a.residual - b.residual) <= (i === 1 ? 0.02 : 0.25) * a.residual + 1e-7, `step ${i}: same residual after the V-cycles`);
+      }
+    }
+    const entries = Object.entries(worst);
+    for (const [label, w] of entries) {
+      const ok = w.rel <= (w.late ? tolLate : tol);
+      if (!ok || verbose) log(`${ok ? 'ok  ' : 'DIFF'}  ${label}: ${w.rel.toExponential(2)} | ${w.where}`);
+    }
+    const first = entries.filter(([, w]) => !w.late).map(([, w]) => w.rel);
+    const later = entries.filter(([, w]) => w.late).map(([, w]) => w.rel);
+    check(Math.max(...first) <= tol, `step 1: ${first.length} fields agree (largest relative difference ${Math.max(...first).toExponential(2)}, allowed ${tol})`);
+    if (steps > 1) check(Math.max(...later) <= tolLate, `steps 2-${steps}: ${later.length} fields agree (largest relative difference ${Math.max(...later).toExponential(2)}, allowed ${tolLate})`);
+  }
+
+  // ------------------------------------------------------------------ bricks around the liquid only
+  if (mode === 'run') {
+    const D = denseSim();
+    // &initial= bricks the pool starts with (it grows), &max= bricks it may hold (then it refuses)
+    const pool = {};
+    if (q.get('initial')) pool.initial = Number(q.get('initial'));
+    if (q.get('max')) pool.max = Number(q.get('max'));
+    const S = new SparseSim(glc, { dim, params: { h, ...params, ...sparams }, bricks: pool });
+    // bricks that lie in the wall throughout are not stored (&veto=0: they are)
+    if (q.get('veto') !== '0') S.solidBrick = staticSolidTest(dim, null, solids);
+    S.reset(solids, liquid);
+    const m0 = S.measureSync().mass;
+    log(`${head}: starts with ${S.bricks} bricks (${S.storedCells} cells of ${boxCells} in the box), mass ${m0.toFixed(4)} (dense ${D.measureSync().mass.toFixed(4)})`);
+    let edge = 0, minB = S.bricks, maxB = S.bricks, worstMass = 0, changes = 0, last = S.levels[0].set.version;
+    const every = Number(q.get('every') || Math.max(1, Math.floor(steps / 6)));
+    // how far the density is from the dense run, over the dense box
+    const distance = () => {
+      const a = glc.read(D.T.rho[0]);
+      const b = glc.read(S.resolve(S.T.rho[0], [0, 0, 0], n));
+      let l1 = 0, sum = 0, linf = 0;
+      for (let i = 0, c = a.length / 2; i < c; i++) {
+        const e = Math.abs(a[2 * i] - b[4 * i]);
+        l1 += e; sum += Math.abs(a[2 * i]);
+        if (e > linf) linf = e;
+      }
+      return { l1: l1 / sum, linf };
+    };
+    // The two runs are compared early: the scenes splash, and any difference (here: where the
+    // air ends, and the multigrid hierarchy) grows with time whatever its size.
+    const cmpAt = Math.min(steps, Number(q.get('cmpAt') || 20));
+    let early = null;
+    for (let i = 1; i <= steps; i++) {
+      D.step();
+      S.step();
+      // (reports that are read back without blocking arrive between frames)
+      if (S.params.reportAsync) await new Promise((r) => requestAnimationFrame(r));
+      if (i === cmpAt) early = distance();
+      if (S.report) edge += S.report.edge;
+      minB = Math.min(minB, S.bricks); maxB = Math.max(maxB, S.bricks);
+      if (S.levels[0].set.version !== last) { changes++; last = S.levels[0].set.version; }
+      if (i % every === 0 || i === steps) {
+        const a = D.measureSync(), b = S.measureSync();
+        const dm = Math.abs(b.mass + S.freedMass - m0) / m0;
+        worstMass = Math.max(worstMass, dm);
+        log(`step ${i}: ${S.bricks} bricks, ${S.nlev} levels | mass error ${dm.toExponential(2)} (dense ${(Math.abs(a.mass - m0) / m0).toExponential(2)}) | max speed ${b.maxSpeed.toFixed(3)} (dense ${a.maxSpeed.toFixed(3)}) | wet/dry ${S.report.wet}/${S.report.dry} | edge cells ${S.report.edge}`);
+        if (!Number.isFinite(b.mass) || !Number.isFinite(b.maxSpeed)) { worstMass = Infinity; break; }
+      }
+    }
+    const end = distance();
+    log(`bricks ${minB}..${maxB} of ${Math.ceil(boxCells / S.CB)} in the box (${S.levels[0].set.marks.size} more lie in the wall and are not stored); the set changed in ${changes} of ${steps} steps`);
+    log(`density against the dense run (L1, share of the mass): ${early.l1.toExponential(2)} after ${cmpAt} steps, ${end.l1.toExponential(2)} after ${steps}`);
+    const strict = !(sparams.margin < 3) && !pool.max;
+    if (pool.initial || pool.max) log(`pool: ${S.levels[0].set.capacity} slots at the end, ${S.refused} bricks refused`);
+    check(worstMass <= 1e-5, `mass conserved (largest error ${worstMass.toExponential(2)})`);
+    // (bricks are dropped with traces of density below wetMin in them; that mass is counted)
+    check(S.freedMass <= 1e-7 * m0, `next to no density in the bricks that were dropped (${S.freedMass.toExponential(2)} of ${m0.toFixed(0)})`);
+    if (strict) {
+      check(edge === 0, `the liquid never touched the edge of the stored bricks (${edge} cell reports)`);
+      check(S.refused === 0, `no brick was refused (${S.refused})`);
+      const lim = Number(q.get('l1') || 0.02);
+      check(early.l1 <= lim, `density within ${lim} (L1) of the dense run after ${cmpAt} steps`);
+    } else {
+      log(`(${pool.max ? 'pool of ' + pool.max + ' bricks' : 'margin ' + sparams.margin}: ${edge} reports of liquid at the edge of the stored bricks; conservation is what is checked)`);
+    }
+  }
+
+  // ------------------------------------------------------------------ timing
+  if (mode === 'perf') {
+    // The three solvers take turns running `steps` steps, each followed by a one-texel read-back
+    // that waits for the GPU (as a frame of the app does: steps that are queued up run slower).
+    // The fastest of `reps` turns counts, which leaves out what else the machine was doing.
+    const reps = Number(q.get('reps') || 5);
+    const hw = new FluidSim(glc, { dim, nx: n[0], ny: n[1], nz: n[2], params: { h, ...params } });
+    hw.reset(solids, liquid);
+    const D = denseSim();
+    const S = new SparseSim(glc, { dim, params: { h, ...params, lifecycle: 0, mgDeep: 0, ...sparams }, bricks: { max: 1 << 20 } });
+    S.ensureBox([0, 0, 0], n);
+    S.reset(solids, liquid, { keep: true });
+    const sims = [hw, D, S];
+    const best = [Infinity, Infinity, Infinity];
+    const run = (sim, k) => { const t0 = performance.now(); for (let i = 0; i < k; i++) { sim.step(); glc.read(sim.rho, 0, 0, 1, 1); } return performance.now() - t0; };
+    for (const sim of sims) run(sim, 5);
+    for (let r = 0; r < reps; r++) sims.forEach((sim, i) => { best[i] = Math.min(best[i], run(sim, steps) / steps); });
+    const [tHw, tD, tS] = best;
+    const Mc = boxCells / 1e6;
+    log(`${head} (${boxCells} cells, ${S.bricks} bricks), ms per step: dense ${tHw.toFixed(2)} | dense, manual interpolation ${tD.toFixed(2)} | sparse ${tS.toFixed(2)}`);
+    log(`ms per step per million cells: dense ${(tHw / Mc).toFixed(1)} | dense manual ${(tD / Mc).toFixed(1)} | sparse ${(tS / Mc).toFixed(1)} | sparse / dense ${(tS / tHw).toFixed(2)}, sparse / dense manual ${(tS / tD).toFixed(2)}`);
+    if (sparams.lifecycle !== 0) {
+      // the same with the per-brick reports made and acted on every step
+      S.params.lifecycle = 1;
+      S.params.freeAfter = 1e9;
+      let tL = Infinity;
+      for (let r = 0; r < reps; r++) tL = Math.min(tL, run(S, steps) / steps);
+      log(`sparse with the brick reports (read back every step): ${tL.toFixed(2)} ms per step`);
+    }
+  }
+
+  // ------------------------------------------------------------------ a fixed set of bricks
+  // ?mode=fixed&lo=x,y,z&hi=x,y,z : the sparse solver on the bricks covering cells [lo, hi), no lifecycle
+  if (mode === 'fixed') {
+    const lo = (q.get('lo') || '0,0,0').split(',').map(Number), hi = (q.get('hi') || n.join(',')).split(',').map(Number);
+    const D = denseSim();
+    const S = new SparseSim(glc, { dim, params: { h, ...params, lifecycle: 0, ...sparams } });
+    S.ensureBox(lo, hi);
+    S.reset(solids, liquid, { keep: true });
+    log(`${head}: bricks over cells ${lo.slice(0, dim)} .. ${hi.slice(0, dim)}: ${S.bricks}, levels ${S.nlev} (dense ${D.nlev})`);
+    const every = Number(q.get('every') || Math.max(1, Math.floor(steps / 4)));
+    for (let i = 1; i <= steps; i++) {
+      D.step(); S.step();
+      if (i % every === 0) {
+        const a = D.measureSync(), b = S.measureSync();
+        if (q.get('where')) {
+          // where the sparse liquid moves fastest
+          const lo2 = [lo[0], lo[1], dim === 2 ? 0 : lo[2]], n2 = hi.map((v, d) => v - lo[d]);
+          const g = { w: n2[0], n: n2 };
+          const vel = glc.read(S.resolve(S.T.vel[0], lo2, n2)).slice();
+          const liq = glc.read(S.resolve(S.levels[0].liq, lo2, n2)).slice();
+          const pp = glc.read(S.resolve(S.levels[0].p[0], lo2, n2)).slice();
+          let best = 0, at = 0;
+          for (let c = 0; c < n2[0] * n2[1]; c++) {
+            if (!(liq[4 * c] < 0 && liq[4 * c + 1] > 0)) continue;
+            const v = Math.hypot(vel[4 * c], vel[4 * c + 1]);
+            if (v > best) { best = v; at = c; }
+          }
+          const rho = glc.read(S.resolve(S.T.rho[0], lo2, n2)).slice();
+          const frac = glc.read(S.resolve(S.T.frac, lo2, n2)).slice();
+          let cols = '  density per column from x = ' + lo[0] + ':';
+          for (let x = 0; x < 24; x++) { let t = 0; for (let y = 0; y < n2[1]; y++) t += rho[4 * (y * g.w + x)]; cols += ' ' + t.toFixed(3); }
+          log(cols);
+          const col = (x, f, k) => { let r = ''; for (let y = 0; y < 8; y++) r += ' ' + f[4 * (y * g.w + x - lo[0]) + k].toFixed(3); return r; };
+          for (let x = -3; x <= 3; x++) log(`  x=${x}: rho y=0..7${col(x, rho, 0)} | V${col(x, frac, 3)} | phi${col(x, liq, 0)} | p${col(x, pp, 0)} | u${col(x, vel, 0)}`);
+          const cx = at % g.w, cy = Math.floor(at / g.w);
+          log(`  fastest liquid cell ${cx + lo[0]},${cy + lo[1]}: vel ${vel[4 * at].toFixed(4)}, ${vel[4 * at + 1].toFixed(4)}`);
+          for (let y = cy + 2; y >= cy - 2; y--) {
+            let row = `  y=${String(y + lo[1]).padStart(4)}:`;
+            for (let x = cx - 3; x <= cx + 3; x++) {
+              const c = y * g.w + x;
+              row += ` [phi ${liq[4 * c].toFixed(2)} V ${liq[4 * c + 1].toFixed(2)} u ${vel[4 * c].toFixed(3)} v ${vel[4 * c + 1].toFixed(3)} p ${pp[4 * c].toFixed(2)}]`;
+            }
+            log(row);
+          }
+        }
+        log(`step ${i}: max speed ${b.maxSpeed.toFixed(4)} (dense ${a.maxSpeed.toFixed(4)}) | residual ${b.residual.toExponential(2)} (dense ${a.residual.toExponential(2)}) | mass ${b.mass.toFixed(4)} (dense ${a.mass.toFixed(4)})`);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ cost of the brick reports
+  if (mode === 'reports') {
+    const S = new SparseSim(glc, { dim, params: { h, ...params, lifecycle: 0, mgDeep: 0, ...sparams }, bricks: { max: 1 << 20 } });
+    S.ensureBox([0, 0, 0], n);
+    S.reset(solids, liquid, { keep: true });
+    for (let i = 0; i < 5; i++) S.step();
+    const L0 = S.levels[0], U = S._U(L0), P = S.prog, T = S.T;
+    const wait = () => glc.read(S.rho, 0, 0, 1, 1);
+    const time = (f, k = 20) => { wait(); let best = Infinity; for (let r = 0; r < 5; r++) { const t0 = performance.now(); for (let i = 0; i < k; i++) f(); wait(); best = Math.min(best, (performance.now() - t0) / k); } return best; };
+    S.frame++;
+    const tReport = time(() => S.makeReport());
+    S.params.freeAfter = 1e9;
+    const tLife = time(() => { S.reports[S.reports.length - 1].applied = false; S._lifecycle(); });
+    log(`${head}, ${S.bricks} bricks, ms: report (2 passes, 2 read-backs) ${tReport.toFixed(3)} | lifecycle on the CPU ${tLife.toFixed(3)}`);
+    // what a step costs when something else happens in between
+    {
+      const run = (extra) => { wait(); const t0 = performance.now(); for (let i = 0; i < steps; i++) { S.step(); extra(); } wait(); return ((performance.now() - t0) / steps).toFixed(2); };
+      const set = L0.set;
+      log(`ms per step: plain ${run(() => {})} | with a 1-texel read-back per step ${run(wait)} | with the tile list re-uploaded per step ${run(() => { set.dirty = true; set.sync(); })}` +
+        ` | with the neighbour table rebuilt per step ${run(() => S._buildNb(L0))} | plain ${run(() => {})}`);
+    }
+    // a run with the lifecycle on: where the CPU time of a step goes
+    S.params.lifecycle = 1;
+    const acc = {};
+    for (const name of ['_lifecycle', '_syncBricks', 'makeReport', '_grow0', '_buildNb']) {
+      const f = S[name].bind(S);
+      S[name] = (...a) => { const t0 = performance.now(); const r = f(...a); acc[name] = (acc[name] || 0) + performance.now() - t0; return r; };
+    }
+    const wrap = (obj, name, label = name) => {
+      const f = obj[name].bind(obj);
+      obj[name] = (...a) => { const t0 = performance.now(); const r = f(...a); acc[label] = (acc[label] || 0) + performance.now() - t0; return r; };
+    };
+    wrap(glc, 'upload'); wrap(glc, 'drawTiles'); wrap(glc, 'draw'); wrap(glc, 'scatter'); wrap(glc, 'read'); wrap(glc, 'texture'); wrap(glc, 'deleteTexture');
+    for (const L of S.levels) { wrap(L.set, 'sync', 'set.sync'); wrap(L.set, 'bounds', 'set.bounds'); wrap(L.set.list, 'set', 'list.set'); }
+    wrap(S, '_updateSolids'); wrap(S, '_computeLiq'); wrap(S, 'addBrick'); wrap(S, '_growLevel');
+    const b0 = S.bricks;
+    const t0 = performance.now();
+    for (let i = 0; i < steps; i++) S.step();
+    wait();
+    log(`${steps} steps with the lifecycle: ${((performance.now() - t0) / steps).toFixed(2)} ms per step, bricks ${b0} -> ${S.bricks} | ms per step in ` +
+      Object.entries(acc).map(([k, v]) => `${k} ${(v / steps).toFixed(2)}`).join(', '));
+  }
+
+  // ------------------------------------------------------------------ where the time goes
+  if (mode === 'profile') {
+    // each stage of the step followed by a one-texel read-back, which waits for the GPU
+    const stages = {
+      extrapolate: (s) => s._extrapolate(),
+      solids: (s) => s._updateSolids(),
+      'advect density': (s) => s._advectDensity(s.params.dt),
+      sharpen: (s) => s._sharpen(s.params.dt),
+      'advect velocity': (s) => s._advectVelocity(s.params.dt),
+      project: (s) => s._project(s.params.dt),
+    };
+    const profile = (sim) => {
+      const t = {};
+      for (let i = 0; i < steps + 5; i++) {
+        for (const [k, f] of Object.entries(stages)) {
+          const t0 = performance.now();
+          f(sim);
+          glc.read(sim.rho, 0, 0, 1, 1);
+          if (i >= 5) t[k] = (t[k] || 0) + (performance.now() - t0) / steps;
+        }
+        sim.time += sim.params.dt; sim.frame++;
+      }
+      return t;
+    };
+    const D = denseSim();
+    const tD = profile(D);
+    D.dispose();
+    const S = new SparseSim(glc, { dim, params: { h, ...params, lifecycle: 0, mgDeep: 0, ...sparams }, bricks: { max: 1 << 20 } });
+    S.ensureBox([0, 0, 0], n);
+    S.reset(solids, liquid, { keep: true });
+    const tS = profile(S);
+    log(`${head} (${boxCells} cells), ms per step by stage: dense (manual interpolation) | sparse | ratio`);
+    let a = 0, b = 0;
+    for (const k of Object.keys(stages)) {
+      a += tD[k]; b += tS[k];
+      log(`  ${k.padEnd(16)} ${tD[k].toFixed(2).padStart(7)} ${tS[k].toFixed(2).padStart(7)}  ${(tS[k] / tD[k]).toFixed(2)}`);
+    }
+    log(`  ${'total'.padEnd(16)} ${a.toFixed(2).padStart(7)} ${b.toFixed(2).padStart(7)}  ${(b / a).toFixed(2)}`);
+  }
+
+  log(failed ? `${failed} check(s) failed` : 'all checks passed');
+  if (failed) window.__error = `${failed} check(s) failed`;
+  window.__done = true;
+} catch (e) {
+  console.log(String(e.stack || e));
+  window.__error = String(e.message || e);
+}
+</script>

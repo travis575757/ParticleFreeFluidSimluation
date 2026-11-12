@@ -38,6 +38,7 @@
   <div class="cards">
     <a class="card" href="2d.html"><strong>2D simulator</strong><span>13 scenes, mouse push / pour / drain, moving obstacles, floating rigid bodies, field views.</span></a>
     <a class="card" href="3d.html"><strong>3D simulator</strong><span>9 scenes, ray-marched liquid surface and density volume, orbit camera, the same interactions in 3D.</span></a>
+    <a class="card" href="world3d.html"><strong>World</strong><span>The same solver without the box: only the 8×8×8 bricks around the water are stored. A 16 m waterfall and a terraced cascade over a height-map terrain.</span></a>
   </div>
 
   <h2>What you are looking at</h2>
@@ -70,6 +71,7 @@
   <ul>
     <li>Serve this folder over HTTP (ES modules do not load from <code>file://</code>): <code>node tools/serve.mjs</code> or <code>python3 -m http.server 8080</code>, then open <code>http://localhost:8080/</code>.</li>
     <li>Needs WebGL2 with <code>EXT_color_buffer_float</code>, <code>EXT_float_blend</code> and <code>OES_texture_float_linear</code> (any recent desktop browser on a discrete or integrated GPU).</li>
+    <li>World mode decides which bricks to store from numbers it reads back from the GPU, so it does not start with <code>privacy.resistFingerprinting</code> on.</li>
     <li><code>README.md</code> lists every place where the paper leaves a choice open and what was chosen, and the one extension that is on by default.</li>
   </ul>
 

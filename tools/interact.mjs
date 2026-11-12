@@ -1,10 +1,11 @@
 // Drives the real apps with synthetic mouse input and checks that every interaction does what
 // it says: push, pour, drain, spawn + drag bodies, orbit/zoom (3D), scene switching.
-//   node tools/interact.mjs [2d|3d] [--shots dir] [--browser chrome|firefox|librewolf] [--pref name=value ...]
+//   node tools/interact.mjs [2d|3d|world] [--shots dir] [--browser chrome|firefox|librewolf] [--pref name=value ...]
 import { startServer } from './serve.mjs';
 import { launch, browserArgs } from './browser.mjs';
 
 const which = process.argv[2] || '2d';
+if (which === 'world') await import('./interact-world.mjs');   // (ends the process itself)
 const shotsIdx = process.argv.indexOf('--shots');
 const shots = shotsIdx > 0 ? process.argv[shotsIdx + 1] : null;
 const server = await startServer(0);

@@ -24,6 +24,12 @@ const SHOTS = [
   { name: '2d-mixer', page: '2d.html?scene=mixer&n=256', steps: 45 },
   { name: '2d-splash', page: '2d.html?scene=splash&n=256', steps: 45 },
   { name: '2d-speed', page: '2d.html?scene=damBreak&n=256&view=speed', steps: 80 },
+  // world mode
+  { name: 'app-world', page: 'world3d.html?scene=cascade&bricks', steps: 360, ui: true },
+  { name: 'world-waterfall', page: 'world3d.html?scene=waterfall', steps: 420 },
+  { name: 'world-waterfall-bricks', page: 'world3d.html?scene=waterfall&bricks', steps: 420 },
+  { name: 'world-cascade', page: 'world3d.html?scene=cascade', steps: 900 },
+  { name: 'world-cascade-bricks', page: 'world3d.html?scene=cascade&bricks', steps: 900 },
 ];
 
 const argv = process.argv.slice(2);
@@ -45,10 +51,10 @@ try {
       // the whole page, running: captured on the first frame at or after the given step
       await page.setViewport({ width: 1280, height: 900 });
       await page.goto(`http://localhost:${port}/${shot.page}&capture`, { waitUntil: 'load' });
-      await page.waitForFunction((n) => window.runner?.sim.frame >= n || window.__error, { timeout: 120000 }, shot.steps);
+      await page.waitForFunction((n) => (window.runner || window.world)?.sim.frame >= n || window.__error, { timeout: 300000 }, shot.steps);
       const file = path.join(out, `${shot.name}.png`);
       await page.screenshot({ path: file });
-      console.log(`${path.relative(process.cwd(), file)}  step ${await page.evaluate(() => window.runner.sim.frame)}  ${(fs.statSync(file).size / 1024).toFixed(0)} kB`);
+      console.log(`${path.relative(process.cwd(), file)}  step ${await page.evaluate(() => (window.runner || window.world).sim.frame)}  ${(fs.statSync(file).size / 1024).toFixed(0)} kB`);
       await page.close();
       continue;
     }
@@ -62,12 +68,15 @@ try {
       const info = await page.evaluate(async (k) => {
         for (let i = 0; i < k; i++) {
           window.app.stepOnce();
-          if (window.runner.bodies.length) await window.runner.forcesReady;   // as in a real-time run
+          if (window.runner?.bodies.length) await window.runner.forcesReady;   // as in a real-time run
+          if (window.world && i % 50 === 49) await new Promise((r) => setTimeout(r));   // (a long run: let the page breathe)
         }
-        const s = await window.runner.sim.measure();
+        const R = window.runner || window.world;
+        const s = await R.sim.measure();
         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-        return `t ${window.runner.time.toFixed(2)} s  mass ${(s.massRatio * 100).toFixed(4)} %  CFL ${s.cfl.toFixed(1)}`;
-      }, n - done);
+        if (window.world) return `t ${R.time.toFixed(2)} s  ${R.sim.bricks} bricks, ${(R.sim.storedCells / 1e6).toFixed(2)} M cells stored of ${(R.boundsCells() / 1e6).toFixed(1)} M in the box around them`;
+        return `t ${R.time.toFixed(2)} s  mass ${(s.massRatio * 100).toFixed(4)} %  CFL ${s.cfl.toFixed(1)}`;
+      }, n - done).catch((e) => { failed = true; return 'FAILED: ' + e.message; });
       done = n;
       const file = path.join(out, at ? `${shot.name}-${String(n).padStart(4, '0')}.png` : `${shot.name}.png`);
       await (await page.$('#view')).screenshot({ path: file });

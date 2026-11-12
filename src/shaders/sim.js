@@ -1,12 +1,12 @@
 // Simulation passes for "Mass-Conserving Eulerian Liquid Simulation" (Chentanez & Mueller, SCA 2012).
 // Section/equation numbers in comments refer to that paper unless another reference is named.
-import { header, TRACE, prims } from './common.js';
+import { header, TRACE, prims, EPSV, TERRAIN } from './common.js';
 
-const EPSV = '1.0e-3'; // floor on the capacity weight so scatter weights can always be normalised
 const VMIN = '0.05';   // floor on V when normalising row sums of nearly solid cells
 
-export function simShaders(dim, floatLinear) {
-  const H = header(dim, floatLinear);
+/** Pass sources for the `dense` or `sparse` grid backend (see header() in common.js). */
+export function simShaders(dim, floatLinear, backend = 'dense') {
+  const H = header(dim, floatLinear, backend);
   const S = {};
 
   // ---------------------------------------------------------------- solids
@@ -20,16 +20,26 @@ export function simShaders(dim, floatLinear) {
   // Volume fractions use clamp(0.5 + d): exact for axis-aligned walls and never positive for an
   // element lying half a cell or more inside the solid (a wider ramp leaks through wall corners).
   // Area fractions use the planar-cut estimate clamp(0.5 + d / |tangential variation of d|).
+  // The sparse backend adds a terrain to the primitives (index -1: it does not move).
+  const terrain = backend !== 'sparse' ? '' : `${TERRAIN}
+vec2 sdSolids(vec3 x) {
+  vec2 s = sdS(x);
+  float t = sdTerrain(x);
+  return t < s.x ? vec2(t, -1.0) : s;
+}
+#define sdS sdSolids
+`;
   S.solid = `${H}
 uniform Grid G;
-${prims('S')}
+${prims('S')}${terrain}
 layout(location = 0) out vec4 oSdf;
 layout(location = 1) out vec4 oUs;
 layout(location = 2) out vec4 oFrac;
 layout(location = 3) out vec4 oW;
 uniform float uVthr;
 ivec3 gc;
-float D(float x, float y, float z) { return sdS(cellPos(gc, vec3(x, y, z))).x; }
+vec3 X(float x, float y, float z) { return shapePos(cellPos(gc, vec3(x, y, z))); }
+float D(float x, float y, float z) { return sdS(X(x, y, z)).x; }
 float ramp(float d, float l1) { return clamp(0.5 + d / max(l1, 1.0e-6), 0.0, 1.0); }
 float vol(float d) { float w = clamp(0.5 + d, 0.0, 1.0); return w < 0.01 ? 0.0 : w; }
 // A cell with V < uVthr has no density of its own to speak of: it is liquid or air according to
@@ -45,8 +55,8 @@ void main() {
   float dc = D(0.5, 0.5, 0.5);
   vec3 xf;
   vec3 us = vec3(0.0);
-  xf = cellPos(gc, vec3(0.0, 0.5, 0.5)); vec2 sx = sdS(xf); if (sx.y >= 0.0) us.x = velS(int(sx.y), xf).x;
-  xf = cellPos(gc, vec3(0.5, 0.0, 0.5)); vec2 sy = sdS(xf); if (sy.y >= 0.0) us.y = velS(int(sy.y), xf).y;
+  xf = X(0.0, 0.5, 0.5); vec2 sx = sdS(xf); if (sx.y >= 0.0) us.x = velS(int(sx.y), xf).x;
+  xf = X(0.5, 0.0, 0.5); vec2 sy = sdS(xf); if (sy.y >= 0.0) us.y = velS(int(sy.y), xf).y;
   vec3 g = vec3(D(1.0, 0.5, 0.5) - sx.x, D(0.5, 1.0, 0.5) - sy.x, 0.0);
   vec3 A = vec3(0.0);
   vec3 W = vec3(vol(sx.x), vol(sy.x), 0.0);
@@ -55,7 +65,7 @@ void main() {
   A.x = ramp(sx.x - bias, abs(n01 - n00));
   A.y = ramp(sy.x - bias, abs(n10 - n00));
 #else
-  xf = cellPos(gc, vec3(0.5, 0.5, 0.0)); vec2 sz = sdS(xf); if (sz.y >= 0.0) us.z = velS(int(sz.y), xf).z;
+  xf = X(0.5, 0.5, 0.0); vec2 sz = sdS(xf); if (sz.y >= 0.0) us.z = velS(int(sz.y), xf).z;
   g.z = D(0.5, 0.5, 1.0) - sz.x;
   W.z = vol(sz.x);
   // edge mid-points: e_ab = edge through corner (a, b) of the two named axes
@@ -73,6 +83,11 @@ void main() {
     if (sliver(0.5, 0.5, -0.5)) W.z = 0.0;
 #endif
   }
+#ifdef SPARSE
+  // a face towards a cell that is not stored is closed (the far side of the cell would hold its
+  // other half): liquid cannot leave the stored set, and the pressure solve knows it
+  for (int d = 0; d < DIM; d++) if (!hasCell(G, gc - AX[d])) { W[d] = 0.0; A[d] = 0.0; }
+#endif
   oSdf = vec4(g, dc);
   oUs = vec4(us, 0.0);
   oFrac = vec4(A, clamp(0.5 + dc, 0.0, 1.0));
@@ -100,7 +115,7 @@ void main() {
     for (int d = 0; d < DIM; d++) {
       for (int s = -1; s <= 1; s += 2) {
         ivec3 nb = c + s * AX[d];
-        if (!inGrid(G, nb)) continue;
+        if (!hasCell(G, nb)) continue;
         ivec2 tn = texelOf(G, nb);
         float Vn = texelFetch(uFrac, tn, 0).a;
         if (Vn >= uVthr) rp = max(rp, texelFetch(uRho, tn, 0).r / Vn);
@@ -129,16 +144,16 @@ void main() {
   vec3 known = vec3(0.0);
   for (int d = 0; d < DIM; d++) {
     ivec3 a = c - AX[d];
-    if (a[d] < 0 || W[d] <= 0.0) continue;
+    if (!hasCell(G, a) || W[d] <= 0.0) continue;
     if (pc < 0.0 || fetchC(uLiq, G, a).r < 0.0) known[d] = 1.0;
   }
   oA = vec4(v.xyz * known, 0.0);
-  oB = vec4(known, 0.0);
+  oB = vec4(known, 1.0);       // w: the cell stands for real cells (averaged down by the pull)
 }`;
 
   S.extrapPull = `${H}
 uniform Grid G;    // coarse (target)
-uniform Grid GF;   // fine (source)
+uniform GridX GF;   // fine (source)
 uniform sampler2D uA;
 uniform sampler2D uB;
 layout(location = 0) out vec4 oA;
@@ -162,7 +177,7 @@ void main() {
 
   S.extrapPush = `${H}
 uniform Grid G;    // this level
-uniform Grid GC;   // coarser level
+uniform GridX GC;   // coarser level
 uniform sampler2D uA;
 uniform sampler2D uB;
 uniform sampler2D uFc;   // filled velocities of the coarser level
@@ -174,16 +189,10 @@ void main() {
   vec4 a = texelFetch(uA, t, 0);
   vec4 b = texelFetch(uB, t, 0);
   vec3 coarse = vec3(0.0);
-  if (uTop == 0) {
-    vec3 x = (vec3(c) + 0.5) * 0.5;
-#if DIM == 2
-    x.z = 0.5;
-#endif
-    coarse = sampleLin(uFc, GC, x).xyz;
-  }
+  if (uTop == 0) coarse = sampleCoarseKnown(uFc, GC, c).xyz;
   vec3 r;
   for (int d = 0; d < 3; d++) r[d] = b[d] > 0.0 ? a[d] / b[d] : coarse[d];
-  o = vec4(r, 0.0);
+  o = vec4(r, b.w > 0.0 ? 1.0 : 0.0);
 }`;
 
   // ---------------------------------------------------------------- density advection (Sec. 3.4)
@@ -224,7 +233,7 @@ void main() {
     float gt = 0.0;
     float Vsrc = 0.0;
     for (int k = 0; k < NC; k++) {
-      ivec2 ts = texelOf(G, clampCell(G, ivec3(f) + cornerOffset(k)));
+      ivec2 ts = texelOf(G, clampCell(G, cellAt(f) + cornerOffset(k)));
       float w = cornerWeight(k, a);
       gt += w * texelFetch(uRho, ts, 0).g;
       Vsrc += w * texelFetch(uFrac, ts, 0).a;
@@ -247,21 +256,23 @@ out vec4 vVal;
 void main() {
   int id = gl_VertexID + uBase;
   int corner = id % NC;
-  int ci = id / NC;
-  int aw = G.n.x * G.tx;
-  ivec2 st = ivec2(ci % aw, ci / aw);
+  ivec2 st = pointTexel(G, id / NC);
   vec4 src = texelFetch(uSrc, st, 0);
   vec3 q = src.xyz - 0.5;
   vec3 f = floor(q);
   float w = cornerWeight(corner, q - f);
-  ivec2 tt = texelOf(G, clampCell(G, ivec3(f) + cornerOffset(corner)));
+  ivec3 tc = cellAt(f) + cornerOffset(corner);
+  ivec2 tt = texelOf(G, clampCell(G, tc));
   vec4 val = vec4(0.0);
   ${body}
+#ifdef SPARSE
+  // nothing is deposited into a cell that is not stored; the passes that compute the amounts
+  // leave such corners out of their normalisation, so no mass is lost here
+  if (!g_live || !hasCell(G, tc)) val = vec4(0.0);
+#endif
   vVal = val * w;
   gl_PointSize = 1.0;
-  gl_Position = (w > 0.0 && val != vec4(0.0))
-    ? vec4((vec2(tt) + 0.5) * G.inv * 2.0 - 1.0, 0.0, 1.0)
-    : vec4(2.0, 2.0, 2.0, 1.0);
+  gl_Position = (w > 0.0 && val != vec4(0.0)) ? texelClip(G, tt) : vec4(2.0, 2.0, 2.0, 1.0);
 }`;
 
   S.scatterFS = `${H}
@@ -294,7 +305,7 @@ void main() {
     vec3 f = floor(q);
     vec3 a = q - f;
     for (int k = 0; k < NC; k++) {
-      ivec2 ts = texelOf(G, clampCell(G, ivec3(f) + cornerOffset(k)));
+      ivec2 ts = texelOf(G, clampCell(G, cellAt(f) + cornerOffset(k)));
       acc += cornerWeight(k, a) * vec2(texelFetch(uRho, ts, 0).r, texelFetch(uFrac, ts, 0).a) / max(1.0, texelFetch(uBeta, ts, 0).r);
     }
     acc *= tr.w;
@@ -313,7 +324,10 @@ void main() {
     vec3 f = floor(q);
     vec3 a = q - f;
     float norm = 0.0;
-    for (int k = 0; k < NC; k++) norm += cornerWeight(k, a) * (fetchC(uFrac, G, ivec3(f) + cornerOffset(k)).a + ${EPSV});
+    for (int k = 0; k < NC; k++) norm += cornerWeight(k, a) * capW(uFrac, G, cellAt(f) + cornerOffset(k));
+#ifdef SPARSE
+    if (norm <= 0.0) { xf = x; norm = capW(uFrac, G, c); }   // nowhere to go: it stays in its cell
+#endif
     amt = rem / norm;
   }
   oFwd = vec4(xf, amt);
@@ -390,13 +404,13 @@ void main() {
     if (uPair >= 0) { useHi = ((c[uAxis] + uPair) & 1) == 0; useLo = !useHi; }
     ivec3 lo = c - AX[uAxis];
     ivec3 hi = c + AX[uAxis];
-    if (useLo && lo[uAxis] >= 0 && fr[uAxis] > 0.0) {
+    if (useLo && hasCell(G, lo) && fr[uAxis] > 0.0) {
       ivec2 tl = texelOf(G, lo);
       float Vl = texelFetch(uFrac, tl, 0).a;
       vec2 nb = texelFetch(uRho, tl, 0).rg;
       if (Vl > 0.0 && nb.r > 0.5 * Vl) r += exchange(me, fr.a, nb, Vl);
     }
-    if (useHi && hi[uAxis] < G.n[uAxis]) {
+    if (useHi && hasCell(G, hi)) {
       ivec2 th = texelOf(G, hi);
       vec4 fh = texelFetch(uFrac, th, 0);
       vec2 nb = texelFetch(uRho, th, 0).rg;
@@ -426,7 +440,13 @@ uniform float uEps;
 uniform int uSharpen;
 layout(location = 0) out vec4 oRho;   // (rho - removed, gamma)
 layout(location = 1) out vec4 oSc;    // xyz = deposit position, w = removed / capacity normalisation
-float rhoP(ivec3 c) { return 0.5 - fetchC(uLiq, G, c).r; }
+// rho' of a neighbour; a cell that does not exist shows no difference to this one (the dense
+// backend gets that from fetchC, which repeats the cell at the edge of the box)
+#ifdef SPARSE
+float rhoP(ivec3 c, float self) { return hasCell(G, c) ? 0.5 - fetchC(uLiq, G, c).r : self; }
+#else
+float rhoP(ivec3 c, float self) { return 0.5 - fetchC(uLiq, G, c).r; }
+#endif
 vec3 gradRhoP(vec3 p) {
   vec3 g = vec3(0.0);
   g.x = sampleFast(uLiq, G, p - vec3(0.5, 0.0, 0.0)).r - sampleFast(uLiq, G, p + vec3(0.5, 0.0, 0.0)).r;
@@ -479,13 +499,13 @@ void main() {
       ivec3 lo = c - AX[d];
       ivec3 hi = c + AX[d];
       float aLo = fr[d];
-      float aHi = hi[d] < G.n[d] ? fetchC(uFrac, G, hi)[d] : 0.0;
+      float aHi = hasCell(G, hi) ? fetchC(uFrac, G, hi)[d] : 0.0;
       float dPlus = -(rho * aHi - fetchC(uRho, G, lo).r * aLo);    // Eq. 18
       float dMinus = -(fetchC(uRho, G, hi).r * aHi - rho * aLo);   // Eq. 19
       float a = min(dPlus, 0.0);
       float b = max(dMinus, 0.0);
       gm += max(a * a, b * b);                                     // Eq. 11-13
-      maxDiff = max(maxDiff, max(abs(rp - rhoP(lo)), abs(rp - rhoP(hi))));
+      maxDiff = max(maxDiff, max(abs(rp - rhoP(lo, rp)), abs(rp - rhoP(hi, rp))));
     }
     float w = rp - 0.5;
     w = w * w * w * (1.0 - min(1.0, maxDiff / uTau));              // Eq. 14
@@ -500,7 +520,10 @@ void main() {
     vec3 f = floor(q);
     vec3 a = q - f;
     float norm = 0.0;
-    for (int k = 0; k < NC; k++) norm += cornerWeight(k, a) * (fetchC(uFrac, G, ivec3(f) + cornerOffset(k)).a + ${EPSV});
+    for (int k = 0; k < NC; k++) norm += cornerWeight(k, a) * capW(uFrac, G, cellAt(f) + cornerOffset(k));
+#ifdef SPARSE
+    if (norm <= 0.0) { p = x; norm = capW(uFrac, G, c); }
+#endif
     sc = amount / norm;
   }
   oRho = vec4(rho - amount, V > 0.0 ? rg.g : 1.0, 0.0, 0.0);
@@ -533,7 +556,7 @@ vec3 back(vec3 x) {
 }
 float brush(vec3 x) {
   if (uMouse.w <= 0.0) return 0.0;
-  vec3 d = x - uMouse.xyz;
+  vec3 d = shapePos(x) - uMouse.xyz;
 #if DIM == 2
   d.z = 0.0;
 #endif
@@ -567,7 +590,7 @@ void main() {
   //     momentarily holds rho' = 8 must not outvote three empty siblings.
   S.downsample = `${H}
 uniform Grid G;    // coarse
-uniform Grid GF;   // fine
+uniform GridX GF;   // fine
 uniform sampler2D uLiqF;
 uniform sampler2D uWF;
 layout(location = 0) out vec4 oLiq;
@@ -579,8 +602,12 @@ void main() {
   f.z = 0;
 #endif
   float sumV = 0.0, sumPhi = 0.0, minPhi = BIG;
+  bool covered = false;
   for (int k = 0; k < NC; k++) {
     vec2 l = fetchC(uLiqF, GF, f + cornerOffset(k)).rg;
+#ifdef SPARSE
+    if (l.g < 0.0) l.g = 0.0; else covered = true;
+#endif
     float phi = max(l.r, -0.5);
     sumV += l.g;
     sumPhi += l.g * phi;
@@ -589,6 +616,9 @@ void main() {
   // a coarse cell without any non-solid volume only matters through its partly open faces;
   // it is liquid if one of its children was reached by the extrapolation of rho'
   oLiq = vec4(sumV > 1.0e-4 ? sumPhi / sumV : minPhi, sumV / float(NC), 0.0, 0.0);
+#ifdef SPARSE
+  if (!covered) oLiq.g = -1.0;   // stored, but none of the cells it stands for exists
+#endif
   vec3 W = vec3(0.0);
   for (int d = 0; d < DIM; d++) {
     float s = 0.0;
@@ -624,7 +654,7 @@ uniform sampler2D uLiq;
 uniform sampler2D uW;
 uniform float uInvThetaMax;
 uniform int uCoarse;
-uniform Grid GF;            // next finer level (uCoarse = 1)
+uniform GridX GF;            // next finer level (uCoarse = 1)
 uniform sampler2D uLiqF;
 uniform sampler2D uWF;
 uniform sampler2D uCBF;     // its coefficients; .w = K
@@ -638,13 +668,23 @@ bool parentLiquid(ivec3 f) {
   return texelFetch(uLiq, texelOf(G, pc), 0).r < 0.0;
 }
 float ghost(float w, float phiAir, float phiLiq) { return w * min(uInvThetaMax, 1.0 - phiAir / phiLiq); }
+// A coarse cell that is solid throughout is not air, whatever its averaged phi says: its faces
+// carry a little weight only because W is averaged over a wider stencil than the cell. Treated
+// as air it would put p = 0 behind every wall that is more than a few cells thick. (The dense
+// box ends in its walls, so there the case only arises around thick obstacles; it is left as it
+// was, the dense solver being the reference. The sparse one can be switched to match it.)
+#ifdef SPARSE
+bool solidAir(vec2 l) { return uCoarse == 1 && uCoarseSolids == 1 && l.g <= 1.0e-4; }
+#else
+bool solidAir(vec2 l) { return false; }
+#endif
 // fine air cell a: is its air still present on this (coarse) level?
 bool airSeen(ivec3 a) {
   if (!parentLiquid(a)) return true;
   for (int d = 0; d < DIM; d++) {
     for (int sgn = -1; sgn <= 1; sgn += 2) {
       ivec3 b = a + sgn * AX[d];
-      if (inGrid(GF, b) && texelFetch(uLiqF, texelOf(GF, b), 0).r >= 0.0 && !parentLiquid(b)) return true;
+      if (present(uLiqF, GF, b) && texelFetch(uLiqF, texelOf(GF, b), 0).r >= 0.0 && !parentLiquid(b)) return true;
     }
   }
   return false;
@@ -660,19 +700,19 @@ void main() {
     float diag = 0.0;
     for (int d = 0; d < DIM; d++) {
       ivec3 lo = c - AX[d];
-      if (lo[d] >= 0 && Wc[d] > 0.0) {
-        float pn = fetchC(uLiq, G, lo).r;
-        if (pn < 0.0) { A[d] = Wc[d]; diag += Wc[d]; }
-        else diag += ghost(Wc[d], pn, phi);
+      if (Wc[d] > 0.0 && present(uLiq, G, lo)) {
+        vec2 ln = fetchC(uLiq, G, lo).rg;
+        if (ln.r < 0.0) { A[d] = Wc[d]; diag += Wc[d]; }
+        else if (!solidAir(ln)) diag += ghost(Wc[d], ln.r, phi);
       }
       ivec3 hi = c + AX[d];
-      if (hi[d] < G.n[d]) {
+      if (present(uLiq, G, hi)) {
         ivec2 th = texelOf(G, hi);
         float w = texelFetch(uW, th, 0)[d];
         if (w > 0.0) {
-          float pn = texelFetch(uLiq, th, 0).r;
-          if (pn < 0.0) { B[d] = w; diag += w; }
-          else diag += ghost(w, pn, phi);
+          vec2 ln = texelFetch(uLiq, th, 0).rg;
+          if (ln.r < 0.0) { B[d] = w; diag += w; }
+          else if (!solidAir(ln)) diag += ghost(w, ln.r, phi);
         }
       }
     }
@@ -691,12 +731,12 @@ void main() {
         vec4 Wf = texelFetch(uWF, tf, 0);
         for (int d = 0; d < DIM; d++) {
           ivec3 lo = f - AX[d];
-          if (lo[d] >= 0 && Wf[d] > 0.0) {
+          if (Wf[d] > 0.0 && present(uLiqF, GF, lo)) {
             float pn = fetchC(uLiqF, GF, lo).r;
             if (pn >= 0.0 && !airSeen(lo)) K += ghost(Wf[d], pn, pf);
           }
           ivec3 hi = f + AX[d];
-          if (hi[d] < GF.n[d]) {
+          if (present(uLiqF, GF, hi)) {
             ivec2 th = texelOf(GF, hi);
             float w = texelFetch(uWF, th, 0)[d];
             float pn = texelFetch(uLiqF, th, 0).r;
@@ -745,9 +785,9 @@ void main() {
       div -= Wc[d] * (uc[d] - sc[d]);
       divS -= sc[d];
       ivec3 lo = c - AX[d];
-      if (lo[d] >= 0 && Wc[d] > 0.0 && fetchC(uLiq, G, lo).r >= 0.0) interior = false;
+      if (Wc[d] > 0.0 && hasCell(G, lo) && fetchC(uLiq, G, lo).r >= 0.0) interior = false;
       ivec3 hi = c + AX[d];
-      if (hi[d] < G.n[d]) {
+      if (hasCell(G, hi)) {
         ivec2 th = texelOf(G, hi);
         float s = texelFetch(uUs, th, 0)[d];
         float w = texelFetch(uW, th, 0)[d];
@@ -806,7 +846,7 @@ void main() {
   // DownsampleSubtract of p_min ([CM11a] Eq. 19-20).
   S.restrict = `${H}
 uniform Grid G;    // coarse
-uniform Grid GF;   // fine
+uniform GridX GF;   // fine
 uniform sampler2D uP;
 uniform sampler2D uRhs;
 uniform sampler2D uCA;
@@ -843,22 +883,17 @@ void main() {
 
   S.prolong = `${H}
 uniform Grid G;    // fine
-uniform Grid GC;   // coarse
+uniform GridX GC;   // coarse
 uniform sampler2D uP;
 uniform sampler2D uPc;
+uniform sampler2D uLiqC;   // liq of the coarse level (which of its cells stand for real cells)
 uniform sampler2D uCA;
 out vec4 o;
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
   ivec3 c = cellOf(G, t);
   float p = texelFetch(uP, t, 0).r;
-  if (texelFetch(uCA, t, 0).w > 0.0) {
-    vec3 x = (vec3(c) + 0.5) * 0.5;
-#if DIM == 2
-    x.z = 0.5;
-#endif
-    p += sampleLin(uPc, GC, x).r;
-  }
+  if (texelFetch(uCA, t, 0).w > 0.0) p += sampleCoarseIn(uPc, uLiqC, GC, c).r;
   o = vec4(p, 0.0, 0.0, 0.0);
 }`;
 
@@ -911,7 +946,7 @@ void main() {
   float fb = texelFetch(uLiq, t, 0).r;
   for (int d = 0; d < DIM; d++) {
     ivec3 lo = c - AX[d];
-    if (lo[d] < 0 || W[d] <= 0.0) { v[d] = us[d]; continue; }
+    if (W[d] <= 0.0 || !hasCell(G, lo)) { v[d] = us[d]; continue; }
     ivec2 ta = texelOf(G, lo);
     float pa = texelFetch(uP, ta, 0).r;
     float fa = texelFetch(uLiq, ta, 0).r;
@@ -938,13 +973,12 @@ layout(location = 0) out vec4 o0;   // sum rho, sum volume, sum |residual|, sum 
 layout(location = 1) out vec4 o1;   // min gamma, max gamma, max liquid speed, max rho'
 void main() {
   ivec2 base = ivec2(gl_FragCoord.xy) * uB;
-  ivec2 size = ivec2(G.n.x * G.tx, int(floor(1.0 / G.inv.y + 0.5)));
   float mass = 0.0, vol = 0.0, res = 0.0, rhs = 0.0;
   float gmin = BIG, gmax = -BIG, vmax = 0.0, rmax = 0.0;
   for (int j = 0; j < uB; j++) {
     for (int i = 0; i < uB; i++) {
       ivec2 t = base + ivec2(i, j);
-      if (t.x >= size.x || t.y >= size.y) continue;
+      if (!liveTexel(G, t)) continue;
       ivec3 c = cellOf(G, t);
       vec2 rg = texelFetch(uRho, t, 0).rg;
       vec2 l = texelFetch(uLiq, t, 0).rg;
@@ -983,7 +1017,7 @@ void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
   ivec3 c = cellOf(G, t);
   float V = texelFetch(uFrac, t, 0).a;
-  float cov = clamp(0.5 - sdL(cellPos(c, vec3(0.5))).x, 0.0, 1.0);
+  float cov = clamp(0.5 - sdL(shapePos(cellPos(c, vec3(0.5)))).x, 0.0, 1.0);
   vec2 rg = texelFetch(uRho, t, 0).rg;
   if (uOp == 0) rg = vec2(V * cov, 1.0);
   else if (uOp == 1) rg.r = max(rg.r, V * cov);
@@ -999,7 +1033,8 @@ ${prims('L')}
 uniform sampler2D uVel;
 uniform int uOp;
 out vec4 o;
-float comp(vec3 x, int d, float old) {
+float comp(vec3 xf, int d, float old) {
+  vec3 x = shapePos(xf);
   vec2 s = sdL(x);
   float cov = clamp(0.5 - s.x, 0.0, 1.0);
   float target = s.y >= 0.0 ? velL(int(s.y), x)[d] : 0.0;
@@ -1037,18 +1072,16 @@ out vec4 vB;   // xyz = torque, w = wet part of the band
 out vec4 vC;   // xyz = liquid velocity summed over the wet band, w = its weight
 float vol(float d) { return clamp(0.5 + d, 0.0, 1.0); }
 void main() {
-  int aw = G.n.x * G.tx;
-  int id = gl_VertexID + uBase;
-  ivec2 st = ivec2(id % aw, id / aw);
+  ivec2 st = pointTexel(G, gl_VertexID + uBase);
   ivec3 c = cellOf(G, st);
-  vec3 xc = cellPos(c, vec3(0.5));
+  vec3 xc = shapePos(cellPos(c, vec3(0.5)));
   vec2 s = sdB(xc);
   gl_PointSize = 1.0;
   gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
   vA = vec4(0.0);
   vB = vec4(0.0);
   vC = vec4(0.0);
-  if (s.y < 0.0 || abs(s.x) > 1.5) return;
+  if (!g_live || s.y < 0.0 || abs(s.x) > 1.5) return;
   int b = int(s.y);
   vec3 dW = vec3(0.0);
   dW.x = vol(sdBPrim(b, xc + vec3(0.5, 0.0, 0.0))) - vol(sdBPrim(b, xc - vec3(0.5, 0.0, 0.0)));
