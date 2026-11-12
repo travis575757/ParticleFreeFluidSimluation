@@ -1,0 +1,362 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>water at rest: the far-field state and held bricks</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// Stage 2 of world mode: bricks that hold water at rest are not solved ("held").
+//   ?mode=rest    the dense solver's own state of rest against the formula that held cells get:
+//                 a pool filled to `level` cells (several sub-cell levels), density and pressure
+//                 in a column after `steps` steps
+//   ?mode=pool    the sparse solver on a pool whose bricks are held except for a band in the
+//                 middle (&act=first,last brick column; &floor=n holds the lowest n brick rows too):
+//                 the pool must stay at rest, nothing may flow steadily through the faces between
+//                 held and solved cells, and stored liquid + what the held bricks absorbed must
+//                 not change.  &bump=h adds a block of water h cells high on top of the solved
+//                 band,  &toggle=k holds / releases one brick of the band every k steps,
+//                 &solve=1 prints the convergence of the V-cycle with and without held bricks.
+//   ?mode=sea     an open sea with nothing stored: a ball of water (&r=8) falls into it from
+//                 &drop=40 cells above the level. Bricks are stored and solved where the splash
+//                 is, held around them, and dropped again once the water is at rest; the books
+//                 (liquid above the water at rest + what the held bricks took in) must balance.
+//                 &bed=y puts a floor under the sea, &delay=k acts on reports k steps late,
+//                 &map=1 prints the bricks (# solved and wet, + solved and dry, - held).
+//   ?dim=2  &n=64 [&nx=]  &steps=600  &level=..  &levels=20,20.25,...  &every=  &p.<param>=value  &s.<param>=value
+import { GLContext } from '../src/gl.js';
+import { FluidSim } from '../src/sim.js';
+import { SparseSim, SPARSE_PARAMS } from '../src/world/sparsesim.js';
+import { farLevel } from '../src/world/water.js';
+
+const q = new URLSearchParams(location.search);
+const dim = Number(q.get('dim') || 2);
+const mode = q.get('mode') || 'rest';
+const N = Number(q.get('n') || (dim === 2 ? 64 : 32));
+const steps = Number(q.get('steps') || (mode === 'sea' ? (dim === 2 ? 3600 : 1000) : 600));
+// (the dense solver the sparse one is compared with runs with the same two options: see SPARSE_PARAMS)
+const params = { pushRel: SPARSE_PARAMS.pushRel, sliverSide: SPARSE_PARAMS.sliverSide }, sparams = {};
+for (const [k, v] of q) {
+  if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
+  if (k.startsWith('s.')) sparams[k.slice(2)] = Number(v);
+}
+const log = (s) => console.log(s);
+let failed = 0;
+const check = (ok, what) => { if (!ok) failed++; log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); };
+const yieldNow = () => new Promise((r) => setTimeout(r));
+
+try {
+  if (document.readyState !== 'complete') await new Promise((r) => addEventListener('load', r, { once: true }));
+  const glc = new GLContext(document.getElementById('c'));
+  log(`readback ${glc.readback} | ${glc.renderer}`);
+  const n = dim === 2 ? [Number(q.get('nx') || N), N, 1] : [Number(q.get('nx') || N), N, Number(q.get('nz') || N)];
+  const m = 2;                 // wall thickness
+  const h = 3.2 / n[1];
+  const walls = [{ type: 'box', inverted: true, center: n.map((v, d) => (dim === 2 && d === 2 ? 0.5 : v / 2)), half: n.map((v, d) => (dim === 2 && d === 2 ? 1 : v / 2 - m)) }];
+  // liquid up to `level` (cells): a box whose top face is the level
+  const pool = (level) => [{ type: 'box', center: [n[0] / 2, level / 2, dim === 2 ? 0.5 : n[2] / 2], half: [n[0], level / 2, dim === 2 ? 1 : n[2]], vel: [0, 0, 0] }];
+
+  if (mode === 'rest') {
+    // (Not 20.5: a top cell that is exactly half full is neither liquid nor air (phi = 0), rounding
+    // decides column by column, and the dense solver does not keep that pool at rest: 0.04 to
+    // 0.06 cells per step after 600 steps. A thousandth of a cell to either side it does.)
+    const levels = (q.get('levels') || '20,20.1,20.25,20.4,20.499,20.501,20.6,20.75,20.9').split(',').map(Number);
+    const tolP = Number(q.get('tol') || 1e-3);
+    for (const level of levels) {
+      const sim = new FluidSim(glc, { dim, nx: n[0], ny: n[1], nz: n[2], params: { h, ...params } });
+      sim.reset(walls, pool(level));
+      for (let i = 0; i < steps; i++) sim.step();
+      const s = sim.measureSync();
+      const g = sim.grid;
+      const rho = glc.read(sim.T.rho[0]), liq = glc.read(sim.levels[0].liq), p = glc.read(sim.levels[0].p[0]);
+      const G = -sim.params.gravity[1] * sim.params.dt / sim.params.h;
+      const far = farLevel(level, G, sim.params.thetaMin);
+      const x = Math.floor(n[0] / 2), z = dim === 2 ? 0 : Math.floor(n[2] / 2);
+      const at = (y) => (y + Math.floor(z / g.tx) * g.n[1]) * g.w + x + (z % g.tx) * g.n[0];
+      let worstP = 0, worstR = 0, rows = '';
+      for (let y = m; y < n[1] - m; y++) {
+        const i = at(y);
+        const fill = Math.min(Math.max(level - y, 0), 1);
+        const pf = y <= far.top ? far.pTop + (far.top - y) * G : 0;
+        worstR = Math.max(worstR, Math.abs(rho[2 * i] - fill));
+        worstP = Math.max(worstP, Math.abs(p[i] - pf) / G);
+        if (Math.abs(y - far.top) <= 2) rows += ` | y ${y}: rho ${rho[2 * i].toFixed(4)} (${fill.toFixed(4)}) phi ${liq[2 * i].toFixed(3)} p/G ${(p[i] / G).toFixed(4)} (${(pf / G).toFixed(4)})`;
+      }
+      log(`level ${level}: after ${steps} steps fastest liquid ${s.maxSpeed.toExponential(1)} cells/s, residual ${s.residual.toExponential(1)}${rows}`);
+      check(worstR <= 0.01 && worstP <= tolP, `level ${level}: density within ${worstR.toExponential(1)} of the fill, pressure within ${worstP.toExponential(1)} cells of head of the formula (allowed ${tolP})`);
+      sim.dispose();
+      await yieldNow();
+    }
+  }
+
+  if (mode === 'pool') {
+    const level = Number(q.get('level') || (dim === 2 ? 30.25 : 14.25));     // (3D runs at 32 cells: the surface has to be below the lid)
+    const bump = Number(q.get('bump') || 0);
+    const toggle = Number(q.get('toggle') || 0);
+    const every = Number(q.get('every') || Math.max(1, Math.floor(steps / 6)));
+    const S = new SparseSim(glc, { dim, params: { h, ...params, lifecycle: 0, ...sparams } });
+    const B = S.B;
+    const nb = n.map((v) => v / B);
+    const act = (q.get('act') || `${Math.floor(nb[0] / 3)},${Math.ceil(2 * nb[0] / 3) - 1}`).split(',').map(Number);
+    const floor = Number(q.get('floor') || 0);
+    const liquid = pool(level);
+    if (bump) {
+      const x0 = act[0] * B + 4, x1 = (act[1] + 1) * B - 4;
+      liquid.push({ type: 'box', center: [(x0 + x1) / 2, level + bump / 2 - 0.5, dim === 2 ? 0.5 : n[2] / 2], half: [(x1 - x0) / 2, bump / 2 + 0.5, dim === 2 ? 1 : n[2] / 4], vel: [0, 0, 0] });
+    }
+    S.ensureBox([0, 0, 0], n);
+    S.setWater([{ box: [-1e6, -1e6, 1e6, 1e6], level }]);
+    S.reset(walls, liquid, { keep: true });
+    const solved = (x, y) => x >= act[0] && x <= act[1] && y >= floor;
+    const each = (f) => { for (let z = 0; z < (dim === 2 ? 1 : nb[2]); z++) for (let y = 0; y < nb[1]; y++) for (let x = 0; x < nb[0]; x++) f(x, y, z); };
+    if (q.get('held') !== '0') each((x, y, z) => S.setHeld(x, y, z, !solved(x, y)));
+    S._syncBricks();
+    log(`${dim}D pool ${n.slice(0, dim).join('x')}, level ${level}: ${S.bricks} bricks, ${S.nHeld} held (solved: brick columns ${act[0]}..${act[1]}${floor ? ', rows from ' + floor : ''}), ${S.nlev} levels`);
+
+    const cols = () => {
+      const g = { w: n[0] };
+      const rho = glc.read(S.resolve(S.T.rho[0], [0, 0, 0], n));
+      const c = new Float64Array(n[0]);
+      // (2D: one row of the texture per y; 3D: the middle slice is enough for this check)
+      const z = dim === 2 ? 0 : Math.floor(n[2] / 2);
+      const sim = S, grid = { tx: 1 };
+      for (let y = 0; y < n[1]; y++) for (let x = 0; x < n[0]; x++) c[x] += rho[4 * (dim === 2 ? y * g.w + x : sliceIndex(x, y, z))];
+      return c;
+    };
+    let sliceIndex = null;
+    if (dim === 3) {
+      const { makeGrid } = await import('../src/sim.js');
+      const g = makeGrid(n[0], n[1], n[2]);
+      sliceIndex = (x, y, z) => (y + Math.floor(z / g.tx) * g.n[1]) * g.w + x + (z % g.tx) * g.n[0];
+    }
+    const c0 = cols();
+    const m0 = S.measureSync().mass;
+    let worstBooks = 0, vmaxLate = 0, absorbedHalf = 0, bigLate = 0, tog = false;
+    const tb = [act[0], Math.floor(level / B), dim === 2 ? 0 : Math.floor(nb[2] / 2)];     // the brick that is toggled: a surface brick at the edge of the band
+    for (let i = 1; i <= steps; i++) {
+      if (toggle && i % toggle === 0) { tog = !tog; S.setHeld(...tb, tog); }
+      S.step();
+      const big = S.readFar();
+      if (i > steps / 2) bigLate = Math.max(bigLate, big);
+      if (i === Math.floor(steps / 2)) absorbedHalf = S.absorbed;
+      if (i % every === 0 || i === steps) {
+        const st = S.measureSync();
+        const books = Math.abs(st.mass + S.absorbed - m0) / m0;
+        worstBooks = Math.max(worstBooks, books);
+        if (i > steps / 2) vmaxLate = Math.max(vmaxLate, st.maxSpeed);
+        const c = cols();
+        let dc = 0, at = 0;
+        for (let x = m; x < n[0] - m; x++) if (Math.abs(c[x] - c0[x]) > dc) { dc = Math.abs(c[x] - c0[x]); at = x; }
+        log(`step ${i} (t = ${(i * S.params.dt).toFixed(1)} s): fastest liquid ${st.maxSpeed.toExponential(2)} cells/s, residual ${st.residual.toExponential(1)}, ` +
+          `columns within ${dc.toFixed(4)} cells of the start (x = ${at}), ` + (bump ? `middle column ${(c[n[0] >> 1] - (level - m)).toFixed(3)} above rest, ` : '') +
+          `absorbed ${S.absorbed.toExponential(3)}, stored + absorbed off by ${books.toExponential(1)}`);
+        if (q.get('where') === '1' && dim === 2) {
+          // where the liquid moves fastest, and the fields around that cell
+          const vel = glc.read(S.resolve(S.T.vel[0], [0, 0, 0], n)).slice();
+          const liq = glc.read(S.resolve(S.levels[0].liq, [0, 0, 0], n)).slice();
+          const pp = glc.read(S.resolve(S.levels[0].p[0], [0, 0, 0], n)).slice();
+          const rr = glc.read(S.resolve(S.T.rho[0], [0, 0, 0], n)).slice();
+          let best = 0, cx = 0, cy = 0;
+          for (let y = 0; y < n[1]; y++) for (let x = 0; x < n[0]; x++) {
+            const k = 4 * (y * n[0] + x);
+            if (!(liq[k] < 0)) continue;
+            const v = Math.hypot(vel[k], vel[k + 1]);
+            if (v > best) { best = v; cx = x; cy = y; }
+          }
+          log(`  fastest liquid cell ${cx},${cy} (brick ${Math.floor(cx / B)},${Math.floor(cy / B)}): ${best.toExponential(2)}`);
+          for (let y = cy + 2; y >= cy - 2; y--) {
+            let row = `  y=${String(y).padStart(3)}:`;
+            for (let x = cx - 2; x <= cx + 2; x++) {
+              const k = 4 * (y * n[0] + x);
+              row += ` [rho ${rr[k].toFixed(5)} u ${vel[k].toExponential(1)} v ${vel[k + 1].toExponential(1)} p ${pp[k].toFixed(4)}]`;
+            }
+            log(row);
+          }
+        }
+        if (!Number.isFinite(st.mass)) break;
+        await yieldNow();
+      }
+    }
+    // (the solver's own round-off drift is a few 1e-7 of the mass per second, with or without held bricks)
+    const tolBooks = 1e-6 + 5e-7 * steps * S.params.dt;
+    check(worstBooks <= tolBooks, `stored liquid + what the held bricks absorbed stays constant (largest relative difference ${worstBooks.toExponential(1)}, allowed ${tolBooks.toExponential(1)})`);
+    if (!bump && !toggle) {
+      const c = cols();
+      let dc = 0;
+      for (let x = m; x < n[0] - m; x++) dc = Math.max(dc, Math.abs(c[x] - c0[x]));
+      const rate = (S.absorbed - absorbedHalf) / (steps / 2 * S.params.dt);
+      check(vmaxLate <= 1e-3, `the pool stays at rest (fastest liquid in the second half ${vmaxLate.toExponential(1)} cells/s)`);
+      check(dc <= 0.01, `every column keeps its liquid (largest change ${dc.toExponential(1)} cells)`);
+      // (again against the solver's round-off drift: 1e-6 of the liquid per second)
+      const tolRate = 1e-6 * m0;
+      check(Math.abs(rate) <= tolRate && bigLate <= 1e-3, `nothing flows steadily into the held bricks (${rate.toExponential(1)} cells/s over the second half, allowed ${tolRate.toExponential(1)}; largest density change in a held cell ${bigLate.toExponential(1)})`);
+    }
+    if (q.get('solve') === '1') {
+      // convergence of the V-cycle on the state reached: residual after each further cycle
+      const hist = [S.measureSync().residual];
+      for (let k = 0; k < 6; k++) { S._vcycle(0); hist.push(S.measureSync().residual); }
+      log(`V-cycles: residual ${hist.map((v) => v.toExponential(2)).join(' -> ')} | factors ${hist.slice(1).map((v, k) => (v / hist[k]).toFixed(3)).join(' ')}`);
+    }
+  }
+
+  if (mode === 'sea') {
+    // A ball of water falls into a sea at rest that is not stored anywhere. In 2D the waves do
+    // not thin out as they spread, so the solved region is capped (maxSolved) and the held
+    // bricks at its ends take the waves in; in 3D the default cap is never reached.
+    const level = Number(q.get('level') || (dim === 2 ? 24.25 : 12.25));
+    const r = Number(q.get('r') || (dim === 2 ? 8 : 6));
+    const drop = Number(q.get('drop') || (dim === 2 ? 40 : 30));
+    const every = Number(q.get('every') || Math.max(1, Math.floor(steps / 12)));
+    const delay = Number(q.get('delay') || 0);
+    const S = new SparseSim(glc, { dim, params: { h: 0.05, ...(dim === 2 ? { maxSolved: 120 } : {}), ...params, reportDelay: delay, ...sparams } });
+    const B = S.B;
+    const mid = dim === 2 ? 0.5 : 0;
+    const solids = q.has('bed') ? [{ type: 'box', center: [0, Number(q.get('bed')) - 500, mid], half: [1e5, 500, 1e5] }] : [];
+    S.setWater([{ box: [-1e6, -1e6, 1e6, 1e6], level }]);
+    S.reset(solids, [{ type: 'ball', center: [0, level + drop, mid], radius: r, vel: [0, 0, 0] }]);
+    const flips = new Map();
+    let events = 0;
+    S.onState = (x, y, z, what) => {
+      if (what !== 'wake' && what !== 'sleep') return;
+      const k = `${x},${y},${z}`;
+      flips.set(k, (flips.get(k) || 0) + 1);
+      events++;
+    };
+    const e0 = S.excessSync();
+    log(`${dim}D sea, level ${level}: a ball of ${e0.toFixed(1)} cells of water ${drop} cells above it; ${S.bricks} bricks stored, ${S.nHeld} of them held${delay ? `; reports acted on ${delay} steps late` : ''}`);
+    let worst = 0, peak = 0, peakMass = 0, edge = 0, refused = 0, last = 0;
+    const map = () => {
+      const set = S.levels[0].set, bb = set.bounds();
+      if (!bb) return;
+      const z = dim === 2 ? 0 : Math.floor(mid / B);
+      for (let y = bb.hi[1] - 1; y >= bb.lo[1]; y--) {
+        let row = `  ${String(y).padStart(4)} `;
+        for (let x = bb.lo[0]; x < bb.hi[0]; x++) {
+          const s = set.get(x, y, z);
+          row += s < 0 ? '.' : set.state(s) === 2 ? '-' : wetNow[s] ? '#' : '+';
+        }
+        log(row);
+      }
+    };
+    let wetNow = [];
+    let edgeAt = null, lastRep = null, booksLast = 0;
+    for (let i = 1; i <= steps; i++) {
+      S.step();
+      if (S.params.reportAsync) await new Promise((r) => requestAnimationFrame(r));
+      const rep = S.report;
+      if (rep && rep !== lastRep) {      // (each report once: with late reports a step may have no new one)
+        lastRep = rep;
+        if (rep.edge && !edgeAt) { edgeAt = rep; log(`  liquid at an open face first in the report of step ${rep.frame} (${rep.edge} cells), ${S.bricks} bricks, fastest ${(rep.maxSpeed * S.params.dt).toFixed(3)} cells/step`); }
+        edge += rep.edge; peakMass = Math.max(peakMass, rep.mass);
+      }
+      peak = Math.max(peak, S.bricks);
+      refused = S.refused;
+      if (S.bricks) last = i;
+      if (q.get('dbg') === '1' && i >= Number(q.get('from') || 0)) {
+        // the bricks with cells that wake or are not at rest, as the statistics see them
+        const set = S.levels[0].set;
+        const s0 = glc.read(S.R.s[0]).slice(), s3 = glc.read(S.R.s[3]).slice(), f2 = glc.read(S.R.f[2]).slice(), f3 = glc.read(S.R.f[3]).slice();
+        const un = (v) => `${v & 15},${(v >> 4) & 15}`;
+        let out = `step ${i}: ${S.bricks} bricks, ${S.nHeld} held`;
+        for (let k = 0; k < set.high; k++) {
+          if (!set.used[k]) continue;
+          const held = set.state(k) === 2;
+          if (held ? !(f2[4 * k + 2] > 0.5 || f3[4 * k + 3] > 1e-3) : !(s3[4 * k] >= 0 || s3[4 * k + 2] > 0.5)) continue;
+          out += `\n    ${held ? 'held  ' : 'solved'} ${set.bx[k]},${set.by[k]}: ` + (held ? `flags ${f2[4 * k + 2]}, inflow ${f3[4 * k + 3].toExponential(1)}`
+            : `waking ${s3[4 * k] >= 0 ? un(s3[4 * k]) + ' .. ' + un(s3[4 * k + 1]) : 'none'}, ${s3[4 * k + 2]} cells not at rest, peak speed ${(s0[4 * k + 1] * S.params.dt).toFixed(4)} cells/step, flags ${f2[4 * k + 2]}`);
+        }
+        log(out);
+        if (q.has('cells') && dim === 2) {
+          // the cells of one brick: density, speed (cells per step), pressure above that of rest (cells of head)
+          const [bx, by] = q.get('cells').split(',').map(Number);
+          const lo = [bx * B, by * B, 0], nn = [B, B, 1];
+          const rho = glc.read(S.resolve(S.T.rho[0], lo, nn)).slice();
+          const vel = glc.read(S.resolve(S.T.vel[0], lo, nn)).slice();
+          const pp = glc.read(S.resolve(S.levels[0].p[0], lo, nn)).slice();
+          const liq = glc.read(S.resolve(S.levels[0].liq, lo, nn)).slice();
+          const G = -S.params.gravity[1] * S.params.dt / S.params.h;
+          const far = farLevel(level, G, S.params.thetaMin);
+          for (const [name, f] of [['rho', (k) => rho[k].toFixed(3)], ['u cells/step', (k) => (vel[k] * S.params.dt).toFixed(3)], ['v cells/step', (k) => (vel[k + 1] * S.params.dt).toFixed(3)],
+            ['p - p rest, cells of head', (k, y) => liq[k] < 0 ? ((pp[k] - (y <= far.top ? far.pTop + (far.top - y) * G : 0)) / G).toFixed(3) : '  .  ']]) {
+            log(`  brick ${bx},${by}: ${name}`);
+            for (let y = B - 1; y >= 0; y--) {
+              let row = `   ${String(y).padStart(2)} `;
+              for (let x = 0; x < B; x++) row += ' ' + f(4 * (y * B + x), by * B + y).padStart(6);
+              log(row);
+            }
+          }
+        }
+      }
+      if (q.get('books') === '1' && S.stored) {
+        // where the books change: per step, against the report they come from
+        const off = S.stored.excess + S.absorbed + S.freedMass - e0;
+        if (Math.abs(off - booksLast) > Number(q.get('jump') || 0.5)) {
+          log(`  books: step ${i}, report of step ${S.stored.frame}: off by ${off.toFixed(3)} (${(off - booksLast).toFixed(3)} since the last line), excess ${S.stored.excess.toFixed(3)}, absorbed ${S.absorbed.toFixed(3)}, ${S.bricks} bricks, ${S.nHeld} held, ${events} changes of state, pool ${S.levels[0].set.rows} rows`);
+          booksLast = off;
+        }
+      }
+      if (i % every === 0 || i === steps) {
+        // (reports that arrive late: the liquid above rest and what was absorbed have to be
+        // those of the same report)
+        const ex = S.params.reportAsync ? S.stored.excess : S.excessSync();
+        const off = ex + S.absorbed + S.freedMass - e0;
+        worst = Math.max(worst, Math.abs(off));
+        const st = S.measureSync();
+        log(`step ${i} (t = ${(i * S.params.dt).toFixed(1)} s): ${S.bricks} bricks, ${S.nHeld} held, ${S.nlev} levels | above rest ${ex.toFixed(3)}, absorbed ${S.absorbed.toFixed(3)}, evaporated ${S.freedMass.toExponential(1)}: off by ${off.toExponential(2)} cells | ` +
+          `fastest ${(st.maxSpeed * S.params.dt).toFixed(3)} cells/step, residual ${st.residual.toExponential(1)}, ${events} changes of state so far`);
+        if (q.get('map') === '1') {
+          const d = glc.read(S.R.s[1]);
+          wetNow = [];
+          for (let s = 0; s < S.levels[0].set.high; s++) wetNow[s] = d[4 * s + 3] > 0.5;
+          map();
+        }
+        if (!Number.isFinite(st.mass)) break;
+        await yieldNow();
+      }
+    }
+    if (q.get('field') === '1' && S.bricks && dim === 2) {
+      // the velocity field of what is left, one sample every 4 cells, in 1/1000 cell per step
+      const bb = S.levels[0].set.bounds();
+      const lo = [bb.lo[0] * B, bb.lo[1] * B, 0], nn = [(bb.hi[0] - bb.lo[0]) * B, (bb.hi[1] - bb.lo[1]) * B, 1];
+      const vel = glc.read(S.resolve(S.T.vel[0], lo, nn)).slice();
+      const rho = glc.read(S.resolve(S.T.rho[0], lo, nn)).slice();
+      const pp = glc.read(S.resolve(S.levels[0].p[0], lo, nn)).slice();
+      const G = -S.params.gravity[1] * S.params.dt / S.params.h;
+      const far = farLevel(level, G, S.params.thetaMin);
+      for (const [name, f] of [['u', (i) => 1000 * vel[4 * i] * S.params.dt], ['v', (i) => 1000 * vel[4 * i + 1] * S.params.dt],
+        ['p - p at rest, 1/1000 cell of head', (i, y) => rho[4 * i] >= 0.5 ? 1000 * (pp[4 * i] - (y <= far.top ? far.pTop + (far.top - y) * G : 0)) / G : 0]]) {
+        log(`  ${name} (cells ${lo[0]}..${lo[0] + nn[0] - 1} by ${lo[1]}..${lo[1] + nn[1] - 1}):`);
+        for (let y = nn[1] - 2; y >= 0; y -= 4) {
+          let row = `   ${String(lo[1] + y).padStart(4)} `;
+          for (let x = 2; x < nn[0]; x += 4) row += String(Math.round(f(y * nn[0] + x, lo[1] + y))).padStart(5);
+          log(row);
+        }
+      }
+    }
+    if (S.bricks && S.bricks <= 80) {
+      // what is left
+      const set = S.levels[0].set;
+      S.refreshSlotStats();
+      const s0 = glc.read(S.R.s[0]).slice(), s1 = glc.read(S.R.s[1]).slice();
+      for (let k = 0; k < set.high; k++) {
+        if (set.used[k]) log(`  left: brick ${set.bx[k]},${set.by[k]},${set.bz[k]} ${set.state(k) === 2 ? 'held' : 'solved'}: mass ${s0[4 * k].toExponential(2)}, peak density ${s0[4 * k + 3].toExponential(2)}, ${s1[4 * k + 3]} wet cells, peak speed ${(s0[4 * k + 1] * S.params.dt).toFixed(3)} cells/step`);
+      }
+    }
+    const seconds = steps * S.params.dt;
+    let most = 0;
+    for (const v of flips.values()) most = Math.max(most, v);
+    const allowed = 2 * Math.ceil(seconds / 10);
+    check(S.bricks === 0, `the sea is at rest again and nothing is stored (${S.bricks} bricks left; the last one was dropped at step ${last}; at most ${peak} were stored)`);
+    // (against the solver's own round-off drift, as in the pool: 5e-7 of the liquid per second)
+    const tolBooks = 1e-6 + 5e-7 * seconds;
+    check(worst <= tolBooks * Math.max(peakMass, 1), `the books balance: liquid above the water at rest + absorbed + evaporated stays what the ball held (off by at most ${worst.toExponential(1)} cells, ${(worst / Math.max(peakMass, 1)).toExponential(1)} of the ${peakMass.toFixed(0)} cells stored at the peak, allowed ${tolBooks.toExponential(1)})`);
+    check(most <= allowed, `no brick changes state more than ${allowed} times in ${seconds.toFixed(0)} s (most: ${most}; ${flips.size} bricks were woken, ${events} changes in all)`);
+    check(edge === 0 && refused === 0, `no liquid at a face of a brick that is not stored (${edge}), no brick refused (${refused})`);
+    S.dispose();
+  }
+
+  log(failed ? `${failed} check(s) failed` : 'all checks passed');
+  window.__done = true;
+} catch (e) {
+  console.log('ERROR: ' + (e.stack || e));
+  window.__error = String(e);
+}
+</script>

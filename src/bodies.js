@@ -214,11 +214,11 @@ export class Container {
  * Advance the dynamic bodies by dt.
  * @param {Body[]} bodies
  * @param {Array} statics  objects with sd/normal/velocityAt and infinite mass (container, kinematic obstacles)
- * @param {object} o       { dt, gravity:[..] (cells/s^2), addedMass, fluidDrag }
+ * @param {object} o       { dt, gravity:[..] (cells/s^2), params: overrides of BODY_PARAMS for this call }
  */
 export function stepBodies(bodies, statics, o) {
   const { dt, gravity } = o;
-  const P = BODY_PARAMS;
+  const P = o.params ? { ...BODY_PARAMS, ...o.params } : BODY_PARAMS;
   const glen = len(gravity);
   for (const b of bodies) {
     // velocity before this step's forces: decides whether a contact is an impact or resting

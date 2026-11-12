@@ -125,14 +125,14 @@ try {
       ` | total ${Object.values(cpu).reduce((a, b) => a + b, 0).toFixed(2)}`);
     { const p0 = glc.passCount; world.step(); log(`${glc.passCount - p0} passes per step`); }
     {
-      // the report: its two passes, and reading two small textures back
+      // the report: its two passes, and reading its small textures back
       const set = sim.levels[0].set, R = sim.R;
       const time = (f) => { wait(); const t0 = performance.now(); for (let i = 0; i < 20; i++) f(); wait(); return ((performance.now() - t0) / 20).toFixed(2); };
       const U = sim._U(sim.levels[0]);
       const rows = Math.max(1, Math.ceil(set.high / set.perRow));
-      log(`report in parts, ms: slotStats ${time(() => glc.draw(sim.prog.slotStats, R.s, { ...U, uRho: sim.T.rho[0], uVel: sim.T.vel[0], uWet: sim.params.wetMin, uEdge: sim.params.edgeMin }))} | ` +
-        `slotFlags ${time(() => glc.draw(sim.prog.slotFlags, R.f, { ...U, uS0: R.s[0], uS1: R.s[1], uS2: R.s[2], uDt: dt, uSteps: 2, uMargin: 5 }))} | ` +
-        `2 read-backs of ${set.perRow} x ${rows} ${time(() => R.f.map((x) => glc.read(x, 0, 0, set.perRow, rows)))} | pool ${set.perRow} x ${set.rows} slots, highest in use ${set.high}`);
+      log(`report in parts, ms: slotStats ${time(() => sim.refreshSlotStats())} | ` +
+        `slotFlags ${time(() => glc.draw(sim.prog.slotFlags, R.f, { ...U, ...sim._farUniforms(), uS0: R.s[0], uS1: R.s[1], uS2: R.s[2], uS3: R.s[3], uD: R.d, uDt: dt, uSteps: 2, uMargin: 5 }))} | ` +
+        `${R.f.length} read-backs of ${set.perRow} x ${rows} ${time(() => R.f.map((x) => glc.read(x, 0, 0, set.perRow, rows)))} | pool ${set.perRow} x ${set.rows} slots, highest in use ${set.high}`);
     }
     const total = Object.values(t).reduce((a, b) => a + b, 0);
     log(`ms per step by part, ${sim.bricks} bricks (${(sim.storedCells / 1e6).toFixed(2)} M cells), ${sim.nlev} levels: ` +

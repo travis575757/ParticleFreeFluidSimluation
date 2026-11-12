@@ -17,7 +17,7 @@
 //   mode=run: &veto=0 &initial= &max= &cmpAt= &l1=
 import { GLContext } from '../src/gl.js';
 import { FluidSim } from '../src/sim.js';
-import { SparseSim } from '../src/world/sparsesim.js';
+import { SparseSim, SPARSE_PARAMS } from '../src/world/sparsesim.js';
 import { staticSolidTest } from '../src/world/terrain.js';
 
 const q = new URLSearchParams(location.search);
@@ -28,7 +28,8 @@ const steps = Number(q.get('steps') || 30);
 const tol = Number(q.get('tol') || 1e-5);
 const tolLate = Number(q.get('tolLate') || 1e-3);
 const verbose = q.get('verbose') === '1';
-const params = {}, sparams = {};
+// (the dense solver the sparse one is compared with runs with the same two options: see SPARSE_PARAMS)
+const params = { pushRel: SPARSE_PARAMS.pushRel, sliverSide: SPARSE_PARAMS.sliverSide }, sparams = {};
 for (const [k, v] of q) {
   if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
   if (k.startsWith('s.')) sparams[k.slice(2)] = Number(v);

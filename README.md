@@ -36,14 +36,20 @@ only the 8×8×8 bricks around the liquid are stored, over a height-map terrain:
 ![2D simulator: rigid bodies falling into a pool](docs/screenshots/app-2d.png)
 
 World (`world3d.html`): the same liquid, stored in bricks where it is. Right: the stored bricks
-(blue: holding liquid, grey: kept around it).
+(blue: holding liquid, grey: kept around it, amber: water at rest next to water that moves).
 
 | | |
 |:-:|:-:|
 | ![Waterfall](docs/screenshots/world-waterfall.png) | ![Waterfall, stored bricks](docs/screenshots/world-waterfall-bricks.png) |
-| High waterfall: 16 m fall, 10 cm cells, t = 7 s | 1.95 M cells stored of the 11.2 M in the box around them |
+| High waterfall: 16 m fall, 10 cm cells, t = 7 s | 1.89 M cells stored of the 11.2 M in the box around them |
 | ![Terraced cascade](docs/screenshots/world-cascade.png) | ![Terraced cascade, stored bricks](docs/screenshots/world-cascade-bricks.png) |
-| Terraced cascade: six basins, 5 cm cells, t = 15 s | 1.83 M cells stored of 6.9 M |
+| Terraced cascade: six basins, 5 cm cells, t = 15 s | 1.92 M cells stored of 8.6 M |
+| ![Crate in an open sea](docs/screenshots/world-sea.png) | ![Crate in an open sea, stored bricks](docs/screenshots/world-sea-bricks.png) |
+| A crate dropped into a sea that is a formula: 5 cm cells, t = 1.8 s | 576 bricks exist: solved (blue), kept around them (grey), water at rest (amber). Ten seconds later there are none |
+| ![Launch in a harbour](docs/screenshots/world-harbour.png) | ![Launch in a harbour, stored bricks](docs/screenshots/world-harbour-bricks.png) |
+| A launch going round a harbour basin, 10 cm cells, t = 10 s | The bricks follow the boat and its wake; the buoys and the crate sleep until it passes |
+| ![Scattered buoys, stored bricks](docs/screenshots/world-buoys-bricks.png) | |
+| Five buoys up to 50 m apart, 10 cm cells, t = 21 s: a lump of water dropped next to one buoy six seconds ago and next to another a second ago. The 819 bricks around those two exist, and none around the other three | |
 
 ![World app: the terraced cascade with its bricks](docs/screenshots/app-world.png)
 
@@ -293,10 +299,10 @@ points can interpenetrate slightly before the contact is seen.
 
 `world3d.html` runs the solver without the box. Cells are world integers on an unbounded grid;
 only bricks of 8×8×8 cells that hold liquid, or that liquid can reach before anyone looks again,
-are stored, and the ground is a height map. The numerics are the passes described above,
-unchanged. This is the first of four planned steps towards large scenes (still to come: water
-at rest that is not solved, a height-field far field, ships with compartments), so for now
-every stored cell is solved in full 3D in every step.
+are stored, and the ground is a height map. The numerics are the passes described above.
+Two of four planned steps towards large scenes are in: storage in bricks, and water at rest
+that is neither solved nor stored. Still to come: a height-field far field, and ships with
+compartments.
 
 **Storage** (`src/world/bricks.js`, `src/world/sparsesim.js`)
 
@@ -328,7 +334,7 @@ of a cell, capacity of a deposit target, where a scatter point comes from and go
   splash), same mass, same residual after the V-cycles. `?mode=run` then stores only the
   bricks around the liquid and checks the mass and the per-brick reports.
 
-In world mode itself three things differ from the dense solver, each for a reason:
+In world mode itself five things differ from the dense solver, each for a reason:
 
 1. A deposit of the advection or the sharpening whose stencil reaches a missing brick is
    normalised over the corners that exist, as at a wall.
@@ -338,6 +344,23 @@ In world mode itself three things differ from the dense solver, each for a reaso
 3. Coarse cells that are solid throughout are walls. The dense solver treats them as air with
    no volume, which is harmless for a tank with thin walls and made the V-cycle converge badly
    over terrain, where a large part of every coarse level is ground.
+4. A characteristic of the advection may end as deep inside a solid as it began, and a cell
+   that a solid fills almost completely takes its density from the cells beside it before
+   those above and below (`pushRel`, `sliverSide`: options of the dense solver too, off
+   there). As the tank simulators run, a current of 0.10 to 0.15 cells per step goes round
+   every solid that crosses a surface at rest, for good. Two causes: a characteristic that
+   ends inside a solid is moved to its surface, so a cut cell whose centre lies in the solid
+   is displaced even at rest, and what it asks of its neighbours and what it hands on do not
+   cancel; and a cell with almost no volume takes the larger density of all its neighbours,
+   including the one below, so the cell at the waterline counts as liquid. In a tank this
+   goes unnoticed among the slosh. Here water that never comes to rest can never be handed
+   back. `tests/waterline.html`: 0.157 cells per step without the options, 0.0001 to 0.0015
+   with them (box, tilted box, ball in a 64³ pool).
+5. A face that is closed because the brick behind it is missing stands still, and a face to
+   water at rest (below) counts as at rest. The `solid` pass gives every face the velocity of
+   the nearest obstacle, however far away; in a tank the nearest thing to a closed face is the
+   wall that closes it. In the open it was the nearest floating body, and a crate falling
+   through the air pushed the sea around before it arrived.
 
 **Which bricks exist.** After every step two passes reduce each brick to eight numbers: its
 mass, its fastest liquid, how many of its cells are wet, the bounding box of those, how many
@@ -351,7 +374,7 @@ brick, and looks only at bricks that raised a flag, about two per step in the sc
 * *Wet* means ρ > 1e-6. Advection and sharpening leave traces of 1e-9 and less around every
   splash; counting those as liquid stored the whole waterfall scene within seconds. What is
   left in a brick when it is dropped is added to an "evaporated" total, so the books below
-  still close: it came to 1e-3 cells of liquid out of 185 000 in the cascade run.
+  still close: it came to 2e-3 cells of liquid out of 187 000 in the cascade run.
 * *Never stored:* bricks that lie at least a cell and a half inside the ground or a fixed
   obstacle everywhere. They are marked in the page table so that the reports do not keep
   asking for them.
@@ -394,29 +417,152 @@ The two scenes (`tests/world.html?scene=…&time=1`, without drawing):
 | Cell size | 10 cm | 5 cm |
 | Scene | 16 m fall, river 3 m wide, 44 m × 22 m of terrain | six basins of 3.2 m × 3.6 m, 1.1 m apart in height |
 | After | 10 s | 15 s |
-| Bricks stored | 3961 | 3582 |
-| of those without a wet cell (the margin) | 1993 | 1815 |
-| Cells stored | 2.03 M | 1.83 M |
-| Cells in the box around them | 14.2 M (14 % stored) | 6.9 M (27 % stored) |
-| Bricks left out because they are in the ground | 1311 | 739 |
-| Step | 17.3 ms | 15.3 ms |
-| Per million stored cells | 8.6 ms | 8.8 ms |
-| in − (stored + out + evaporated), relative | 5.0e-6 | 2.4e-6 |
-| Fastest liquid | 6.5 cells per step | 3.5 cells per step |
+| Bricks stored | 3720 | 3757 |
+| of those without a wet cell (the margin) | 1803 | 1874 |
+| Cells stored | 1.91 M | 1.92 M |
+| Cells in the box around them | 11.2 M (17 % stored) | 8.6 M (22 % stored) |
+| Bricks left out because they are in the ground | 1236 | 743 |
+| Step | 16.5 ms | 15.2 ms |
+| Per million stored cells | 8.8 ms | 9.2 ms |
+| in − (stored + out + evaporated), relative | 5.0e-6 | 2.3e-6 |
+| Fastest liquid | 7.1 cells per step | 3.0 cells per step |
 | Wet cells at the edge of the stored bricks, bricks refused | 0, 0 | 0, 0 |
 
 A stored cell costs about 9 ms per million in a real scene against 5.5 for a full box and 3.6
 for the dense solver: there are more multigrid levels, the slots of neighbouring bricks are
 scattered over the pool, and the per-brick reports are read back every step. On top of that
 half of the stored bricks are margin: dry, but within reach. While the set of bricks changes
-quickly (water arriving in a new basin) a step costs up to 15 ms per million cells.
+quickly (water arriving in a new basin) a step costs up to 20 ms per million cells.
 
 The app at 1280×800, drawing included, runs the cascade at 60 frames per second up to
-1.7 million stored cells and at 37–52 beyond 2 million, the waterfall at 47–51; LibreWolf 156
+1.7 million stored cells and at 37–52 beyond 2 million, the waterfall at 52–55; LibreWolf 156
 gives the same rates.
 
 `node tools/interact.mjs world` drives the app: bricks follow the water, the books balance,
-pour / drain / push act under the pointer and conserve what they should, every scene runs.
+pour / drain / push act under the pointer and conserve what they should, every scene runs,
+a crate dropped with the crate tool lands in the sea.
+
+**Water at rest** (`src/world/water.js`, held bricks in `src/world/sparsesim.js`)
+
+A scene can name up to four bodies of water, each a level and an extent in x and z. Where
+such water is at rest it is not solved and mostly not stored. A brick below the level is
+
+* *solved*, as above;
+* *held*: stored, not solved. After the density passes of every step its cells are put back
+  to the state of rest, and the pressure solve treats them as cells whose pressure is known.
+  Every solved brick has the water at rest beside it stored like this, because to the solver
+  a missing brick is a wall;
+* or *implicit*: not stored. The renderer draws it from the level; nothing else touches it.
+
+The open sea of the scenes below is one line, `water: [{ box: [-1e6, -1e6, 1e6, 1e6], level:
+24.25 }]`, and costs nothing until something falls into it.
+
+*The state of rest* is the one the solver itself settles into: ρ′ = clamp(level − y, 0, 1)
+and p = G (θ + rows below the top liquid cell), G = g Δt / h, θ being where the ghost-fluid
+pressure solve puts the surface above the centre of the top liquid cell. That is not the
+hydrostatic pressure of the level. The two differ by up to 0.086 cells of head, and a held
+cell with the analytic value next to a solved one drives a steady flow.
+`tests/held.html?mode=rest` compares the formula with the dense solver at nine fill levels:
+within 9e-5 cells of head. (A top cell that is exactly half full is neither liquid nor air,
+and the dense solver does not keep that pool at rest. A thousandth of a cell to either side
+it does.)
+
+*Between solved and held water.* Sideways the faces are open and carry u = (p − p_rest) / Z
+in place of what the projection would give them: a boundary that lets out a wave travelling
+Z cells per step (Z = 1), entered into the pressure matrix as a coupling of that weight to a
+known pressure. A face that kept its own velocity next to a fixed pressure would be the open
+end of an organ pipe, which sends waves back upside down. What crosses into held cells is
+added up per brick before they are reset. Above and below, water at rest is a lid and a
+floor to solved water, stored or not: through an open floor the whole solved column moves up
+and down as one, with nothing but its own inertia against it. A solved brick next to a held
+one also damps the liquid, by up to a tenth of its velocity per step at the held face.
+
+*Waking and sleeping.* The per-brick reports also carry: how many cells are not at rest
+(faster than 0.02 cells per step, pressure more than 0.15 cells of head or density more than
+0.6 from rest), the bounding box of the cells faster than 0.06 ("waking"), the liquid above
+the state of rest, and what a held brick took in. From these, per report:
+
+* a solved brick is held after 60 steps at rest, or after 300 steps in which its surface and
+  pressure were at rest and nothing in it was as fast as waking (a splash leaves slow eddies
+  that nothing damps);
+* a held or implicit brick is solved when waking cells can reach it, when more than 0.03
+  cells per face cell and step flow into it, or when it lies within 8 cells of a body that
+  is awake, a scripted solid that moves, or the brush;
+* a brick stays solved for at least 30 steps, and for 120 after a body or the brush has left
+  it (a body that bobs moves the edge of its 8 cells back and forth across a brick boundary);
+* waves slower than 0.15 cells per step wake the same brick once in 10 s at most (`rewake`):
+  a brick at the edge of what a wake reaches would otherwise change state with every group
+  of waves. Faster water (something has fallen in, a bow wave) wakes it whenever it comes;
+* while 3000 bricks are solved only a body or the brush wakes more: the held bricks then
+  take the waves in;
+* a held brick with no solved brick beside it is dropped.
+
+Speed counts below the surface only. A surface that has moved stays smeared over two or
+three cells and is never quite at rest in its top cell.
+
+*The books.* With water that has no end, "mass is conserved" reads: liquid above the state
+of rest in the stored bricks − what solids displace + what the held bricks took in − what
+sources put in + what drains took and what evaporated is constant. The app shows the
+difference as *Unaccounted for*.
+
+*Rigid bodies* (`src/world/world.js`) are those of the tank simulators, with the terrain as
+one more thing to collide with; scripted solids follow a function of time. Forces are
+measured in the bricks around a body only. A body goes to sleep once, for 90 steps, it has
+moved less than 0.02 cells per step and its height has stayed within 0.1 cells: it stays
+where it is, and its water is free to come to rest and be handed back. (Slow alone is not
+enough. A buoy that bobs a quarter of a cell up and down is slow all the time, and was
+stopped at the bottom of its bob, 0.3 cells under its float line, every time.) It wakes
+when grabbed, when a moving body comes near, to water faster than 0.15 cells per step next
+to it, and to any waking water once that water has been at rest for 4 s. (The water a body
+stirred up itself must not wake it again.)
+
+Three scenes use this, and a *Crate* tool drops crates into any of them:
+
+| | Crate into open sea | Scattered buoys | Boat across a harbour |
+|---|---|---|---|
+| Cell size | 5 cm | 10 cm | 10 cm |
+| Scene | a 50 × 40 × 50 cm crate falls 1.2 m into a sea without shores or bed | five buoys up to 50 m apart; from 15 s on a 380 l lump of water drops next to one of them every 5 s | a 2.6 m launch goes round a 30 m × 13 m basin behind breakwaters once in 28 s; two buoys and a crate ride its wake |
+| Bricks stored at most (solved at most) | 715 (537) | 1138 (745) | 997 (709) |
+| Cells stored then, of those in the box around them | 0.37 M of 0.60 M | 0.58 M of 6.88 M | 0.51 M of 0.87 M |
+| Step, mean over 60 s | 2.3 ms | 14.6 ms | 13.9 ms |
+| Books off by, of the liquid stored at the peak | 3.3e-6 | 2.0e-5 | 3.4e-5 |
+| Bodies | crate asleep after 7.2 s | each lump wakes the buoy next to it and no other; asleep again 0.01 to 0.26 cells below the float line (half of the eight times within 0.08) | the buoys woken twice, once per round of the launch, the crate once; asleep 0.04 to 0.14 cells below their float lines |
+| Most changes between solved and held of one brick in 60 s | 2 | 6 | 9 |
+| Wet cells at the edge of the stored bricks, bricks refused | 0, 0 | 0, 0 | 0, 0 |
+
+(Chrome 154, RTX 3090, `tests/sea.html?scene=…&time=1`, without drawing. The step times
+were taken while another job kept the machine busy, a load of 26 to 33 on 32 threads; the
+app's own GPU timer read 7 to 12 ms per step with the buoys and in the harbour at the same
+time, and it draws all three scenes at 60 frames per second.)
+
+In the first scene nothing is stored from 10.8 s on: the crate is asleep, its waves have
+left, and the sea is a formula once more. Where water stays solved for the whole minute the
+books drift by 2 to 3e-5, which is the solver's own loss in the solved cells (the dense
+solver ends its scene of four floating bodies 1e-6 short per second). The buoys and the
+harbour cost more per cell than the waterfall: while a body is awake the pressure solve runs
+four V-cycles instead of two and the forces on the bodies are read back, and five islands
+far apart make nine multigrid levels.
+
+How far a wave travels before the sea counts as at rest is the waking speed. Halving both
+thresholds (`?p.wakeSpeed=0.03&p.sleepSpeed=0.01`) keeps the rings of the crate for longer
+and further out: 3235 bricks at the most instead of 715, and the sea is empty again after
+15.1 s instead of 10.8.
+
+`tests/held.html` checks the pieces on fixed sets of bricks in 2D and 3D: a pool with only
+its middle third solved stays at rest for 120 s with every column within 0.01 cells and no
+steady flow through the held faces (and for 20 s at 15 levels across a cell and 7 around a
+brick boundary; the sixteenth, a top cell exactly half full, is not at rest in the dense
+solver either); a brick held and released every 10 steps for 600 steps changes stored + absorbed
+by less than 1e-6; a block of water three cells high on the solved band has left through
+the held bricks after 4 s (the surface is back within 0.1 cells of rest); and a ball of
+water dropped into an open sea leaves nothing stored afterwards, also when the reports are
+acted on 1, 3 or 6 steps late or read back without blocking.
+
+`tests/sea.html` runs the three scenes for a minute each without drawing them and checks
+the books, the storage and the bodies (the table above). With `&lump=9` a ball of water
+lands 1.6 m from the crate nine seconds after it, on water that has just gone back to rest:
+it has to splash all the same (1040 bricks at the most) and leave nothing stored (after
+22 s).
 
 **Limits of world mode as it stands**
 
@@ -432,7 +578,24 @@ pour / drain / push act under the pointer and conserve what they should, every s
   only approximate (it is the vertical clearance scaled by the slope).
 * The per-brick reports are read back with a blocking call every step. A non-blocking variant
   (`reportAsync`) passes the same tests but needs a wider margin, hence more bricks.
-* No rigid bodies yet, and no 2D app (2D exists in the tests).
+* A body of water has a fixed level. What the held bricks take in is entered in the books
+  and gone: a lake does not rise when a river runs into it. (Levels that follow the volume
+  come with the height field.)
+* Waves slower than the waking speed (0.06 cells per step: 18 cm/s at 5 cm cells) end at the
+  held bricks instead of travelling on, and a held face only lets waves of one speed out
+  cleanly; others are partly reflected. Where the last ripples of a wake end is a straight
+  line along the bricks.
+* Water that waves have woken is not woken again for 10 s by waves slower than 0.15 cells
+  per step: the outer, slow rings of a second disturbance that soon after the first end
+  where the water is still solved.
+* Beyond the budget of 3000 solved bricks nothing more is woken by water. Liquid that falls
+  onto water at rest is then taken in by it without a splash.
+* A sleeping body stays exactly where it is until something wakes it, so a slow drift ends
+  when it goes to sleep.
+* With `pushRel` and `sliverSide` a slower flow remains at a tilted solid in a pool at rest:
+  0.03 to 0.05 cells per step in the dense 64³ test after 15 to 40 s. In the scenes the body
+  is asleep and its water handed back before that.
+* No 2D app (2D exists in the tests).
 
 ## Known limitations
 
@@ -474,7 +637,8 @@ src/bodies.js                  rigid bodies and contacts
 src/render2d.js, render3d.js   renderers
 src/scenes2d.js, scenes3d.js   scenarios
 src/world/                     world mode: bricks.js (page table), sparsesim.js (solver on bricks),
-                               terrain.js, world.js, scenes.js, render3d.js, app3d.js
+                               water.js (water at rest), terrain.js, world.js, scenes.js,
+                               render3d.js, app3d.js
 tests/, tools/                 headless diagnostics and interaction checks (puppeteer-core)
 docs/screenshots/              the pictures above (tools/screenshots.mjs regenerates them)
 ```

@@ -8,7 +8,7 @@
 //          leaf, or -1. Two groups that wrap onto the same entry cannot both exist; add() throws.
 //   leaf   the slot of each of its 16^dim bricks, -1 (not stored), or -2 (not stored and known
 //          to lie inside a solid throughout: see mark())
-//   slot   per slot: the brick's coordinate and whether the slot is in use
+//   slot   per slot: the brick's coordinate and its state (0 = slot not in use, 1 = solved, 2 = held)
 //
 // From these the owner renders `texNb` (SparseSim._buildNb): per slot, the slots of the bricks
 // around it, which is what the solver passes actually read.
@@ -173,6 +173,15 @@ export class BrickSet {
     this.dirty = this.dirtySlots = true;
     this.version++;
     return s;
+  }
+
+  /** State of the brick in slot s: 1 = solved, 2 = held (kept at the state of the water at rest; see SparseSim). */
+  state(s) { return this.slotData[4 * s + 3]; }
+
+  setState(s, v) {
+    if (!this.used[s] || this.slotData[4 * s + 3] === v) return;
+    this.slotData[4 * s + 3] = v;
+    this.dirty = this.dirtySlots = true;
   }
 
   /** Drop brick (x, y, z); returns the slot it had, or -1. */

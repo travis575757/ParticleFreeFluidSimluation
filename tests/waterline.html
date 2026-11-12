@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>a pool at rest with a solid across its surface</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// A pool at rest in the dense 3D solver with a solid that does not move standing across the
+// waterline. Nothing has a reason to move, but with the solver as the 2D and 3D apps run it a
+// steady current of 0.1 to 0.15 cells per step goes round the contact line (see TRACE_REL in
+// src/shaders/common.js and "liq" in src/shaders/sim.js for the two causes). The options
+// pushRel and sliverSide remove it; World mode runs with both, because water that never comes
+// to rest can never be handed back.
+//   checks: with both options the fastest liquid stays below 0.01 cells per step for 450 steps
+//           (box, tilted box, ball); without them the tilted box drives more than 0.05
+//   ?kinds=box,tilted,ball  &steps=  &p.<solver param>=
+import { GLContext } from '../src/gl.js';
+import { FluidSim } from '../src/sim.js';
+import { quatFromAxisAngle, quatToWorldToLocal } from '../src/bodies.js';
+
+const q = new URLSearchParams(location.search);
+const log = (s) => console.log(s);
+let failed = 0;
+const check = (ok, what) => { if (!ok) failed++; log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); };
+const params = {};
+for (const [k, v] of q) if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
+
+try {
+  if (document.readyState !== 'complete') await new Promise((r) => window.addEventListener('load', r));
+  const glc = new GLContext(document.getElementById('c'));
+  log(`readback ${glc.readback} | ${glc.renderer}`);
+  const n = 64, level = 30.25;
+  const steps = Number(q.get('steps') || 450);
+  const kinds = (q.get('kinds') || 'box,tilted,ball').split(',');
+
+  // the fastest liquid over the last third of the run, in cells per step
+  const run = (kind, options, count) => {
+    const sim = new FluidSim(glc, { dim: 3, nx: n, ny: n, nz: n, params: { h: 0.05, ...options, ...params } });
+    const walls = { type: 'box', inverted: true, center: [32, 32, 32], half: [30, 30, 30] };
+    const rot = quatToWorldToLocal(quatFromAxisAngle([1, 0, 0.6], kind === 'tilted' ? 0.5 : 0));
+    const body = kind === 'ball' ? { type: 'ball', center: [32, level + 1, 32], radius: 5, vel: [0, 0, 0] }
+      : { type: 'box', center: [32, level + 0.2, 32], half: [5, 4, 5], round: 1, rot, vel: [0, 0, 0], omega: [0, 0, 0] };
+    sim.reset([walls, body], [{ type: 'box', center: [32, level / 2, 32], half: [40, level / 2, 40], vel: [0, 0, 0] }]);
+    const mass0 = sim.measureSync().mass;
+    let fastest = 0, mass = mass0;
+    for (let i = 1; i <= count; i++) {
+      sim.step();
+      if (i % 30 === 0 || i === count) {
+        const s = sim.measureSync();
+        mass = s.mass;
+        if (i > (2 * count) / 3) fastest = Math.max(fastest, s.maxSpeed * sim.params.dt);
+      }
+    }
+    sim.dispose();
+    return { fastest, loss: Math.abs(mass - mass0) / mass0 };
+  };
+
+  for (const kind of kinds) {
+    const r = run(kind, { pushRel: 1, sliverSide: 1 }, steps);
+    check(r.fastest < 0.01 && r.loss < 1e-5, `${kind} at the waterline, pushRel and sliverSide on: fastest liquid ${r.fastest.toFixed(4)} cells/step after ${steps} steps (mass off by ${r.loss.toExponential(1)})`);
+    await new Promise((r2) => setTimeout(r2));
+  }
+  const ref = run('tilted', {}, Math.min(steps, 240));
+  check(ref.fastest > 0.05, `tilted box, the solver as the 2D and 3D apps run it: a current of ${ref.fastest.toFixed(4)} cells/step (what the options are for)`);
+  log(failed ? `${failed} check(s) failed` : 'all checks passed');
+} catch (e) {
+  console.log('FAIL  ' + (e.stack || e));
+  window.__error = String(e);
+}
+window.__done = true;
+</script>

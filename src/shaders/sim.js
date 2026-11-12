@@ -1,12 +1,16 @@
 // Simulation passes for "Mass-Conserving Eulerian Liquid Simulation" (Chentanez & Mueller, SCA 2012).
 // Section/equation numbers in comments refer to that paper unless another reference is named.
-import { header, TRACE, prims, EPSV, TERRAIN } from './common.js';
+import { header, TRACE as TRACE_ABS, TRACE_REL, prims, EPSV, TERRAIN, FAR } from './common.js';
 
 const VMIN = '0.05';   // floor on V when normalising row sums of nearly solid cells
 
 /** Pass sources for the `dense` or `sparse` grid backend (see header() in common.js). */
-export function simShaders(dim, floatLinear, backend = 'dense') {
+/**
+ * @param opts  { pushRel, sliverSide }: see PARAMS in sim.js. Off, the sources are those of the reference solver, to the letter.
+ */
+export function simShaders(dim, floatLinear, backend = 'dense', opts = {}) {
   const H = header(dim, floatLinear, backend);
+  const TRACE = opts.pushRel ? TRACE_REL : TRACE_ABS;
   const S = {};
 
   // ---------------------------------------------------------------- solids
@@ -31,7 +35,7 @@ vec2 sdSolids(vec3 x) {
 `;
   S.solid = `${H}
 uniform Grid G;
-${prims('S')}${terrain}
+${prims('S')}${terrain}${backend === 'sparse' ? FAR : ''}
 layout(location = 0) out vec4 oSdf;
 layout(location = 1) out vec4 oUs;
 layout(location = 2) out vec4 oFrac;
@@ -85,13 +89,32 @@ void main() {
   }
 #ifdef SPARSE
   // a face towards a cell that is not stored is closed (the far side of the cell would hold its
-  // other half): liquid cannot leave the stored set, and the pressure solve knows it
-  for (int d = 0; d < DIM; d++) if (!hasCell(G, gc - AX[d])) { W[d] = 0.0; A[d] = 0.0; }
+  // other half): liquid cannot leave the stored set, and the pressure solve knows it.
+  // Such a face stands still, as does the floor and the lid below: us is the velocity of the
+  // nearest obstacle however far away it is, and belongs to a face only if that obstacle is
+  // what closes it. (Left in, every face at the edge of the stored cells moved with the nearest
+  // body: a crate falling through the air pushed the water under it before it arrived.)
+  for (int d = 0; d < DIM; d++) if (!hasCell(G, gc - AX[d])) { if (W[d] > 0.0) us[d] = 0.0; W[d] = 0.0; A[d] = 0.0; }
+  // Water at rest (a held brick, see SparseSim) under solved cells is a floor to them, and a lid
+  // above them: held and solved cells exchange liquid sideways only. Through an open floor the
+  // whole solved column would move up and down as one (nothing but its own inertia resists),
+  // which is not what deep water does. Where the held cell is not full (the surface, air) the
+  // face stays open: spray falls into water at rest.
+  if (uWaterN > 0 && (gc.y & BM) == 0) {
+    int sb = slotOf(G, gc - AX[1]);
+    if (sb < G.tiles.x * G.tiles.y) {
+      bool heldBelow = texelFetch(uSl0, ivec2(sb % G.tiles.x, sb / G.tiles.x), 0).w > 1.5;
+      if (heldBelow != g_held && farState(g_held ? gc : gc - AX[1]).x >= 1.0) { if (W[1] > 0.0) us[1] = 0.0; W[1] = 0.0; A[1] = 0.0; }
+    }
+  }
 #endif
   oSdf = vec4(g, dc);
   oUs = vec4(us, 0.0);
   oFrac = vec4(A, clamp(0.5 + dc, 0.0, 1.0));
   oW = vec4(W, 0.0);
+#ifdef SPARSE
+  oW.a = g_held ? 1.0 : 0.0;    // held cells: see "coef"
+#endif
 }`;
 
   // ---------------------------------------------------------------- liquid classification
@@ -112,6 +135,27 @@ void main() {
   if (V >= uVthr) {
     rp = rho / V;
   } else {
+${opts.sliverSide ? `
+    // Option "sliverSide". The fullest neighbour deciding makes the cell at the waterline of a
+    // solid liquid because the cell below it is: the liquid stands a cell too high along the
+    // solid with no pressure to speak of at its top, and what is below it sinks, a steady current
+    // down the side of the solid. Here the cells beside it decide, those above and below only
+    // where there are none beside it: the cell is what the liquid next to it is, as in a pool at rest.
+    float along = 0.0;
+    bool beside = false;
+    for (int d = 0; d < DIM; d++) {
+      for (int s = -1; s <= 1; s += 2) {
+        ivec3 nb = c + s * AX[d];
+        if (!hasCell(G, nb)) continue;
+        ivec2 tn = texelOf(G, nb);
+        float Vn = texelFetch(uFrac, tn, 0).a;
+        if (Vn < uVthr) continue;
+        float r = texelFetch(uRho, tn, 0).r / Vn;
+        if (d == 1) along = max(along, r);
+        else { rp = max(rp, r); beside = true; }
+      }
+    }
+    if (!beside) rp = along;` : `
     for (int d = 0; d < DIM; d++) {
       for (int s = -1; s <= 1; s += 2) {
         ivec3 nb = c + s * AX[d];
@@ -120,7 +164,7 @@ void main() {
         float Vn = texelFetch(uFrac, tn, 0).a;
         if (Vn >= uVthr) rp = max(rp, texelFetch(uRho, tn, 0).r / Vn);
       }
-    }
+    }`}
   }
   o = vec4(0.5 - rp, V, 0.0, 0.0);
 }`;
@@ -577,6 +621,13 @@ void main() {
   v.z = sampleFast(uVel, G, back(xw) + vec3(0.0, 0.0, 0.5)).z;
   v.z = mix(v.z, uMouseVel.z, brush(xw));
 #endif
+#ifdef SPARSE
+  v.x *= spongeKeep(xu);
+  v.y *= spongeKeep(xv);
+#if DIM == 3
+  v.z *= spongeKeep(xw);
+#endif
+#endif
   o = vec4(v + uGravity * uDt, 0.0);
 }`;
 
@@ -631,6 +682,9 @@ void main() {
     W[d] = s / float(NC / 2);
   }
   oW = vec4(W, 0.0);
+#ifdef SPARSE
+  for (int k = 0; k < NC; k++) oW.a = max(oW.a, fetchC(uWF, GF, f + cornerOffset(k)).a);
+#endif
 }`;
 
   // Matrix coefficients of  sum_f W_f (p_i - p_nb) = b_i  with the ghost-fluid treatment of
@@ -658,7 +712,11 @@ uniform GridX GF;            // next finer level (uCoarse = 1)
 uniform sampler2D uLiqF;
 uniform sampler2D uWF;
 uniform sampler2D uCBF;     // its coefficients; .w = K
-layout(location = 0) out vec4 oA;   // xyz = coupling to low neighbours, w = diagonal
+#ifdef SPARSE
+uniform float uHeldInv;     // coarse levels: 1 / (distance to the centre of a held neighbour's nearest fine cell), else 0
+uniform float uHeldK;       // weight of a face between a solved and a held liquid cell (see "project")
+#endif
+layout(location = 0) out vec4 oA;   // xyz = coupling to low neighbours, w = diagonal (negative: held)
 layout(location = 1) out vec4 oB;   // xyz = coupling to high neighbours, w = K
 bool parentLiquid(ivec3 f) {
   ivec3 pc = f >> 1;
@@ -695,6 +753,18 @@ void main() {
   float phi = texelFetch(uLiq, t, 0).r;
   vec4 A = vec4(0.0);
   vec4 B = vec4(0.0);
+#ifdef SPARSE
+  // A held cell (water at rest that is not solved) keeps its pressure: no equation, diagonal -1.
+  // To its neighbours it is a liquid cell whose pressure is known, coupled with uHeldK times the
+  // weight of the face (see "project"). A coarse cell is held if one of its children is; its
+  // correction is zero, at the centre of its nearest fine cell, which lies 0.5 + 2^-(l+1)
+  // coarse cells from the centre of the neighbour (uHeldInv is 1 over that).
+  if (texelFetch(uW, t, 0).a > 0.5) {
+    oA = vec4(0.0, 0.0, 0.0, -1.0);
+    oB = vec4(0.0);
+    return;
+  }
+#endif
   if (phi < 0.0) {
     vec4 Wc = texelFetch(uW, t, 0);
     float diag = 0.0;
@@ -702,6 +772,12 @@ void main() {
       ivec3 lo = c - AX[d];
       if (Wc[d] > 0.0 && present(uLiq, G, lo)) {
         vec2 ln = fetchC(uLiq, G, lo).rg;
+#ifdef SPARSE
+        if (ln.r < 0.0 && fetchC(uW, G, lo).a > 0.5) {
+          if (uHeldInv > 0.0) diag += Wc[d] * uHeldK * uHeldInv;
+          else { A[d] = Wc[d] * uHeldK; diag += Wc[d] * uHeldK; }
+        } else
+#endif
         if (ln.r < 0.0) { A[d] = Wc[d]; diag += Wc[d]; }
         else if (!solidAir(ln)) diag += ghost(Wc[d], ln.r, phi);
       }
@@ -711,6 +787,12 @@ void main() {
         float w = texelFetch(uW, th, 0)[d];
         if (w > 0.0) {
           vec2 ln = texelFetch(uLiq, th, 0).rg;
+#ifdef SPARSE
+          if (ln.r < 0.0 && texelFetch(uW, th, 0).a > 0.5) {
+            if (uHeldInv > 0.0) diag += w * uHeldK * uHeldInv;
+            else { B[d] = w * uHeldK; diag += w * uHeldK; }
+          } else
+#endif
           if (ln.r < 0.0) { B[d] = w; diag += w; }
           else if (!solidAir(ln)) diag += ghost(w, ln.r, phi);
         }
@@ -775,6 +857,9 @@ void main() {
   vec2 l = texelFetch(uLiq, t, 0).rg;
   vec4 sc = texelFetch(uUs, t, 0);
   float b = 0.0;
+#ifdef SPARSE
+  if (texelFetch(uW, t, 0).a > 0.5) { o = vec4(0.0, -BIG, 0.0, 0.0); return; }   // held: no equation
+#endif
   if (l.r < 0.0) {
     vec4 Wc = texelFetch(uW, t, 0);
     vec4 uc = texelFetch(uVel, t, 0);
@@ -782,18 +867,36 @@ void main() {
     float divS = 0.0;
     bool interior = true;     // every open face leads to another liquid cell
     for (int d = 0; d < DIM; d++) {
-      div -= Wc[d] * (uc[d] - sc[d]);
+      float ul = uc[d] - sc[d];
       divS -= sc[d];
       ivec3 lo = c - AX[d];
+#ifdef SPARSE
+      // (a face towards a held liquid cell carries no velocity of its own: see "project". It
+      // counts as at rest, not as moving with the nearest obstacle: us is that obstacle's
+      // velocity however far away it is, and is added back below (divS).)
+      if (Wc[d] > 0.0 && hasCell(G, lo)) {
+        ivec2 tl = texelOf(G, lo);
+        if (texelFetch(uLiq, tl, 0).r >= 0.0) interior = false;
+        else if (texelFetch(uW, tl, 0).a > 0.5) ul = -sc[d];
+      }
+#else
       if (Wc[d] > 0.0 && hasCell(G, lo) && fetchC(uLiq, G, lo).r >= 0.0) interior = false;
+#endif
+      div -= Wc[d] * ul;
       ivec3 hi = c + AX[d];
       if (hasCell(G, hi)) {
         ivec2 th = texelOf(G, hi);
         float s = texelFetch(uUs, th, 0)[d];
-        float w = texelFetch(uW, th, 0)[d];
-        div += w * (texelFetch(uVel, th, 0)[d] - s);
+        vec4 wh = texelFetch(uW, th, 0);
+        float w = wh[d];
+        float uh = texelFetch(uVel, th, 0)[d] - s;
+        float lh = texelFetch(uLiq, th, 0).r;
+#ifdef SPARSE
+        if (lh < 0.0 && wh.a > 0.5) uh = -s;
+#endif
+        div += w * uh;
         divS += s;
-        if (w > 0.0 && texelFetch(uLiq, th, 0).r >= 0.0) interior = false;
+        if (w > 0.0 && lh >= 0.0) interior = false;
       }
     }
     float rp = 0.5 - l.r;
@@ -836,6 +939,9 @@ void main() {
       }
       p = max(r.y, s / A.w);
     } else {
+#ifdef SPARSE
+      if (A.w == 0.0)       // (negative: a held cell keeps its pressure)
+#endif
       p = 0.0;
     }
   }
@@ -927,6 +1033,14 @@ void main() {
 
   // Velocity update u -= grad p on every face that touches a liquid cell; solid faces take
   // the solid velocity.
+  // Sparse backend, the faces between a solved liquid cell and a held one (water at rest whose
+  // pressure is that of rest): they carry u = -uHeldK * (p_rest - p) and nothing of what they
+  // carried before. That is the condition of a boundary that lets waves out: the liquid leaves
+  // at a speed proportional to how far the pressure next to the boundary is above that of rest,
+  // u = (p - p_rest) / Z, Z = 1 / uHeldK being the speed of the waves in cells per step. A face
+  // that kept its velocity (u -= grad p, a fixed pressure next to it) would be the open end of
+  // an organ pipe instead: waves come back from it upside down, and the liquid moves fastest
+  // exactly there.
   S.project = `${H}
 uniform Grid G;
 uniform sampler2D uVel;
@@ -935,6 +1049,9 @@ uniform sampler2D uW;
 uniform sampler2D uLiq;
 uniform sampler2D uP;
 uniform float uInvThetaMax;
+#ifdef SPARSE
+uniform float uHeldK;
+#endif
 out vec4 o;
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
@@ -950,6 +1067,12 @@ void main() {
     ivec2 ta = texelOf(G, lo);
     float pa = texelFetch(uP, ta, 0).r;
     float fa = texelFetch(uLiq, ta, 0).r;
+#ifdef SPARSE
+    // a face between two held cells is at rest; one between a held and a solved cell is live
+    float ha = texelFetch(uW, ta, 0).a;
+    if (W.a > 0.5 && ha > 0.5) { v[d] = 0.0; continue; }
+    if (W.a != ha && fa < 0.0 && fb < 0.0) { v[d] = -uHeldK * (pb - pa); continue; }
+#endif
     if (fa < 0.0 && fb < 0.0) v[d] -= pb - pa;
     else if (fa < 0.0) v[d] += pa * min(uInvThetaMax, 1.0 - fb / fa);
     else if (fb < 0.0) v[d] -= pb * min(uInvThetaMax, 1.0 - fa / fb);

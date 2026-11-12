@@ -129,14 +129,31 @@ try {
     const err = await page.evaluate(() => window.__error || null);
     const s = err ? null : await stats();
     const m0 = err ? 0 : await page.evaluate(() => window.world.mass0);
-    const shown = err ? '' : await page.evaluate(() => document.querySelector('#panel').innerText.match(/In − out − stored\s*([^\n]+)/)?.[1] || '');
+    // (a scene with a sea keeps its books above the water at rest: World.balance; what it stores is
+    // one island round whatever moves, which fills the box around itself, so sparsity is not asked of it)
+    const bal = err ? 0 : await page.evaluate(async () => { await window.world.sim.settleLedger(); return { off: window.world.balance(), stored: window.world.sim.books.stored, sea: window.world.sim.water.length > 0 }; });
+    const shown = err ? '' : await page.evaluate(() => document.querySelector('#panel').innerText.match(/Unaccounted for\s*([^\n]+)/)?.[1] || '');
     const perf = err ? '' : await page.evaluate(() => document.querySelector('#panel').innerText.match(/Step \/ frame\s*([^\n]+)/)?.[1] || '');
-    const off = s ? Math.abs(m0 + s.added - s.removed - s.freed - s.mass) / Math.max(m0 + s.added, 1) : 1;
-    const ok = !err && Number.isFinite(s.mass) && s.cfl < 14 && off < 1e-4 && s.refused === 0 && s.bricks > 0 && s.cells < 0.8 * s.box;
+    const off = !s ? 1 : bal.sea ? Math.abs(bal.off) / Math.max(bal.stored, 1) : Math.abs(m0 + s.added - s.removed - s.freed - s.mass) / Math.max(m0 + s.added, 1);
+    const ok = !err && Number.isFinite(s.mass) && s.cfl < 14 && off < 1e-4 && s.refused === 0 && s.bricks > 0 && (bal.sea || s.cells < 0.8 * s.box);
     check(`scene "${sc}" runs`, ok, err || `${s.bricks} bricks = ${(s.cells / 1e6).toFixed(2)} M cells (${(100 * s.cells / s.box).toFixed(0)} % of the box around them), ` +
       `books off by ${off.toExponential(1)} (shown: ${shown}), fastest ${s.cfl.toFixed(1)} cells per step, ${perf}`);
     await shot('scene_' + sc);
   }
+  // the crate tool: a crate dropped into the open sea lands in it, and its water is stored
+  await page.goto(`http://localhost:${port}/world3d.html?scene=sea&capture`, { waitUntil: 'load' });
+  await page.waitForFunction(() => window.world?.time > 0.2 || window.__error, { timeout: 120000 });
+  await tool('crate');
+  const n0 = await page.evaluate(() => window.world.bodies.length);
+  await page.mouse.click(...at(0.3, 0.62));
+  await page.waitForFunction(() => window.world.time > 3.5 || window.__error, { timeout: 300000 });
+  const cr = await page.evaluate(() => {
+    const w = window.world, b = w.bodies[w.bodies.length - 1], set = w.sim.levels[0].set, B = w.sim.B;
+    return { n: w.bodies.length, y: b.pos[1] - w.scene.water[0].level, here: set.get(Math.floor(b.pos[0] / B), Math.floor((b.pos[1] - 2) / B), Math.floor(b.pos[2] / B)) >= 0,
+      shown: document.querySelector('#panel').innerText.match(/Bodies awake\s*([^\n]+)/)?.[1] || '' };
+  });
+  check('crate tool drops a crate into the sea', cr.n === n0 + 1 && Math.abs(cr.y) < 6 && cr.here, `${cr.n} bodies, the new one ${cr.y.toFixed(1)} cells above the surface, its water ${cr.here ? 'stored' : 'not stored'} (bodies awake: ${cr.shown})`);
+  await shot('crate');
   check('no page errors', errors.length === 0, errors.slice(0, 3).join(' | '));
 } catch (e) {
   console.log('FAIL  harness error: ' + (e.stack || e.message));

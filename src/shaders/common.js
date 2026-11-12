@@ -164,7 +164,8 @@ bool liveTexel(Grid g, ivec2 t) { return t.x < g.n.x * g.tx && t.y < int(floor(1
 
   // ---- sparse ----------------------------------------------------------------------------
   // Lookup textures of a grid level (kept by BrickSet, src/world/bricks.js):
-  //   uSl0  per slot: xyz = brick coordinate, w = 1 if in use
+  //   uSl0  per slot: xyz = brick coordinate, w = 0 if not in use, 2 if held, else 1 + m / 128,
+  //         m = which face neighbours are held (g_sponge)
   //   uNb0  per slot: the slots of the bricks up to NR bricks away on every axis. Where there is
   //         none: the null slot (first tile of the extra row of every pool), or the one after
   //         it if the brick is known to lie inside a solid (BrickSet.mark); both tiles hold
@@ -200,6 +201,9 @@ uniform int uCoarseSolids; // 1: coarse cells that are solid throughout are wall
 ivec3 g_frame = ivec3(0);  // corner cell of the brick the fragment (or scatter point) lies in
 ivec2 g_nb = ivec2(0);     // corner texel of that brick's block in uNb0
 bool g_live = true;
+bool g_held = false;       // that brick is held: its cells keep the state of the water at rest (see FAR)
+int g_sponge = 0;          // a solved brick: which of its face neighbours are held (bit 2 d: low side of axis d, bit 2 d + 1: high side)
+uniform float uSponge;     // damping per step at a held face
 ivec2 slotTexel(ivec2 tiles, int s, ivec3 l) {
 #if DIM == 2
   return ivec2((s % tiles.x) * TW + l.x, (s / tiles.x) * BS + l.y);
@@ -248,6 +252,8 @@ ivec3 enterSlot(Grid g, int s) {
   vec4 sl = texelFetch(uSl0, st, 0);
   ivec3 b = ivec3(sl.xyz);
   g_live = sl.w > 0.5;
+  g_held = sl.w > 1.5;
+  g_sponge = g_held ? 0 : int((sl.w - 1.0) * 128.0 + 0.5);
   g_frame = b * BS;
   g_nb = st * ivec2(NBW, NBS);
   return b;
@@ -318,6 +324,19 @@ vec4 sampleLin(sampler2D s, Grid g, vec3 x) {
   return r;
 }
 vec4 sampleFast(sampler2D s, Grid g, vec3 x) { return sampleLin(s, g, x); }
+// The share of its velocity that the liquid at frame position x keeps in a step. A solved brick
+// next to a held one is a sponge: the faces between held and solved cells are open, nothing
+// resists a flow in through one of them and out through the next, and rounding noise would
+// slowly drive one. The damping grows quadratically towards the held face.
+float spongeKeep(vec3 x) {
+  if (g_sponge == 0) return 1.0;
+  float s = 0.0;
+  for (int d = 0; d < DIM; d++) {
+    if ((g_sponge & (1 << (2 * d))) != 0) s = max(s, 1.0 - x[d] / float(BS));
+    if ((g_sponge & (2 << (2 * d))) != 0) s = max(s, x[d] / float(BS));
+  }
+  return 1.0 - uSponge * s * s;
+}
 // The centre of fine cell c lies a quarter of a coarse cell from the centre of its parent. Coarse
 // cells that are not present (not stored, or standing for no real cell) are left out and the
 // weights renormalised: at the edge of a box that is the edge replication of the dense backend.
@@ -415,6 +434,44 @@ vec3 trace(vec3 x, float dt) {
 }
 `;
 
+// TRACE with the option "pushRel" of FluidSim.
+//
+// As it stands, a characteristic that ends in a solid ends at its surface instead. The centre of
+// a cell that a solid cuts by more than half lies in the solid, so its characteristic is moved
+// even when nothing flows: such a cell asks the cells beside it for liquid and hands its own on,
+// every step, and the two do not cancel (the full cells are asked for more than they hold, the
+// cut one for less). Along a solid that crosses a surface at rest the cut cells of the surface
+// row fill up, their column counts as standing higher than the pool and sinks: a steady current
+// of a tenth of a cell per step down the side of the solid, which never stops.
+// Here a characteristic may end as deep in the solid as it began (the centre of its own cell),
+// not deeper. Without flow nothing is moved, and a pool at rest stays at rest.
+export const TRACE_REL = (() => {
+  const a = TRACE.indexOf('vec3 pushOut(vec3 x) {');
+  if (a < 0) throw new Error('TRACE_REL: pushOut not found');
+  return TRACE.slice(0, a) + `// a point deeper in a solid than d0 (<= 0) is moved out along the gradient, to that depth
+vec3 pushOut(vec3 x, float d0) {
+  vec4 s = sdfAt(x);
+  if (s.w < d0) {
+    float l = length(s.xyz);
+    if (l > 1.0e-6) x = clampDomain(x + s.xyz / l * (d0 - s.w));
+  }
+  return x;
+}
+// midpoint (RK2) characteristic trace over time dt (negative dt = backwards), optionally sub-stepped
+vec3 trace(vec3 x, float dt) {
+  float d0 = min(sdfAt(x).w, 0.0);
+  float h = dt / float(uTraceSteps);
+  for (int i = 0; i < 4; i++) {
+    if (i >= uTraceSteps) break;
+    vec3 k1 = velAt(x);
+    vec3 k2 = velAt(clampDomain(x + 0.5 * h * k1));
+    x = clampDomain(x + h * k2);
+  }
+  return pushOut(x, d0);
+}
+`;
+})();
+
 // Terrain: ground given by its height over x and z (2D: over x), as a texture of samples that
 // the shader interpolates linearly. Mirrored in JS by src/world/terrain.js.
 // The distance is the vertical clearance scaled by the slope: exact for a plane, and right to a
@@ -495,3 +552,44 @@ vec3 vel${P}(int i, vec3 x) {
 }
 `;
 }
+
+// Water at rest (src/world/water.js), for the sparse backend: up to MAX_WATER bodies, each a level
+// and an extent in x and z. farState(c) of world cell c: x = rho' (how full the cell is),
+// y = pressure. Outside every body both are zero.
+export const MAX_WATER = 4;
+export const FAR = `
+uniform int uWaterN;
+uniform vec4 uWaterBox[${MAX_WATER}];   // x0, z0, x1, z1 in cells, measured as the primitives are
+uniform vec4 uWaterLvl[${MAX_WATER}];   // level, row of the top liquid cell, its pressure, pressure step per row
+// does the brick whose corner cell is c hold water at rest? (SparseSim._farWet is the same test)
+bool farWetBrick(ivec3 c) {
+  vec3 r = vec3(c - uAnchor);
+  for (int i = 0; i < ${MAX_WATER}; i++) {
+    if (i >= uWaterN) break;
+    vec4 b = uWaterBox[i];
+    if (r.y >= uWaterLvl[i].x) continue;
+    if (r.x + float(BS) - 0.5 < b.x || r.x + 0.5 > b.z) continue;
+#if DIM == 3
+    if (r.z + float(BS) - 0.5 < b.y || r.z + 0.5 > b.w) continue;
+#endif
+    return true;
+  }
+  return false;
+}
+vec2 farState(ivec3 c) {
+  ivec3 r = c - uAnchor;
+  vec3 x = vec3(r) + 0.5;
+  for (int i = 0; i < ${MAX_WATER}; i++) {
+    if (i >= uWaterN) break;
+    vec4 b = uWaterBox[i];
+    if (x.x < b.x || x.x > b.z) continue;
+#if DIM == 3
+    if (x.z < b.y || x.z > b.w) continue;
+#endif
+    vec4 L = uWaterLvl[i];
+    float rows = L.y - float(r.y);
+    return vec2(clamp(L.x - float(r.y), 0.0, 1.0), rows >= 0.0 ? L.z + rows * L.w : 0.0);
+  }
+  return vec2(0.0);
+}
+`;

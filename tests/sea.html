@@ -1,0 +1,209 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>world scenes with water at rest: bricks, bodies and the books</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// Runs a world scene that has bodies of water at rest (src/world/scenes.js: sea, buoys,
+// harbour) without drawing it, and checks
+//   the books: liquid above the water at rest - what solids displaced + what the held bricks
+//     took in - what the sources put in + what the drains took + what evaporated stays constant
+//   the storage: no liquid at a face of a brick that is not stored, no brick refused, no brick
+//     changing between solved and held more than twice in 10 s (on average over the run)
+//   the bodies: they float where Archimedes puts them, and go to sleep; a body in the air
+//     above water at rest leaves it at rest
+//   and per scene what should be stored at the end (see below).
+//   ?scene=sea|buoys|harbour  &steps=  &every=  &p.<solver param>=  &w.<world param>=  &o.<scene option>=
+//   &async=1 (reports read back without blocking)  &time=1 (ms per step, synced)  &until=s (sources stop)
+//   &lump=s: after s seconds a ball of water drops 30 cells from the middle. With scene=sea&lump=9
+//     it lands on water that has just gone back to rest, which waves may not wake again yet
+//     (rewake): it has to splash all the same, and leave nothing stored afterwards.
+import { GLContext } from '../src/gl.js';
+import { World } from '../src/world/world.js';
+import { WORLD_SCENES } from '../src/world/scenes.js';
+
+const q = new URLSearchParams(location.search);
+const name = q.get('scene') || 'sea';
+const steps = Number(q.get('steps') || { sea: 1500, buoys: 1500, harbour: 1500 }[name] || 1200);
+const every = Number(q.get('every') || Math.max(1, Math.floor(steps / 10)));
+const params = {}, wparams = {}, opts = {};
+for (const [k, v] of q) {
+  if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
+  if (k.startsWith('w.')) wparams[k.slice(2)] = Number(v);
+  if (k.startsWith('o.')) opts[k.slice(2)] = Number(v);      // options of the scene's build()
+}
+if (q.get('async') === '1') params.reportAsync = 1;
+const log = (s) => console.log(s);
+let failed = 0;
+const check = (ok, what) => { if (!ok) failed++; log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); };
+
+try {
+  // (a long run must not hold up the page's load event, which the test runner waits for)
+  if (document.readyState !== 'complete') await new Promise((r) => window.addEventListener('load', r));
+  const glc = new GLContext(document.getElementById('c'));
+  log(`readback ${glc.readback} | ${glc.renderer}`);
+  const scene = WORLD_SCENES[name].build(opts);
+  if (q.get('until')) for (const e of scene.emitters || []) e.until = Number(q.get('until'));
+  const world = new World(glc, 3, scene, { params, world: wparams });
+  const sim = world.sim;
+  const level = scene.water[0].level;
+  const dt = sim.params.dt;
+  const flips = new Map(), trail = new Map();
+  let events = 0;
+  sim.onState = (x, y, z, what) => {
+    if (what !== 'wake' && what !== 'sleep') return;
+    const k = `${x},${y},${z}`;
+    flips.set(k, (flips.get(k) || 0) + 1);
+    if (q.get('dbg') === '1') trail.set(k, (trail.get(k) || '') + ` ${what[0]}${world.time.toFixed(1)}`);
+    events++;
+  };
+  log(`${name}: ${sim.bricks} bricks at the start, ${world.bodies.length} bodies, ${world.kin.length} scripted, liquid above the water at rest ${world.excess0.toFixed(1)} cells`);
+
+  // where a body floats at rest: the height of its centre above the surface (upright boxes)
+  const floatLine = (b) => {
+    if (b.density >= 1) return null;
+    if (b.shape === 'box') return b.half[1] * (1 - 2 * b.density);
+    // ball: the cap below the surface holds `density` of the volume
+    let lo = -b.radius, hi = b.radius;
+    for (let i = 0; i < 40; i++) {
+      const c = 0.5 * (lo + hi), d = b.radius - c;           // d: depth of the lowest point
+      const cap = Math.PI * d * d * (3 * b.radius - d) / 3;
+      if (cap > b.density * b.volume) lo = c; else hi = c;
+    }
+    return 0.5 * (lo + hi);
+  };
+
+  let edgeListed = 0, before = 0, beforeSteps = 0, beforeSolved = 0, peakBox = 0;
+  let edge = 0, worst = 0, peak = 0, peakSolved = 0, peakMass = 0, lastRep = null, lastStored = 0, tSum = 0, tN = 0;
+  let sleptAt = world.bodies.map(() => -1), wakes = world.bodies.map(() => 0), wasAsleep = world.bodies.map(() => false);
+  const timed = q.get('time') === '1';
+  const history = [];
+  for (let i = 1; i <= steps; i++) {
+    const t0 = performance.now();
+    // &freeze=step: from then on the bodies stay where they are (an experiment: what the water does without them moving)
+    if (i === Number(q.get('freeze'))) { world.bodies.forEach((b) => world._sleep(b)); world._sleepBodies = () => {}; }
+    if (q.get('lump') && i === Math.round(Number(q.get('lump')) / dt)) {
+      world.emitters.push({ prim: { type: 'ball', center: [30, level + 26, 10], radius: 4.5, vel: [0, -20, 0] }, from: world.time, until: world.time + 0.5 * dt });
+    }
+    world.step();
+    await world.forcesReady;
+    if (sim.params.reportAsync) await new Promise((r) => requestAnimationFrame(r));
+    if (timed) {
+      glc.read(sim.rho, 0, 0, 1, 1);
+      if (i > 20) { tSum += performance.now() - t0; tN++; }
+    }
+    const rep = sim.report;
+    if (rep && rep !== lastRep) {
+      lastRep = rep;
+      if (rep.edge && !edge) log(`  liquid at an open face first in the report of step ${rep.frame} (${rep.edge} cells), ${sim.bricks} bricks, ${sim.nHeld} held, fastest ${(rep.maxSpeed * dt).toFixed(3)} cells/step`);
+      if (rep.edge && q.get('dbg') === '1' && edgeListed < 3) {
+        // which bricks, and what is stored around them
+        edgeListed++;
+        const set = sim.levels[0].set, last = sim.reports.find((r) => r.data && r.frame === rep.frame);
+        if (!last) { log('    (that report is gone)'); continue; }
+        const A = last.data[0];
+        const st = (x, y, z) => { const t = set.get(x, y, z); return t < 0 ? '-' : set.state(t) === 2 ? 'h' : 's'; };
+        for (let k = 0; k < last.high; k++) {
+          if (!last.used[k] || !(A[4 * k + 2] > 0)) continue;
+          const [x, y, z] = [last.bx[k], last.by[k], last.bz[k]];
+          log(`    report of step ${last.frame}: brick ${x},${y},${z} (${st(x, y, z)}) has ${A[4 * k + 2]} cells at an open face, mass ${A[4 * k].toFixed(2)}, fastest ${(A[4 * k + 1] * dt).toFixed(3)}; stored around it -x ${st(x - 1, y, z)} +x ${st(x + 1, y, z)} -y ${st(x, y - 1, z)} +y ${st(x, y + 1, z)} -z ${st(x, y, z - 1)} +z ${st(x, y, z + 1)}`);
+        }
+      }
+      edge += rep.edge; peakMass = Math.max(peakMass, rep.mass);
+      // the crate still more than two cells above the sea
+      if (name === 'sea' && world.bodies[0].pos[1] - world.bodies[0].extent > level + 2) {
+        before = Math.max(before, rep.maxSpeed * dt);
+        beforeSolved = Math.max(beforeSolved, sim.bricks - sim.nHeld);
+        beforeSteps = i;
+      }
+    }
+    if (sim.bricks > peak) { peak = sim.bricks; peakBox = world.boundsCells(); }
+    peakSolved = Math.max(peakSolved, sim.bricks - sim.nHeld);
+    if (sim.bricks) lastStored = i;
+    world.bodies.forEach((b, k) => {
+      if (b.asleep && !wasAsleep[k]) sleptAt[k] = i;
+      if (!b.asleep && wasAsleep[k]) wakes[k]++;
+      wasAsleep[k] = b.asleep;
+    });
+    if (i % every === 0 || i === steps) {
+      sim.readLedger();
+      // (reports that arrive late: the liquid above rest and what was absorbed have to be those of the same report)
+      const ex = sim.params.reportAsync ? (sim.stored ? sim.stored.excess : world.excess0) : sim.excessSync();
+      const off = ex - sim.displaced + sim.absorbed - sim.added + sim.removed + sim.freedMass - world.excess0;
+      worst = Math.max(worst, Math.abs(off));
+      const st = sim.measureSync();
+      history.push({ i, bricks: sim.bricks, held: sim.nHeld });
+      log(`step ${i} (t = ${world.time.toFixed(1)} s): ${sim.bricks} bricks, ${sim.nHeld} held, ${sim.nlev} levels | above rest ${ex.toFixed(2)}, displaced ${sim.displaced.toFixed(2)}, absorbed ${sim.absorbed.toFixed(2)}, ` +
+        `in ${sim.added.toFixed(1)}, out ${sim.removed.toFixed(1)}, evaporated ${sim.freedMass.toExponential(1)}: off by ${off.toExponential(2)} | fastest ${(st.maxSpeed * dt).toFixed(3)} cells/step, residual ${st.residual.toExponential(1)} | ` +
+        world.bodies.map((b, k) => `${k}: y ${(b.pos[1] - level).toFixed(2)}${b.asleep ? ' asleep' : ` v ${(Math.hypot(...b.vel) * dt).toFixed(3)}`}`).join(', '));
+      if (!Number.isFinite(st.mass)) { worst = Infinity; break; }
+      await new Promise((r) => setTimeout(r));
+    }
+  }
+  if (timed) log(`${(tSum / tN).toFixed(2)} ms per step over the run`);
+  if (q.get('dbg') === '1') {
+    // what still moves at the end: the solved bricks by their fastest wet cell
+    const set = sim.levels[0].set;
+    sim.refreshSlotStats();
+    const s0 = glc.read(sim.R.s[0]).slice(), s1 = glc.read(sim.R.s[1]).slice(), s3 = glc.read(sim.R.s[3]).slice();
+    const rows = [];
+    let solved = 0, waking = 0, moving = 0, off = 0;
+    for (let k = 0; k < set.high; k++) {
+      if (!set.used[k] || set.state(k) === 2) continue;
+      solved++;
+      const aw = s3[4 * k + 2] % 4194304;
+      if (s3[4 * k] >= 0) waking++;
+      if (aw % 1024 > 0) moving++;
+      if (aw >= 1024) off++;
+      rows.push([s0[4 * k + 1] * dt, `${set.bx[k]},${set.by[k]},${set.bz[k]}: fastest wet cell ${(s0[4 * k + 1] * dt).toFixed(3)}, mass ${s0[4 * k].toFixed(1)}, ${s1[4 * k + 3]} wet cells, ` +
+        `${aw % 1024} cells moving, ${Math.floor(aw / 1024)} off, ${s3[4 * k] >= 0 ? 'waking' : 'not waking'}, calm ${sim.calm[k] || 0}, drift ${sim.drift[k] || 0}`]);
+    }
+    log(`at the end: ${solved} solved bricks, ${waking} with waking cells, ${moving} with cells that move, ${off} with pressure or density off; bodies at ` +
+      world.bodies.map((b) => b.pos.map((v) => (v / sim.B).toFixed(1)).join(',')).join(' | ') + ' (bricks)');
+    rows.sort((a, b) => b[0] - a[0]);
+    for (const r of rows.slice(0, Number(q.get('top') || 14))) log('  ' + r[1]);
+    // the bricks that changed state most often: w(oken) and s(ent to sleep) at these times
+    for (const [k, n] of [...flips].sort((a, b) => b[1] - a[1]).slice(0, 6)) log(`  brick ${k}: ${n} changes,${trail.get(k)}`);
+  }
+  const seconds = steps * dt;
+  log(`most bricks at once ${peak} (${peakSolved} solved at most): ${(peak * sim.B ** 3 / 1e6).toFixed(2)} M cells of ${(peakBox / 1e6).toFixed(2)} M in the box around them; ${events} changes between solved and held in ${flips.size} bricks`);
+
+  // (What the solver itself loses: the dense one ends its scene of four floating bodies 1e-6 of
+  // its liquid short per second, tests/basic3d.html?scene=floaters. An error in these books
+  // would be whole cells or bricks at once.)
+  const tolBooks = (1e-6 + 1e-6 * seconds) * Math.max(peakMass, 1);
+  check(worst <= tolBooks, `the books balance (off by at most ${worst.toExponential(1)} cells, allowed ${tolBooks.toExponential(1)}: ${(worst / Math.max(peakMass, 1)).toExponential(1)} of the ${peakMass.toFixed(0)} cells stored at the peak)`);
+  check(edge === 0 && sim.refused === 0, `no liquid at a face of a brick that is not stored (${edge}), no brick refused (${sim.refused})`);
+  let most = 0;
+  for (const v of flips.values()) most = Math.max(most, v);
+  // (twice in 10 s; three times where a boat comes round again and again)
+  const allowed = 2 * Math.ceil(seconds / 10);
+  check(most <= allowed, `no brick changes state more than ${allowed} times in ${seconds.toFixed(0)} s (most: ${most})`);
+
+  const afloat = world.bodies.map((b) => {
+    const f = floatLine(b);
+    return f === null ? 0 : b.pos[1] - level - f;
+  });
+  if (name === 'sea') {
+    // (the bricks under the crate are solved before it arrives; nothing in them has a reason to move)
+    check(beforeSteps > 0 && beforeSolved > 0 && before < 1e-3, `the water is at rest until the crate reaches it (fastest ${before.toExponential(1)} cells/step in ${beforeSolved} solved bricks during the first ${beforeSteps} steps)`);
+    check(sim.bricks === 0, `the sea is at rest again and nothing is stored (${sim.bricks} bricks left; the last one was dropped at step ${lastStored})`);
+    const b = world.bodies[0];
+    // (a box of this density does not float upright: only that it floats is checked)
+    check(b.asleep && Math.abs(b.pos[1] - level) < b.extent, `the crate floats and is asleep (centre ${(b.pos[1] - level).toFixed(2)} cells above the surface, asleep since step ${sleptAt[0]}, woken ${wakes[0]} times)`);
+  } else if (name === 'buoys') {
+    check(afloat.every((d) => Math.abs(d) < 0.75), `every buoy floats within 0.75 cells of its float line (${afloat.map((d) => d.toFixed(2)).join(', ')})`);
+    check(sleptAt.every((s) => s > 0), `every buoy went to sleep (last at steps ${sleptAt.join(', ')}; woken ${wakes.join(', ')} times)`);
+    const quiet = history.filter((h) => h.bricks === 0).length;
+    check(peakSolved < 3200, `the solved water stays within the budget (${peakSolved} bricks at most; nothing stored at ${quiet} of ${history.length} lines)`);
+  } else if (name === 'harbour') {
+    check(afloat.slice(0, 2).every((d) => Math.abs(d) < 1.5), `the buoys ride at the surface (${afloat.map((d) => d.toFixed(2)).join(', ')} cells from their float lines; the three bodies were woken ${wakes.join(', ')} times)`);
+    check(peakSolved < 3200, `the solved water stays within the budget (${peakSolved} bricks at most, ${sim.bricks - sim.nHeld} at the end)`);
+  }
+  log(failed ? `${failed} check(s) failed` : 'all checks passed');
+} catch (e) {
+  console.log('ERROR ' + (e.stack || e));
+  window.__error = String(e);
+}
+window.__done = true;
+</script>

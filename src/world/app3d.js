@@ -42,6 +42,8 @@ const v3 = {
   dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
 };
 
+let crates = 0;      // crates dropped with the tool (their colours)
+
 function frameCamera() {
   const c = world.scene.camera;
   camera.target = c.target.slice();
@@ -59,6 +61,7 @@ function loadScene(keepCamera = false) {
   if (q.has('until')) for (const e of scene.emitters) e.until = Number(q.get('until'));
   world = new World(glc, 3, scene, { params: state.overrides });
   window.world = world;
+  crates = 0;
   if (!keepCamera) frameCamera();
   const blurb = document.getElementById('blurb');
   if (blurb) blurb.textContent = WORLD_SCENES[state.scene].blurb;
@@ -101,8 +104,20 @@ canvas.addEventListener('pointerdown', (ev) => {
   pointer.pan = ev.button === 1 || (ev.button === 0 && ev.ctrlKey);
   pointer.orbit = !pointer.pan && (ev.button !== 0 || state.tool === 'orbit' || ev.shiftKey);
   canvas.style.cursor = pointer.orbit || pointer.pan ? 'grabbing' : 'crosshair';
+  if (state.tool === 'crate' && !pointer.orbit && !pointer.pan) dropCrate();
   ev.preventDefault();
 });
+
+/** A crate above the point under the pointer (one per click, while there is room in the table of solids). */
+function dropCrate() {
+  pointer.pos = actionPoint();
+  if (!pointer.pos || !world.canAddBody()) return;
+  const s = Math.max(3, state.brush * 0.6), a = crates * 2.4;
+  world.addBody({
+    shape: 'box', pos: v3.add(pointer.pos, [0, 14 + 2 * s, 0]), half: [s, s * 0.8, s], round: 1, density: 0.45, color: crates++,
+    quat: [0.17 * Math.cos(a), Math.sin(a / 2), 0.17 * Math.sin(a), Math.cos(a / 2)], omega: [0.3, 0, 0.2],
+  });
+}
 canvas.addEventListener('pointermove', (ev) => {
   const n = ndcOf(ev);
   const now = performance.now();
@@ -180,24 +195,26 @@ function buildPanel() {
     ['push', 'Push', 'Drag across the liquid to push it'],
     ['pour', 'Pour', 'Hold to add liquid under the pointer'],
     ['drain', 'Drain', 'Hold to remove liquid'],
+    ['crate', 'Crate', 'Click to drop a crate (its size follows the brush; up to twelve solids in a scene)'],
   ], state.tool, (v) => { state.tool = v; canvas.style.cursor = v === 'orbit' ? 'grab' : 'crosshair'; });
   P.slider('brush', 'Brush size (cells)', { min: 3, max: 16, step: 1, value: state.brush }, (v) => { state.brush = v; });
   P.note('Right-drag or Shift-drag orbits, middle-drag or Ctrl-drag moves the view, the wheel zooms.');
 
   P.section('View');
   P.checkbox('bricks', 'Show the stored bricks', state.overlay, (v) => { state.overlay = v; },
-    'Outlines of the 8 x 8 x 8 cell bricks that are stored: blue where they hold liquid, grey where they are kept as a margin around it.');
+    'Outlines of the 8 x 8 x 8 cell bricks that are stored: blue where they hold liquid, amber where they hold water at rest that is kept but not solved, grey where they are kept as a margin.');
   P.checkbox('mist', 'Show spray', state.mist, (v) => { state.mist = v; },
     'Density below the surface threshold of 0.5 (sheets and drops thinner than a cell) drawn as a white haze.');
   P.select('rs', 'Render scale', [[0.5, '50 %'], [0.75, '75 %'], [1, '100 %']], state.renderScale, (v) => { state.renderScale = Number(v); });
 
   P.section('Storage');
   readouts = P.stats([
-    ['bricks', 'Bricks stored', 'Bricks of 8 x 8 x 8 cells that exist right now (those inside the ground are never stored)'],
+    ['bricks', 'Bricks stored', 'Bricks of 8 x 8 x 8 cells that exist right now (those inside the ground are never stored), and how many of them hold water at rest that is kept but not solved. Water at rest away from anything that moves is not stored at all.'],
     ['cells', 'Cells stored', 'Cells the solver works on'],
     ['box', 'Box around them', 'Cells a dense grid over the same region would hold, and the share of it that is stored'],
-    ['budget', 'In − out − stored', 'The liquid the scene started with plus what the sources and the pour tool fed in, minus what the drains took, minus what is stored now: zero if nothing is lost (cells of liquid)'],
+    ['budget', 'Unaccounted for', 'The liquid the scene started with plus what the sources and the pour tool fed in, minus what the drains took, minus what is there now: zero if nothing is lost (cells of liquid). In a scene with a sea, what is there is counted above the water at rest, with what the bodies displace and what the water at rest has taken in.'],
     ['flow', 'In / out', 'Totals of the sources and of the drains, in cells of liquid'],
+    ['bodies', 'Bodies awake', 'Rigid bodies that are being stepped, of all there are. A body that has been slow for a while sleeps, and stops keeping the water around it solved, until that water moves again.'],
     ['cfl', 'Fastest liquid', 'Largest liquid speed in cells per time step (the limit of the brick storage is 14)'],
     ['perf', 'Step / frame', 'GPU time of one simulation step and frame rate'],
     ['gpu', 'Runs on', 'The whole solver executes as WebGL2 shader passes on this GPU'],
@@ -255,13 +272,13 @@ function updateStats() {
   const sim = world.sim;
   const rep = sim.report;
   const box = world.boundsCells();
-  readouts.bricks.textContent = `${sim.bricks}`;
+  readouts.bricks.textContent = sim.water.length ? `${sim.bricks} · ${sim.nHeld} at rest` : `${sim.bricks}`;
+  readouts.bodies.textContent = world.bodies.length ? `${world.bodies.filter((b) => !b.asleep).length} of ${world.bodies.length}` : '–';
   readouts.cells.textContent = fmt(sim.storedCells);
   readouts.box.textContent = box ? `${fmt(box)} · ${(100 * sim.storedCells / box).toFixed(1)} % stored` : '–';
   const bk = sim.books;
   if (bk) {
-    const off = world.mass0 + bk.added - bk.removed - bk.freed - bk.stored;
-    readouts.budget.textContent = `${off.toFixed(2)} of ${fmt(bk.stored)}`;
+    readouts.budget.textContent = `${world.balance().toFixed(2)} of ${fmt(bk.stored)}`;
     readouts.flow.textContent = `${fmt(bk.added)} / ${fmt(bk.removed)}`;
   }
   if (rep) readouts.cfl.textContent = (rep.maxSpeed * sim.params.dt).toFixed(1);

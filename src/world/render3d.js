@@ -2,12 +2,17 @@
 // levels: a group of 16 bricks per side without any brick (one fetch of the page table's top
 // level), a brick that is not stored, and the part of a stored brick that holds no liquid (the
 // per-brick statistics the solver keeps anyway). The ground is traced as a height field,
-// obstacles are sphere-traced analytically.
+// obstacles and bodies are sphere-traced analytically.
+//
+// Water at rest that is not stored (a body of water, src/world/water.js) is drawn from its
+// description: where no brick is stored, the liquid is what lies below the body's surface
+// inside its extent. The surface is put where the stored density of the same water at rest
+// crosses one half, so a brick that is stored or dropped does not move it.
 //
 // The density is first copied into a pool of its own in which every brick carries a border of
 // one cell from its neighbours: inside a brick the GPU's own filtering then gives a continuous
 // trilinear density from two fetches.
-import { header, prims, TERRAIN, BRICK } from '../shaders/common.js';
+import { header, prims, TERRAIN, FAR as FAR_FIELD, BRICK, MAX_PRIMS, MAX_WATER } from '../shaders/common.js';
 import { packPrims } from '../sim.js';
 
 export { Camera } from '../render3d.js';
@@ -29,6 +34,7 @@ export class WorldRenderer {
 uniform Grid G;
 uniform sampler2D uLiq;
 uniform int uVolRow;
+${FAR_FIELD}
 out vec4 o;
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
@@ -40,7 +46,11 @@ void main() {
   if (!g_live) return;
   int lx = t.x - tile.x * ${AT};
   ivec3 l = ivec3(lx % ${AP}, t.y - tile.y * ${AP}, lx / ${AP}) - 1;
-  o = vec4(max(0.5 - fetchC(uLiq, G, g_frame + l).r, 0.0), 0.0, 0.0, 0.0);
+  vec4 q = fetchC(uLiq, G, g_frame + l);
+  float d = max(0.5 - q.r, 0.0);
+  // a border cell that is not stored: the water at rest that belongs there, if any
+  if (q.g < 0.0 && uWaterN > 0) d = farState(g_frame + l).x;
+  o = vec4(d, 0.0, 0.0, 0.0);
 }`);
 
     const COMMON = `${H}
@@ -53,7 +63,9 @@ uniform sampler2D uS2;        // per slot: highest wet cell
 uniform float uStep;
 uniform float uTerMax;        // highest point of the ground
 ${TERRAIN}
+${FAR_FIELD}
 ${prims('S')}
+uniform float uKind[${MAX_PRIMS}];    // per primitive: 0 fixed obstacle, 1 scripted body, 2.. rigid body colours
 const float FAR = 20000.0;
 
 // slot of brick b, -1 if it is not stored (the top level of the page table wraps: the answer
@@ -83,6 +95,26 @@ vec2 boxHit(vec3 ro, vec3 inv, vec3 lo, vec3 hi) {
   vec3 a = min(t0, t1), b = max(t0, t1);
   return vec2(max(max(a.x, a.y), a.z), min(min(b.x, b.y), b.z));
 }
+// Where the ray is in water at rest inside the box lo..hi: x = entry, y = exit (x >= y: nowhere).
+// A body of water is everything below its surface within its extent; the surface is where the
+// density of the same water in stored cells, interpolated between their centres, crosses 0.5.
+vec2 waterSpan(vec3 ro, vec3 inv, vec3 lo, vec3 hi) {
+  vec2 best = vec2(1.0e9, -1.0e9);
+  vec3 an = vec3(uAnchor);
+  for (int i = 0; i < ${MAX_WATER}; i++) {
+    if (i >= uWaterN) break;
+    vec4 b = uWaterBox[i];
+    vec4 L = uWaterLvl[i];
+    float fa = min(L.x - L.y, 1.0), fb = max(L.x - L.y - 1.0, 0.0);     // fill of the top liquid row and of the row above
+    float top = L.y + 0.5 + (fa - 0.5) / (fa - fb);
+    vec3 l = max(lo, vec3(b.x, -1.0e9, b.y) + an);
+    vec3 h = min(hi, vec3(b.z, top, b.w) + an);
+    if (any(greaterThanEqual(l, h))) continue;
+    vec2 t = boxHit(ro, inv, l, h);
+    if (t.x < t.y && t.x < best.x) best = t;
+  }
+  return best;
+}
 // First place after t0 where the density crosses 0.5, away from the side the ray starts on
 // (inside: in liquid); -1 if there is none before tEnd. Adds up the density met in air (mist)
 // and, with uOverlay, lines along the edges of the stored bricks the ray enters.
@@ -102,6 +134,7 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
     vec3 lo = floor(p / size) * size;
     float tOut = max(boxHit(ro, inv, lo, lo + size).y, t + 2.0e-3);
     float tA = t, tB = tOut;
+    bool stored = s >= 0;
     if (s >= 0) {
       ivec2 st = ivec2(s % G.tiles.x, s / G.tiles.x);
       vec4 w1 = texelFetch(uS1, st, 0);
@@ -110,8 +143,10 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
         float w = 0.05 + 0.0012 * t;
         float e = float(q.x < w) + float(q.y < w) + float(q.z < w);
         if (e > 1.5) {
-          vec3 c = w1.w > 0.5 ? vec3(0.25, 0.85, 1.0) : vec3(0.75, 0.75, 0.8);
-          float a = (w1.w > 0.5 ? 0.40 : 0.16) * (1.0 - lines.a);
+          // solved with liquid, solved without (the margin), held (water at rest)
+          bool heldB = texelFetch(uSl0, st, 0).w > 1.5;
+          vec3 c = heldB ? vec3(1.0, 0.66, 0.22) : w1.w > 0.5 ? vec3(0.25, 0.85, 1.0) : vec3(0.75, 0.75, 0.8);
+          float a = (heldB ? 0.30 : w1.w > 0.5 ? 0.40 : 0.16) * (1.0 - lines.a);
           lines += vec4(c * a, a);
         }
       }
@@ -123,6 +158,20 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
       }
     }
     if (s < 0) {
+      if (!stored && uWaterN > 0) {
+        // nothing stored here: the water at rest of the bodies of water, if this is in one
+        vec2 w = waterSpan(ro, inv, lo, lo + size);
+        float wa = max(w.x, t), wb = min(w.y, tOut);
+        if (inside) {
+          // (the block was picked 2e-3 further along the ray: past a corner it is entered that much later)
+          if (wa >= wb || wa > t + 3.0e-3) return t;
+          if (wb < min(tOut, tEnd) - 1.0e-3) return wb;      // out through the surface or the side of the body of water
+          prev = 1.0;
+          t = tOut;
+          continue;
+        }
+        if (wa < wb && wa < tEnd) return wa;
+      }
       if (inside) return t;       // liquid ends where the wet cells do
       prev = 0.0;
       t = tOut;
@@ -143,6 +192,12 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
     }
     if (tB < tOut) { if (inside) return tB; prev = 0.0; }
     t = tOut;
+  }
+  if (!inside && uWaterN > 0) {
+    // out of steps (a long way over stored bricks): what is left is the water at rest
+    vec2 w = waterSpan(ro, inv, vec3(-1.0e9), vec3(1.0e9));
+    float wa = max(w.x, t);
+    if (wa < min(w.y, tEnd)) return wa;
   }
   return -1.0;
 }
@@ -278,7 +333,13 @@ vec3 shadeOpaque(vec3 p, float idx, float t) {
     n = normalize(vec3(sdS(p + vec3(e, 0.0, 0.0)).x - sdS(p - vec3(e, 0.0, 0.0)).x,
                        sdS(p + vec3(0.0, e, 0.0)).x - sdS(p - vec3(0.0, e, 0.0)).x,
                        sdS(p + vec3(0.0, 0.0, e)).x - sdS(p - vec3(0.0, 0.0, e)).x));
-    base = vec3(0.50, 0.44, 0.40);
+    float kind = uKind[int(idx)];
+    base = kind < 0.5 ? vec3(0.50, 0.44, 0.40)
+      : kind < 1.5 ? vec3(0.62, 0.20, 0.14)
+      : kind < 2.5 ? vec3(0.95, 0.60, 0.20)
+      : kind < 3.5 ? vec3(0.90, 0.33, 0.35)
+      : kind < 4.5 ? vec3(0.42, 0.78, 0.50)
+      : vec3(0.68, 0.55, 0.93);
   }
   float dif = max(dot(n, uLight), 0.0) * groundShadow(p + n * 0.3);
   vec3 c = base * (0.26 + 0.20 * (n.y * 0.5 + 0.5) + 1.0 * dif);
@@ -305,6 +366,9 @@ void main() {
     float c = clamp(dot(-rd, n), 0.0, 1.0);
     float F = 0.02 + 0.98 * pow(1.0 - c, 5.0);
     col = F * sky(reflect(rd, n));
+    // the surface itself is not spray: between the cell that is full and the one that is empty
+    // the density passes through everything below 0.5, over a cell or two (seen along the normal)
+    mist = max(mist - 0.45 / max(c, 0.1), 0.0);
     // into the liquid: how far the refracted ray travels in it, and what it lands on
     vec3 rr = refract(rd, n, 1.0 / IOR);
     rr = normalize(rr + vec3(equal(rr, vec3(0.0))) * 1.0e-6);
@@ -316,6 +380,8 @@ void main() {
     vec3 trans = exp(-vec3(0.075, 0.020, 0.010) * thick);
     float body = 1.0 - exp(-thick * 0.035);
     col += (1.0 - F) * trans * mix(behind, vec3(0.03, 0.30, 0.52), body * 0.75);
+    // deep water: what the light scattered in it sends back (nothing to speak of in a pool)
+    col += (1.0 - F) * vec3(0.010, 0.065, 0.120) * (1.0 - exp(-thick * 0.012));
   } else if (op.x > 0.0) {
     col = shadeOpaque(ro + rd * op.x, op.y, op.x);
   } else {
@@ -352,12 +418,15 @@ void main() {
       this.volRows = Math.ceil(rows * 1.5);
       this.vol = this.glc.texture(this.perRow * AT, this.volRows * AP, 'r16f', { linear: true });
     }
+    const kinds = new Float32Array(MAX_PRIMS);
+    kinds.set(world.solidKinds());
     return {
       ...sim._U(L0), ...sim._solidUniforms(),
       uVol: this.vol, uVolInv: [1 / this.vol.w, 1 / this.vol.h], uVolRow: this.perRow,
       uS1: sim.R.s[1], uS2: sim.R.s[2],
       uTerMax: world.terrain ? world.terrain.max : 0,
-      ...packPrims(world.solids, 'S', 3),
+      ...packPrims(world.solidPrims(), 'S', 3),
+      uKind: kinds,
       _rows: rows,
     };
   }

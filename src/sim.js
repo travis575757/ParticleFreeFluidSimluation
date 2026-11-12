@@ -18,6 +18,9 @@ export const DEFAULT_PARAMS = {
   // density advection (Sec. 3.4)
   advection: 1,          // 0 plain semi-Lagrangian (NOT conservative), 1 paper, 2 1/gamma row scale, 3 no gamma feedback
   traceSteps: 1,         // RK2 sub-steps per characteristic
+  pushRel: 0,            // 1 = a characteristic may end as deep in a solid as it began (TRACE_REL in shaders/common.js): with
+                         //     sliverSide, a pool stays at rest around a solid that crosses its surface. Both are fixed
+                         //     when the solver is built, like manualFilter.
   diffusionIters: 1,     // gamma diffusion sweeps per step ([LAF11] uses 1..7)
   diffusionPairs: 1,     // 1 = pairwise exchange as in [LAF11] (two passes per axis), 0 = both neighbours at once (Jacobi)
   diffusionLimit: 1,     // 1 = the exchange never moves liquid from an emptier cell into a fuller one
@@ -34,6 +37,7 @@ export const DEFAULT_PARAMS = {
   S: 1,                  // excess density is moved S cells out of the solid
   vthr: 0.1,             // cells with less non-solid volume take rho' from their neighbours
   closeSlivers: 1,       // faces between two such cells are closed (a sliver between two solids is not an air pocket)
+  sliverSide: 0,         // 1 = such a cell takes rho' from the cells beside it; from those above and below only if there are none (see pass "liq")
 
   // pressure (Sec. 3.7)
   lambda: 0.5,
@@ -132,7 +136,8 @@ export class FluidSim {
   // ------------------------------------------------------------------ setup
   _buildPrograms() {
     const glc = this.glc;
-    const S = simShaders(this.dim, glc.floatLinear && !this.params.manualFilter, this.backend);
+    const S = simShaders(this.dim, glc.floatLinear && !this.params.manualFilter, this.backend,
+      { pushRel: this.params.pushRel, sliverSide: this.params.sliverSide });
     const vs = this._passVS();
     const P = {};
     const fragmentPasses = ['solid', 'liq', 'extrapInit', 'extrapPull', 'extrapPush', 'advTrace',
@@ -243,6 +248,12 @@ export class FluidSim {
 
   /** What the backend adds to the solids (the sparse one: a terrain). */
   _solidUniforms() { return {}; }
+  /** What the backend adds to the matrix coefficients of level l ... */
+  _coefUniforms(l) { return {}; }
+  /** ... and to the right-hand side and the velocity update. */
+  _projectUniforms() { return {}; }
+  /** Called once the density of the step is final (the sparse backend resets its held bricks here). */
+  _afterDensity() {}
 
   _computeLiq() {
     const { prog: P, T } = this;
@@ -294,6 +305,7 @@ export class FluidSim {
     if (p.advection === 0) this._advectDensityPlain(p.dt);
     else this._advectDensity(p.dt);
     this._sharpen(p.dt);
+    this._afterDensity();
     this._advectVelocity(p.dt);
     this._project(p.dt);
     this.time += p.dt;
@@ -413,7 +425,7 @@ export class FluidSim {
     // (the finer-level inputs are unused on level 0; any texture that is not a target of the pass will do)
     this._draw(P.coef, [L0.cA, L0.cB], L0, {
       uLiq: L0.liq, uW: L0.W, uInvThetaMax: invThetaMax,
-      uCoarse: 0, uLiqF: L0.liq, uWF: L0.W, uCBF: L0.exB,
+      uCoarse: 0, uLiqF: L0.liq, uWF: L0.W, uCBF: L0.exB, ...this._coefUniforms(0),
     });
     for (let l = 1; l < this.nlev; l++) {
       const L = levels[l];
@@ -421,7 +433,7 @@ export class FluidSim {
       this._draw(P.downsample, [L.liq, L.W], L, { uLiqF: F.liq, uWF: F.W }, F);
       this._draw(P.coef, [L.cA, L.cB], L, {
         uLiq: L.liq, uW: L.W, uInvThetaMax: invThetaMax,
-        uCoarse: p.airLeak, uLiqF: F.liq, uWF: F.W, uCBF: F.cB,
+        uCoarse: p.airLeak, uLiqF: F.liq, uWF: F.W, uCBF: F.cB, ...this._coefUniforms(l),
       }, F);
     }
   }
@@ -436,10 +448,11 @@ export class FluidSim {
       uSrcScale: p.lambda / dt, uSrcMax: p.eta / dt, uSinkScale: p.compress / dt, uSinkMax: p.compressMax / dt,
       uSeparate: p.separate,
     });
+    const PU = this._projectUniforms();
     const cycles = this.twoWay ? Math.max(p.vcycles, p.vcyclesBodies) : p.vcycles;
     for (let i = 0; i < cycles; i++) this._vcycle(0);
     this._draw(P.project, T.vel[1], L0,
-      { uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uP: L0.p[0], uInvThetaMax: invThetaMax });
+      { uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uP: L0.p[0], uInvThetaMax: invThetaMax, ...PU });
     this._swap(T.vel);
   }
 

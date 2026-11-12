@@ -274,9 +274,10 @@ export class GLContext {
    * Additive point-scatter pass: `count` attribute-less points. The vertex shader takes the
    * point's index from `gl_VertexID + uBase`: browsers cap the number of vertices in one draw
    * call (Firefox at 30 million, and a larger draw is dropped with nothing but a console
-   * warning), so a large pass is drawn in pieces.
+   * warning), so a large pass is drawn in pieces. `ranges` ([[first, count], ...]) draws those
+   * points instead of all `count`.
    */
-  scatter(p, target, uniforms, count, { clear = false } = {}) {
+  scatter(p, target, uniforms, count, { clear = false, ranges = null } = {}) {
     const gl = this.gl;
     this._bindTarget(target);
     if (clear) { gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
@@ -287,9 +288,11 @@ export class GLContext {
     gl.blendFunc(gl.ONE, gl.ONE);
     const base = p.uniforms.get('uBase');
     if (!base) throw new Error(`Program "${p.label}": a scatter pass needs "uniform int uBase"`);
-    for (let first = 0; first < count; first += this.maxPointsPerDraw) {
-      if (first > 0) gl.uniform1i(base.loc, first);
-      gl.drawArrays(gl.POINTS, 0, Math.min(this.maxPointsPerDraw, count - first));
+    for (const [start, n] of ranges || [[0, count]]) {
+      for (let first = 0; first < n; first += this.maxPointsPerDraw) {
+        if (start + first > 0) gl.uniform1i(base.loc, start + first);
+        gl.drawArrays(gl.POINTS, 0, Math.min(this.maxPointsPerDraw, n - first));
+      }
     }
     gl.disable(gl.BLEND);
     this.passCount++;

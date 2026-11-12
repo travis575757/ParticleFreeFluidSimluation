@@ -30,6 +30,11 @@ const SHOTS = [
   { name: 'world-waterfall-bricks', page: 'world3d.html?scene=waterfall&bricks', steps: 420 },
   { name: 'world-cascade', page: 'world3d.html?scene=cascade', steps: 900 },
   { name: 'world-cascade-bricks', page: 'world3d.html?scene=cascade&bricks', steps: 900 },
+  { name: 'world-sea', page: 'world3d.html?scene=sea&dist=150&pitch=0.42', steps: 110 },
+  { name: 'world-sea-bricks', page: 'world3d.html?scene=sea&dist=150&pitch=0.42&bricks', steps: 110 },
+  { name: 'world-harbour', page: 'world3d.html?scene=harbour', steps: 600 },
+  { name: 'world-harbour-bricks', page: 'world3d.html?scene=harbour&bricks', steps: 600 },
+  { name: 'world-buoys-bricks', page: 'world3d.html?scene=buoys&bricks', steps: 1260 },
 ];
 
 const argv = process.argv.slice(2);
@@ -68,7 +73,7 @@ try {
       const info = await page.evaluate(async (k) => {
         for (let i = 0; i < k; i++) {
           window.app.stepOnce();
-          if (window.runner?.bodies.length) await window.runner.forcesReady;   // as in a real-time run
+          if ((window.runner || window.world).bodies.length) await (window.runner || window.world).forcesReady;   // as in a real-time run
           if (window.world && i % 50 === 49) await new Promise((r) => setTimeout(r));   // (a long run: let the page breathe)
         }
         const R = window.runner || window.world;
