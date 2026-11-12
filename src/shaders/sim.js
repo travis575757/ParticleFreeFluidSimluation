@@ -715,6 +715,7 @@ uniform sampler2D uCBF;     // its coefficients; .w = K
 #ifdef SPARSE
 uniform float uHeldInv;     // coarse levels: 1 / (distance to the centre of a held neighbour's nearest fine cell), else 0
 uniform float uHeldK;       // weight of a face between a solved and a held liquid cell (see "project")
+uniform int uHeldFloor;     // 1: on coarse levels held water above and below is a lid and a floor, as on the finest
 #endif
 layout(location = 0) out vec4 oA;   // xyz = coupling to low neighbours, w = diagonal (negative: held)
 layout(location = 1) out vec4 oB;   // xyz = coupling to high neighbours, w = K
@@ -759,6 +760,12 @@ void main() {
   // weight of the face (see "project"). A coarse cell is held if one of its children is; its
   // correction is zero, at the centre of its nearest fine cell, which lies 0.5 + 2^-(l+1)
   // coarse cells from the centre of the neighbour (uHeldInv is 1 over that).
+  // Sideways only. Above and below, held water is a lid and a floor to solved water (pass
+  // "solid" closes those faces), and it has to be one on the coarse levels too: their face
+  // weights are averages over three layers of fine faces, so the closed layer came out half
+  // open, and the coarse levels solved for a pool with its pressure fixed at the floor. Their
+  // corrections were too small by that much: 0.6 to 0.8 of the residual was left per V-cycle
+  // where a tank leaves 0.1 to 0.3.
   if (texelFetch(uW, t, 0).a > 0.5) {
     oA = vec4(0.0, 0.0, 0.0, -1.0);
     oB = vec4(0.0);
@@ -774,7 +781,7 @@ void main() {
         vec2 ln = fetchC(uLiq, G, lo).rg;
 #ifdef SPARSE
         if (ln.r < 0.0 && fetchC(uW, G, lo).a > 0.5) {
-          if (uHeldInv > 0.0) diag += Wc[d] * uHeldK * uHeldInv;
+          if (uHeldInv > 0.0) { if (d != 1 || uHeldFloor == 0) diag += Wc[d] * uHeldK * uHeldInv; }
           else { A[d] = Wc[d] * uHeldK; diag += Wc[d] * uHeldK; }
         } else
 #endif
@@ -789,7 +796,7 @@ void main() {
           vec2 ln = texelFetch(uLiq, th, 0).rg;
 #ifdef SPARSE
           if (ln.r < 0.0 && texelFetch(uW, th, 0).a > 0.5) {
-            if (uHeldInv > 0.0) diag += w * uHeldK * uHeldInv;
+            if (uHeldInv > 0.0) { if (d != 1 || uHeldFloor == 0) diag += w * uHeldK * uHeldInv; }
             else { B[d] = w * uHeldK; diag += w * uHeldK; }
           } else
 #endif

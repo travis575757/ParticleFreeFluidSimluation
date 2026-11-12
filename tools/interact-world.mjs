@@ -79,7 +79,9 @@ try {
   await drag(at(...a), at(...b), 14);
   const v1 = await speed();
   const s1 = await stats();
-  check('push tool moves the liquid', v1 > v0 + 0.15, `fastest ${v0.toFixed(2)} -> ${v1.toFixed(2)} cells per step`);
+  // (how fast depends on the frame rate, which sets how many steps the push acts for: 0.34 to 0.55
+  // cells per step in headless Firefox, 0.54 to 0.80 in Chrome)
+  check('push tool moves the liquid', v1 > v0 + 0.1, `fastest ${v0.toFixed(2)} -> ${v1.toFixed(2)} cells per step`);
   check('push tool conserves mass', Math.abs(s1.mass + s1.freed - s0.mass - s0.freed) < 1e-4 * s0.mass, `mass x${(s1.mass / s0.mass).toFixed(6)}`);
   await shot('push');
 

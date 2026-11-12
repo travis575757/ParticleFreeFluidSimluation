@@ -15,8 +15,9 @@ export const WORLD_PARAMS = {
   // of a cell per step within seconds.
   bodySleepSpeed: 0.02,
   // Slow is not enough: a buoy bobbing a quarter of a cell up and down is slow all the time, and
-  // would be stopped wherever in its bob it happened to be (low, as it turned out, every time).
-  // Its height must not have changed by more than this either (cells).
+  // would be stopped wherever in its bob it happened to be. Over the same steps its height must
+  // have stayed within a band of twice this (cells), and it is stopped as it passes the middle
+  // of that band: where it would come to rest by itself.
   bodySleepRange: 0.1,
   bodySleepAfter: 90,     // steps a body has to be at rest before it sleeps
   bodyArmAfter: 240,      // steps the water next to a sleeping body has to be at rest before moving water wakes the body
@@ -44,11 +45,12 @@ export class World {
    * @param scene  see src/world/scenes.js:
    *   { h, params, terrain: { origin, spacing, n, height }, solids: [prims], liquid: [prims],
    *     water: [{ box: [x0, z0, x1, z1], level }]   bodies of water at rest (SparseSim.setWater),
+   *     swell: { center: [x, z], params }            the map of their surface (src/world/swell.js),
    *     bodies: [body specs]                         rigid bodies (src/bodies.js),
    *     kinematic: (t) => [body specs]               bodies that follow a script (3D: `yaw` turns them about y),
    *     emitters: [{ prim, from, until, every, for }], drains: [{ prim }] }
    */
-  constructor(glc, dim, scene, { params = {}, bricks = {}, world = {} } = {}) {
+  constructor(glc, dim, scene, { params = {}, bricks = {}, world = {}, swell = {} } = {}) {
     this.glc = glc;
     this.dim = dim;
     this.scene = scene;
@@ -61,7 +63,12 @@ export class World {
     this.sim.solidBrick = staticSolidTest(dim, this.terrain, this.solids);
     // what the bodies can touch that never moves
     this.statics = [...(this.terrain ? [this.terrain] : []), ...this.solids.map((p) => new Obstacle(dim, p))];
-    this.sim.setWater(scene.water || []);
+    // (the map of the surface is laid out around what the scene's camera looks at)
+    const sw = scene.swell || {};
+    this.sim.setWater(scene.water || [], {
+      center: sw.center || (scene.camera ? [scene.camera.target[0], scene.camera.target[2]] : [0, 0]),
+      params: { ...sw.params, ...swell },
+    });
     this.reset();
   }
 
@@ -152,6 +159,7 @@ export class World {
     b.asleep = false;
     b.kinematic = false;
     b.still = 0;
+    b.heights = [];
   }
 
   _sleep(b) {
@@ -188,9 +196,16 @@ export class World {
             movers.some((o) => len([o.pos[0] - b.pos[0], o.pos[1] - b.pos[1], o.pos[2] - b.pos[2]]) < o.extent + b.extent + 2)) this.wake(b);
         continue;
       }
-      if (b.grabbed || moves(b) || !(Math.abs(b.pos[1] - b.stillAt) <= P.bodySleepRange)) { b.still = 0; b.stillAt = b.pos[1]; }
-      else b.still++;
-      if (b.still >= P.bodySleepAfter) this._sleep(b);
+      const ys = b.heights || (b.heights = []);
+      const before = ys.length ? ys[ys.length - 1] : b.pos[1];
+      ys.push(b.pos[1]);
+      if (ys.length > P.bodySleepAfter) ys.shift();
+      b.still = b.grabbed || moves(b) ? 0 : b.still + 1;
+      if (b.still < P.bodySleepAfter) continue;
+      let lo = Infinity, hi = -Infinity;
+      for (const y of ys) { lo = Math.min(lo, y); hi = Math.max(hi, y); }
+      const mid = 0.5 * (lo + hi);
+      if (hi - lo <= 2 * P.bodySleepRange && (before - mid) * (b.pos[1] - mid) <= 0) this._sleep(b);
     }
   }
 

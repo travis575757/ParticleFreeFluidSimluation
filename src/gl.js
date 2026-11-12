@@ -3,6 +3,7 @@
 
 const FORMATS = {
   r16f: { internal: 'R16F', format: 'RED', channels: 1, half: true },   // filters linearly without an extension
+  rgba16f: { internal: 'RGBA16F', format: 'RGBA', channels: 4, half: true },
   r32f: { internal: 'R32F', format: 'RED', channels: 1 },
   rg32f: { internal: 'RG32F', format: 'RG', channels: 2 },
   rgba32f: { internal: 'RGBA32F', format: 'RGBA', channels: 4 },

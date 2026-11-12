@@ -143,6 +143,8 @@ export const WORLD_SCENES = {
         h: 0.1,
         terrain: { origin: [-280, -230], spacing: 2, n: [281, 161], height },
         water: [{ box: [-1e6, -1e6, 1e6, 76], level }],
+        // (the waves of the map run on water as deep as the basin)
+        swell: { params: { depth: level - bed } },
         liquid: [],
         kinematic: (t) => [boat(t)],
         bodies: [

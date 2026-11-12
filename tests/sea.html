@@ -10,14 +10,17 @@
 //     took in - what the sources put in + what the drains took + what evaporated stays constant
 //   the storage: no liquid at a face of a brick that is not stored, no brick refused, no brick
 //     changing between solved and held more than twice in 10 s (on average over the run)
-//   the bodies: they float where Archimedes puts them, and go to sleep; a body in the air
-//     above water at rest leaves it at rest
+//   the bodies: they float where Archimedes puts them, go to sleep, and are at their float
+//     lines when they do; a body in the air above water at rest leaves it at rest
 //   and per scene what should be stored at the end (see below).
 //   ?scene=sea|buoys|harbour  &steps=  &every=  &p.<solver param>=  &w.<world param>=  &o.<scene option>=
 //   &async=1 (reports read back without blocking)  &time=1 (ms per step, synced)  &until=s (sources stop)
-//   &lump=s: after s seconds a ball of water drops 30 cells from the middle. With scene=sea&lump=9
-//     it lands on water that has just gone back to rest, which waves may not wake again yet
-//     (rewake): it has to splash all the same, and leave nothing stored afterwards.
+//   &lump=s: after s seconds a ball of water drops 30 cells from the middle (&lumpAt=x,z: there).
+//     With scene=sea&lump=9 it lands on water that has just gone back to rest, which waves may
+//     not wake again yet (rewake): it has to splash all the same, and leave nothing stored
+//     afterwards. With scene=sea&lump=2&lumpAt=150,0&p.maxSolved=400 it lands on water at rest
+//     while the waves of the crate use up the whole budget of solved bricks: the calmest of
+//     those have to make room (&p.evict=0: they do not, and the sea takes the lump in without a splash).
 import { GLContext } from '../src/gl.js';
 import { World } from '../src/world/world.js';
 import { WORLD_SCENES } from '../src/world/scenes.js';
@@ -74,8 +77,11 @@ try {
   };
 
   let edgeListed = 0, before = 0, beforeSteps = 0, beforeSolved = 0, peakBox = 0;
-  let edge = 0, worst = 0, peak = 0, peakSolved = 0, peakMass = 0, lastRep = null, lastStored = 0, tSum = 0, tN = 0;
+  let edge = 0, worst = 0, peak = 0, peakSolved = 0, peakMass = 0, lastRep = null, lastStored = 0, lastMapped = 0, mapThen = null, tSum = 0, tN = 0;
   let sleptAt = world.bodies.map(() => -1), wakes = world.bodies.map(() => 0), wasAsleep = world.bodies.map(() => false);
+  const lumpAt = (q.get('lumpAt') || '30,10').split(',').map(Number);
+  let lumpStep = 0, splash = 0, solvedThen = 0;
+  const bob = world.bodies.map(() => []), rests = [];     // heights above the float line: while awake; on going to sleep
   const timed = q.get('time') === '1';
   const history = [];
   for (let i = 1; i <= steps; i++) {
@@ -83,7 +89,8 @@ try {
     // &freeze=step: from then on the bodies stay where they are (an experiment: what the water does without them moving)
     if (i === Number(q.get('freeze'))) { world.bodies.forEach((b) => world._sleep(b)); world._sleepBodies = () => {}; }
     if (q.get('lump') && i === Math.round(Number(q.get('lump')) / dt)) {
-      world.emitters.push({ prim: { type: 'ball', center: [30, level + 26, 10], radius: 4.5, vel: [0, -20, 0] }, from: world.time, until: world.time + 0.5 * dt });
+      world.emitters.push({ prim: { type: 'ball', center: [lumpAt[0], level + 26, lumpAt[1]], radius: 4.5, vel: [0, -20, 0] }, from: world.time, until: world.time + 0.5 * dt });
+      lumpStep = i;
     }
     world.step();
     await world.forcesReady;
@@ -118,9 +125,31 @@ try {
       }
     }
     if (sim.bricks > peak) { peak = sim.bricks; peakBox = world.boundsCells(); }
+    if (lumpStep) {
+      // the splash of the lump: the solved bricks within three of where it lands, at the most
+      if (i === lumpStep) solvedThen = sim.bricks - sim.nHeld;
+      const set = sim.levels[0].set, B = sim.B;
+      const cx = Math.floor(lumpAt[0] / B), cy = Math.floor(level / B), cz = Math.floor(lumpAt[1] / B);
+      let near = 0;
+      for (let z = cz - 3; z <= cz + 3; z++) for (let y = cy - 2; y <= cy; y++) for (let x = cx - 3; x <= cx + 3; x++) { const t = set.get(x, y, z); if (t >= 0 && set.state(t) !== 2) near++; }
+      splash = Math.max(splash, near);
+    }
     peakSolved = Math.max(peakSolved, sim.bricks - sim.nHeld);
+    // (what the map of the surface holds at the moment the last brick is dropped: the rings on their way out, and nothing else)
+    if (sim.swell && !sim.bricks && lastStored === i - 1 && i > 1) mapThen = sim.swell.peakSync();
     if (sim.bricks) lastStored = i;
+    if (sim.swell && sim.swell.active) lastMapped = i;
+    // (the map looks at itself without blocking, which needs the page to come up for air)
+    if (sim.swell && i % 20 === 0) await new Promise((r) => setTimeout(r));
     world.bodies.forEach((b, k) => {
+      const f = floatLine(b);
+      if (f !== null && !b.asleep && i % 4 === 0) bob[k].push(b.pos[1] - level - f);
+      if (b.asleep && !wasAsleep[k]) {
+        if (f !== null) rests.push({ k, i, d: b.pos[1] - level - f });
+        // &bob=1: where it was every fourth step of the last four seconds before it went to sleep
+        if (q.get('bob') === '1') log(`  body ${k} asleep at step ${i}, ${(b.pos[1] - level - (f ?? 0)).toFixed(3)} from its float line; before: ${bob[k].slice(-60).map((v) => v.toFixed(2)).join(' ')}`);
+        bob[k] = [];
+      }
       if (b.asleep && !wasAsleep[k]) sleptAt[k] = i;
       if (!b.asleep && wasAsleep[k]) wakes[k]++;
       wasAsleep[k] = b.asleep;
@@ -135,7 +164,8 @@ try {
       history.push({ i, bricks: sim.bricks, held: sim.nHeld });
       log(`step ${i} (t = ${world.time.toFixed(1)} s): ${sim.bricks} bricks, ${sim.nHeld} held, ${sim.nlev} levels | above rest ${ex.toFixed(2)}, displaced ${sim.displaced.toFixed(2)}, absorbed ${sim.absorbed.toFixed(2)}, ` +
         `in ${sim.added.toFixed(1)}, out ${sim.removed.toFixed(1)}, evaporated ${sim.freedMass.toExponential(1)}: off by ${off.toExponential(2)} | fastest ${(st.maxSpeed * dt).toFixed(3)} cells/step, residual ${st.residual.toExponential(1)} | ` +
-        world.bodies.map((b, k) => `${k}: y ${(b.pos[1] - level).toFixed(2)}${b.asleep ? ' asleep' : ` v ${(Math.hypot(...b.vel) * dt).toFixed(3)}`}`).join(', '));
+        world.bodies.map((b, k) => `${k}: y ${(b.pos[1] - level).toFixed(2)}${b.asleep ? ' asleep' : ` v ${(Math.hypot(...b.vel) * dt).toFixed(3)}`}`).join(', ') +
+        (sim.swell ? ` | map ${sim.swell.active ? `in use, waves up to ${sim.swell.peak[0].toFixed(3)} cells, ${(sim.swell.peak[1] * dt).toExponential(1)} cells/step` : 'off'}` : ''));
       if (!Number.isFinite(st.mass)) { worst = Infinity; break; }
       await new Promise((r) => setTimeout(r));
     }
@@ -174,12 +204,14 @@ try {
   const tolBooks = (1e-6 + 1e-6 * seconds) * Math.max(peakMass, 1);
   check(worst <= tolBooks, `the books balance (off by at most ${worst.toExponential(1)} cells, allowed ${tolBooks.toExponential(1)}: ${(worst / Math.max(peakMass, 1)).toExponential(1)} of the ${peakMass.toFixed(0)} cells stored at the peak)`);
   check(edge === 0 && sim.refused === 0, `no liquid at a face of a brick that is not stored (${edge}), no brick refused (${sim.refused})`);
+  if (lumpStep) check(splash >= 18, `the lump splashes: up to ${splash} of the 147 bricks around where it lands are solved (${solvedThen} bricks were solved when it was let go, the budget is ${sim.params.maxSolved || 3000}; ${sim.evicted} bricks were sent to sleep to make room)`);
   let most = 0;
   for (const v of flips.values()) most = Math.max(most, v);
   // (twice in 10 s; three times where a boat comes round again and again)
   const allowed = 2 * Math.ceil(seconds / 10);
   check(most <= allowed, `no brick changes state more than ${allowed} times in ${seconds.toFixed(0)} s (most: ${most})`);
 
+  const restRange = (list) => (list.length ? `${Math.min(...list.map((r) => r.d)).toFixed(3)} to ${Math.max(...list.map((r) => r.d)).toFixed(3)}` : 'never');
   const afloat = world.bodies.map((b) => {
     const f = floatLine(b);
     return f === null ? 0 : b.pos[1] - level - f;
@@ -188,16 +220,30 @@ try {
     // (the bricks under the crate are solved before it arrives; nothing in them has a reason to move)
     check(beforeSteps > 0 && beforeSolved > 0 && before < 1e-3, `the water is at rest until the crate reaches it (fastest ${before.toExponential(1)} cells/step in ${beforeSolved} solved bricks during the first ${beforeSteps} steps)`);
     check(sim.bricks === 0, `the sea is at rest again and nothing is stored (${sim.bricks} bricks left; the last one was dropped at step ${lastStored})`);
+    // (the map of the surface carries the rings on after that, and is switched off once they are too low to see)
+    if (sim.swell) {
+      // (0.08 cells without a lump, 0.13 to 0.14 with one, whose rings are younger; the underside of the crate taken for the surface: 2.2)
+      const most = lumpStep ? 0.3 : 0.12;
+      check(mapThen && mapThen[0] < most, `when the last brick was dropped the map of the surface held waves of ${mapThen ? mapThen[0].toFixed(3) : '?'} cells at the most (allowed ${most}: no dent where the crate floats)`);
+      // (it takes the map about 26 s from there to calm down)
+      const said = `in use until step ${lastMapped}; waves of ${sim.swell.peak[0].toExponential(1)} cells when last looked at`;
+      if (steps - lastStored >= 30 / dt) check(!sim.swell.active, `the map of the surface is switched off again (${said})`);
+      else log(`      the map of the surface: ${sim.swell.active ? `still ${said}` : `switched off (${said})`}; the run ends ${((steps - lastStored) * dt).toFixed(0)} s after the last brick was dropped`);
+    }
     const b = world.bodies[0];
     // (a box of this density does not float upright: only that it floats is checked)
     check(b.asleep && Math.abs(b.pos[1] - level) < b.extent, `the crate floats and is asleep (centre ${(b.pos[1] - level).toFixed(2)} cells above the surface, asleep since step ${sleptAt[0]}, woken ${wakes[0]} times)`);
   } else if (name === 'buoys') {
     check(afloat.every((d) => Math.abs(d) < 0.75), `every buoy floats within 0.75 cells of its float line (${afloat.map((d) => d.toFixed(2)).join(', ')})`);
+    check(rests.length >= 5 && rests.every((r) => Math.abs(r.d) < 0.1), `each of the ${rests.length} times a buoy went to sleep it was within 0.1 cells of its float line (${restRange(rests)})`);
     check(sleptAt.every((s) => s > 0), `every buoy went to sleep (last at steps ${sleptAt.join(', ')}; woken ${wakes.join(', ')} times)`);
     const quiet = history.filter((h) => h.bricks === 0).length;
     check(peakSolved < 3200, `the solved water stays within the budget (${peakSolved} bricks at most; nothing stored at ${quiet} of ${history.length} lines)`);
   } else if (name === 'harbour') {
     check(afloat.slice(0, 2).every((d) => Math.abs(d) < 1.5), `the buoys ride at the surface (${afloat.map((d) => d.toFixed(2)).join(', ')} cells from their float lines; the three bodies were woken ${wakes.join(', ')} times)`);
+    const buoys = rests.filter((r) => r.k < 2), crate = rests.filter((r) => r.k === 2);
+    check(buoys.length >= 2 && buoys.every((r) => Math.abs(r.d) < 0.1) && crate.every((r) => Math.abs(r.d) < 0.25),
+      `each of the ${buoys.length} times a buoy went to sleep it was within 0.1 cells of its float line (${restRange(buoys)}), the crate within 0.25 (${restRange(crate)})`);
     check(peakSolved < 3200, `the solved water stays within the budget (${peakSolved} bricks at most, ${sim.bricks - sim.nHeld} at the end)`);
   }
   log(failed ? `${failed} check(s) failed` : 'all checks passed');

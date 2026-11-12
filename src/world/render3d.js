@@ -4,15 +4,18 @@
 // per-brick statistics the solver keeps anyway). The ground is traced as a height field,
 // obstacles and bodies are sphere-traced analytically.
 //
-// Water at rest that is not stored (a body of water, src/world/water.js) is drawn from its
-// description: where no brick is stored, the liquid is what lies below the body's surface
-// inside its extent. The surface is put where the stored density of the same water at rest
-// crosses one half, so a brick that is stored or dropped does not move it.
+// Water at rest that is not solved (a body of water, src/world/water.js; its bricks are held or
+// not stored at all) is drawn from its description: the liquid is what lies below the body's
+// surface inside its extent. At rest the surface is where the stored density of the same water
+// crosses one half, so a brick that is stored or dropped does not move it. On top of that comes
+// the map of the small waves that run on over such water (src/world/swell.js). Solved water is
+// drawn from its density, moved up or down by what the map says its surface should differ by:
+// nothing inside the solved water, and at its edge whatever makes the two surfaces meet.
 //
 // The density is first copied into a pool of its own in which every brick carries a border of
 // one cell from its neighbours: inside a brick the GPU's own filtering then gives a continuous
 // trilinear density from two fetches.
-import { header, prims, TERRAIN, FAR as FAR_FIELD, BRICK, MAX_PRIMS, MAX_WATER } from '../shaders/common.js';
+import { header, prims, TERRAIN, FAR as FAR_FIELD, SWELL, BRICK, MAX_PRIMS, MAX_WATER } from '../shaders/common.js';
 import { packPrims } from '../sim.js';
 
 export { Camera } from '../render3d.js';
@@ -28,6 +31,9 @@ export class WorldRenderer {
     this.perRow = Math.min(80, Math.floor(glc.maxTextureSize / AT));
     this.vol = null;
     this.volRows = 0;
+    // what the shaders read where a scene has no map of the surface (Swell)
+    this.noSwell = { uSwell: glc.texture(1, 1, 'rgba16f', { linear: true }), uSwellMap: [0, 0, 0, 0], uSwellAmp: 0 };
+    glc.clear(this.noSwell.uSwell);
 
     // density of every stored brick with a border of one cell, tile by tile
     this.pApron = glc.program('worldApron', `${H}
@@ -36,6 +42,11 @@ uniform sampler2D uLiq;
 uniform int uVolRow;
 ${FAR_FIELD}
 out vec4 o;
+// density of cell c; if it is not stored: of the water at rest that belongs there, if any
+float cellDens(ivec3 c) {
+  vec4 q = fetchC(uLiq, G, c);
+  return q.g < 0.0 && uWaterN > 0 ? farState(c).x : max(0.5 - q.r, 0.0);
+}
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
   ivec2 tile = ivec2(t.x / ${AT}, t.y / ${AP});
@@ -46,10 +57,25 @@ void main() {
   if (!g_live) return;
   int lx = t.x - tile.x * ${AT};
   ivec3 l = ivec3(lx % ${AP}, t.y - tile.y * ${AP}, lx / ${AP}) - 1;
-  vec4 q = fetchC(uLiq, G, g_frame + l);
-  float d = max(0.5 - q.r, 0.0);
-  // a border cell that is not stored: the water at rest that belongs there, if any
-  if (q.g < 0.0 && uWaterN > 0) d = farState(g_frame + l).x;
+  ivec3 c = g_frame + l;
+  float d = cellDens(c);
+  if (uWaterN > 0 && (l.x < 0 || l.x > BM || l.z < 0 || l.z > BM)) {
+    // A border cell beside the brick whose water is not solved (held, or not stored): the surface
+    // of that water is the map's, not what is stored there. The border continues the brick's own
+    // density in a straight line, so its surface runs on to the face of the brick as it arrives.
+    int sn = slotOf(G, c);
+    if (sn >= G.tiles.x * G.tiles.y || texelFetch(uSl0, ivec2(sn % G.tiles.x, sn / G.tiles.x), 0).w > 1.5) {
+      ivec3 e = ivec3(clamp(l.x, 0, BM), l.y, clamp(l.z, 0, BM));     // the brick's cell next to it
+      ivec3 i = e + (e - l);                                          // and the one after that
+      if (e.x != l.x && e.z != l.z) {
+        // (a corner: in a straight line along both axes)
+        d = 4.0 * cellDens(g_frame + e) - 2.0 * (cellDens(g_frame + ivec3(e.x, l.y, i.z)) + cellDens(g_frame + ivec3(i.x, l.y, e.z))) + cellDens(g_frame + i);
+      } else {
+        d = 2.0 * cellDens(g_frame + e) - cellDens(g_frame + i);
+      }
+      d = max(d, 0.0);
+    }
+  }
   o = vec4(d, 0.0, 0.0, 0.0);
 }`);
 
@@ -64,16 +90,19 @@ uniform float uStep;
 uniform float uTerMax;        // highest point of the ground
 ${TERRAIN}
 ${FAR_FIELD}
+${SWELL}
 ${prims('S')}
 uniform float uKind[${MAX_PRIMS}];    // per primitive: 0 fixed obstacle, 1 scripted body, 2.. rigid body colours
 const float FAR = 20000.0;
 
 // slot of brick b, -1 if it is not stored (the top level of the page table wraps: the answer
-// is checked against the brick the slot belongs to)
+// is checked against the brick the slot belongs to); g_state: its state (uSl0.w)
+float g_state = 0.0;
 int brickSlot(ivec3 b) {
   int s = pageLookup(G, b);
   if (s < 0) return -1;
   vec4 sl = texelFetch(uSl0, ivec2(s % G.tiles.x, s / G.tiles.x), 0);
+  g_state = sl.w;
   return sl.w > 0.5 && ivec3(sl.xyz) == b ? s : -1;
 }
 // density at l (cells from the corner of the brick in slot s; valid from -0.5 to BS + 0.5)
@@ -85,10 +114,10 @@ float densIn(int s, vec3 l) {
   vec2 uv = (org + vec2(k * ${AP.toFixed(1)}, 0.0) + xy) * uVolInv;
   return mix(texture(uVol, uv).r, texture(uVol, uv + vec2(${AP.toFixed(1)} * uVolInv.x, 0.0)).r, u - k);
 }
-float densAt(vec3 p) {
-  ivec3 b = ivec3(floor(p / float(BS)));
-  int s = brickSlot(b);
-  return s < 0 ? 0.0 : densIn(s, p - vec3(b * BS));
+// the same with the solved water moved to where the map has its surface (org: corner of the brick)
+float densLifted(int s, vec3 l, vec3 org) {
+  if (uSwellMap.w > 0.5) l.y -= swellAt(org.xz + l.xz).g;
+  return densIn(s, l);
 }
 vec2 boxHit(vec3 ro, vec3 inv, vec3 lo, vec3 hi) {
   vec3 t0 = (lo - ro) * inv, t1 = (hi - ro) * inv;
@@ -96,11 +125,15 @@ vec2 boxHit(vec3 ro, vec3 inv, vec3 lo, vec3 hi) {
   return vec2(max(max(a.x, a.y), a.z), min(min(b.x, b.y), b.z));
 }
 // Where the ray is in water at rest inside the box lo..hi: x = entry, y = exit (x >= y: nowhere).
-// A body of water is everything below its surface within its extent; the surface is where the
-// density of the same water in stored cells, interpolated between their centres, crosses 0.5.
-vec2 waterSpan(vec3 ro, vec3 inv, vec3 lo, vec3 hi) {
+// A body of water is everything below its surface within its extent; the surface at rest (surf)
+// is where the density of the same water in stored cells, interpolated between their centres,
+// crosses 0.5. With the map of the waves in use the span is that of the highest the surface can
+// be (uSwellAmp above rest); waterEnter() finds the surface itself.
+vec2 waterSpan(vec3 ro, vec3 inv, vec3 lo, vec3 hi, out float surf) {
   vec2 best = vec2(1.0e9, -1.0e9);
   vec3 an = vec3(uAnchor);
+  float amp = uSwellMap.w > 0.5 ? uSwellAmp : 0.0;
+  surf = 0.0;
   for (int i = 0; i < ${MAX_WATER}; i++) {
     if (i >= uWaterN) break;
     vec4 b = uWaterBox[i];
@@ -108,21 +141,48 @@ vec2 waterSpan(vec3 ro, vec3 inv, vec3 lo, vec3 hi) {
     float fa = min(L.x - L.y, 1.0), fb = max(L.x - L.y - 1.0, 0.0);     // fill of the top liquid row and of the row above
     float top = L.y + 0.5 + (fa - 0.5) / (fa - fb);
     vec3 l = max(lo, vec3(b.x, -1.0e9, b.y) + an);
-    vec3 h = min(hi, vec3(b.z, top, b.w) + an);
+    vec3 h = min(hi, vec3(b.z, top + amp, b.w) + an);
     if (any(greaterThanEqual(l, h))) continue;
     vec2 t = boxHit(ro, inv, l, h);
-    if (t.x < t.y && t.x < best.x) best = t;
+    if (t.x < t.y && t.x < best.x) { best = t; surf = top + an.y; }
   }
   return best;
+}
+// Where a ray that is in the air at t enters the water at rest inside the box lo..hi, which it
+// leaves at tOut; -1 if it does not. The surface of that water is the map's.
+float waterEnter(vec3 ro, vec3 rd, vec3 inv, vec3 lo, vec3 hi, float t, float tOut) {
+  float surf;
+  vec2 w = waterSpan(ro, inv, lo, hi, surf);
+  float ta = max(w.x, t), tb = min(w.y, tOut);
+  if (ta >= tb) return -1.0;
+  if (uSwellMap.w < 0.5) return ta;
+  // (f: height above the surface)
+  vec3 p = ro + rd * ta;
+  float fa = p.y - surf - swellAt(p.xz).r;
+  if (fa <= 0.0) return ta;
+  p = ro + rd * tb;
+  float fb = p.y - surf - swellAt(p.xz).r;
+  if (fb >= 0.0) return -1.0;
+  for (int k = 0; k < 6; k++) {
+    float tm = ta + (tb - ta) * fa / (fa - fb);
+    p = ro + rd * tm;
+    float fm = p.y - surf - swellAt(p.xz).r;
+    if (fm > 0.0) { ta = tm; fa = fm; } else { tb = tm; fb = fm; }
+  }
+  return ta + (tb - ta) * fa / (fa - fb);
 }
 // First place after t0 where the density crosses 0.5, away from the side the ray starts on
 // (inside: in liquid); -1 if there is none before tEnd. Adds up the density met in air (mist)
 // and, with uOverlay, lines along the edges of the stored bricks the ray enters.
+// g_mapped: the place found is on water that is not solved (its surface is the map's).
 uniform int uOverlay;
+bool g_mapped = false;
 float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter, inout float mist, inout vec4 lines) {
   vec3 inv = 1.0 / rd;
   float t = t0;
   float prev = inside ? 1.0 : 0.0;
+  float amp = uSwellMap.w > 0.5 ? uSwellAmp : 0.0;
+  g_mapped = false;
   for (int i = 0; i < 220; i++) {
     if (t >= tEnd) break;
     vec3 p = ro + rd * (t + 2.0e-3);
@@ -138,31 +198,34 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
     if (s >= 0) {
       ivec2 st = ivec2(s % G.tiles.x, s / G.tiles.x);
       vec4 w1 = texelFetch(uS1, st, 0);
+      bool heldB = g_state > 1.5;
       if (uOverlay == 1 && lines.a < 0.9) {
         vec3 q = abs(fract((ro + rd * t) / size + 0.5) - 0.5) * size;      // distance to the brick's faces
         float w = 0.05 + 0.0012 * t;
         float e = float(q.x < w) + float(q.y < w) + float(q.z < w);
         if (e > 1.5) {
           // solved with liquid, solved without (the margin), held (water at rest)
-          bool heldB = texelFetch(uSl0, st, 0).w > 1.5;
           vec3 c = heldB ? vec3(1.0, 0.66, 0.22) : w1.w > 0.5 ? vec3(0.25, 0.85, 1.0) : vec3(0.75, 0.75, 0.8);
           float a = (heldB ? 0.30 : w1.w > 0.5 ? 0.40 : 0.16) * (1.0 - lines.a);
           lines += vec4(c * a, a);
         }
       }
-      if (w1.w < 0.5) s = -1;
+      // (a held brick holds the water at rest and nothing else: it is drawn as the body of water it is part of)
+      if (heldB) { s = -1; stored = false; }
+      else if (w1.w < 0.5) s = -1;
       else {
-        vec2 tw = boxHit(ro, inv, lo + w1.xyz - 1.5, lo + texelFetch(uS2, st, 0).xyz + 2.5);
+        vec2 tw = boxHit(ro, inv, lo + w1.xyz - vec3(1.5, 1.5 + amp, 1.5), lo + texelFetch(uS2, st, 0).xyz + vec3(2.5, 2.5 + amp, 2.5));
         tA = max(t, tw.x); tB = min(tOut, tw.y);
         if (tA >= tB) s = -1;
       }
     }
     if (s < 0) {
       if (!stored && uWaterN > 0) {
-        // nothing stored here: the water at rest of the bodies of water, if this is in one
-        vec2 w = waterSpan(ro, inv, lo, lo + size);
-        float wa = max(w.x, t), wb = min(w.y, tOut);
+        // nothing solved here: the water at rest of the bodies of water, if this is in one
         if (inside) {
+          float surf;
+          vec2 w = waterSpan(ro, inv, lo, lo + size, surf);
+          float wa = max(w.x, t), wb = min(w.y, tOut);
           // (the block was picked 2e-3 further along the ray: past a corner it is entered that much later)
           if (wa >= wb || wa > t + 3.0e-3) return t;
           if (wb < min(tOut, tEnd) - 1.0e-3) return wb;      // out through the surface or the side of the body of water
@@ -170,7 +233,8 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
           t = tOut;
           continue;
         }
-        if (wa < wb && wa < tEnd) return wa;
+        float te = waterEnter(ro, rd, inv, lo, lo + size, t, tOut);
+        if (te >= 0.0 && te < tEnd) { g_mapped = true; return te; }
       }
       if (inside) return t;       // liquid ends where the wet cells do
       prev = 0.0;
@@ -183,7 +247,7 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
     float tStop = min(tB, tEnd);
     for (int k = 0; k < 48; k++) {
       float tn = min(tt + uStep, tStop);
-      float d = densIn(s, ro + rd * tn - lo);
+      float d = densLifted(s, ro + rd * tn - lo, lo);
       if ((d > 0.5) != inside) return tt + (tn - tt) * clamp((0.5 - prev) / (d - prev), 0.0, 1.0);
       if (!inside) mist += d * (tn - tt);
       prev = d;
@@ -195,9 +259,8 @@ float crossing(vec3 ro, vec3 rd, float t0, float tEnd, bool inside, float jitter
   }
   if (!inside && uWaterN > 0) {
     // out of steps (a long way over stored bricks): what is left is the water at rest
-    vec2 w = waterSpan(ro, inv, vec3(-1.0e9), vec3(1.0e9));
-    float wa = max(w.x, t);
-    if (wa < min(w.y, tEnd)) return wa;
+    float te = waterEnter(ro, rd, inv, vec3(-1.0e9), vec3(1.0e9), t, tEnd);
+    if (te >= 0.0 && te < tEnd) { g_mapped = true; return te; }
   }
   return -1.0;
 }
@@ -284,15 +347,20 @@ vec3 sky(vec3 d) {
   float s = max(dot(d, uLight), 0.0);
   return c + vec3(1.0, 0.93, 0.80) * (pow(s, 900.0) * 6.0 + pow(s, 24.0) * 0.18);
 }
-vec3 liquidNormal(vec3 p) {
+// mapped: p is on water that is not solved
+vec3 liquidNormal(vec3 p, bool mapped) {
   ivec3 b = ivec3(floor(p / float(BS)));
-  int s = brickSlot(b);
-  if (s < 0) return vec3(0.0, 1.0, 0.0);
-  vec3 l = p - vec3(b * BS);
+  int s = mapped ? -1 : brickSlot(b);
+  if (s < 0 || g_state > 1.5) {
+    vec4 m = swellAt(p.xz);
+    return normalize(vec3(-m.b, 1.0, -m.a));
+  }
+  vec3 org = vec3(b * BS);
+  vec3 l = p - org;
   const float e = 0.5;
-  vec3 g = vec3(densIn(s, l + vec3(e, 0.0, 0.0)) - densIn(s, l - vec3(e, 0.0, 0.0)),
-                densIn(s, l + vec3(0.0, e, 0.0)) - densIn(s, l - vec3(0.0, e, 0.0)),
-                densIn(s, l + vec3(0.0, 0.0, e)) - densIn(s, l - vec3(0.0, 0.0, e)));
+  vec3 g = vec3(densLifted(s, l + vec3(e, 0.0, 0.0), org) - densLifted(s, l - vec3(e, 0.0, 0.0), org),
+                densLifted(s, l + vec3(0.0, e, 0.0), org) - densLifted(s, l - vec3(0.0, e, 0.0), org),
+                densLifted(s, l + vec3(0.0, 0.0, e), org) - densLifted(s, l - vec3(0.0, 0.0, e), org));
   float n = length(g);
   return n > 1.0e-5 ? -g / n : vec3(0.0, 1.0, 0.0);
 }
@@ -361,7 +429,7 @@ void main() {
   vec3 col;
   if (tw >= 0.0) {
     vec3 ph = ro + rd * tw;
-    vec3 n = liquidNormal(ph);
+    vec3 n = liquidNormal(ph, g_mapped);
     if (dot(n, rd) > 0.0) n = -n;
     float c = clamp(dot(-rd, n), 0.0, 1.0);
     float F = 0.02 + 0.98 * pow(1.0 - c, 5.0);
@@ -407,7 +475,7 @@ void main() {
 }`);
   }
 
-  _uniforms(world) {
+  _uniforms(world, o = {}) {
     const sim = world.sim;
     const L0 = sim.levels[0];
     const set = L0.set;
@@ -421,7 +489,7 @@ void main() {
     const kinds = new Float32Array(MAX_PRIMS);
     kinds.set(world.solidKinds());
     return {
-      ...sim._U(L0), ...sim._solidUniforms(),
+      ...sim._U(L0), ...sim._solidUniforms(), ...(sim.swell && o.swell !== false ? sim.swell.uniforms : this.noSwell),
       uVol: this.vol, uVolInv: [1 / this.vol.w, 1 / this.vol.h], uVolRow: this.perRow,
       uS1: sim.R.s[1], uS2: sim.R.s[2],
       uTerMax: world.terrain ? world.terrain.max : 0,
@@ -432,18 +500,18 @@ void main() {
   }
 
   /** Bring the density pool and the per-brick statistics up to date with the solver's state. */
-  _prepare(world) {
+  _prepare(world, o = {}) {
     const sim = world.sim;
     sim._syncBricks();
     if (sim.statsFrame !== sim.frame || sim._statsVersion !== sim.levels[0].set.version) sim.refreshSlotStats();
-    const U = this._uniforms(world);
+    const U = this._uniforms(world, o);
     this.glc.draw(this.pApron, this.vol, { ...U, uLiq: sim.liq }, { viewport: [0, 0, this.vol.w, U._rows * AP] });
     return U;
   }
 
   render(world, camera, o = {}) {
     const glc = this.glc;
-    const U = this._prepare(world);
+    const U = this._prepare(world, o);
     this.U = U;
     const { pos, right, up, fwd } = camera.basis();
     const canvas = glc.canvas;
@@ -482,5 +550,6 @@ void main() {
   dispose() {
     if (this.vol) this.glc.deleteTexture(this.vol);
     this.glc.deleteTexture(this.pickTex);
+    this.glc.deleteTexture(this.noSwell.uSwell);
   }
 }

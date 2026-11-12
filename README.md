@@ -45,11 +45,13 @@ World (`world3d.html`): the same liquid, stored in bricks where it is. Right: th
 | ![Terraced cascade](docs/screenshots/world-cascade.png) | ![Terraced cascade, stored bricks](docs/screenshots/world-cascade-bricks.png) |
 | Terraced cascade: six basins, 5 cm cells, t = 15 s | 1.92 M cells stored of 8.6 M |
 | ![Crate in an open sea](docs/screenshots/world-sea.png) | ![Crate in an open sea, stored bricks](docs/screenshots/world-sea-bricks.png) |
-| A crate dropped into a sea that is a formula: 5 cm cells, t = 1.8 s | 576 bricks exist: solved (blue), kept around them (grey), water at rest (amber). Ten seconds later there are none |
+| A crate dropped into a sea that is a formula: 5 cm cells, t = 1.8 s | 579 bricks exist: solved (blue), kept around them (grey), water at rest (amber). Ten seconds later there are none |
+| ![Crate in an open sea, the rings](docs/screenshots/world-sea-rings.png) | ![Crate in an open sea, the rings and the stored bricks](docs/screenshots/world-sea-rings-bricks.png) |
+| The same at t = 5 s, from further away: the rings have slowed down below what keeps water solved | They run on beyond the 587 bricks, on a map of the surface that the solved water writes |
 | ![Launch in a harbour](docs/screenshots/world-harbour.png) | ![Launch in a harbour, stored bricks](docs/screenshots/world-harbour-bricks.png) |
 | A launch going round a harbour basin, 10 cm cells, t = 10 s | The bricks follow the boat and its wake; the buoys and the crate sleep until it passes |
-| ![Scattered buoys, stored bricks](docs/screenshots/world-buoys-bricks.png) | |
-| Five buoys up to 50 m apart, 10 cm cells, t = 21 s: a lump of water dropped next to one buoy six seconds ago and next to another a second ago. The 819 bricks around those two exist, and none around the other three | |
+| ![Scattered buoys](docs/screenshots/world-buoys.png) | ![Scattered buoys, stored bricks](docs/screenshots/world-buoys-bricks.png) |
+| Five buoys up to 50 m apart, 10 cm cells, t = 21 s: a lump of water dropped next to one buoy six seconds ago and next to another a second ago | The 972 bricks around those two exist, and none around the other three |
 
 ![World app: the terraced cascade with its bricks](docs/screenshots/app-world.png)
 
@@ -477,6 +479,16 @@ floor to solved water, stored or not: through an open floor the whole solved col
 and down as one, with nothing but its own inertia against it. A solved brick next to a held
 one also damps the liquid, by up to a tenth of its velocity per step at the held face.
 
+The lid and the floor hold on every level of the pressure solve. A coarse cell is held if
+one of its children is, its correction is zero, and a solved cell beside it is tied to that;
+above and below it is tied to nothing. (At first it was: coarse face weights are averages
+over three layers of fine faces, so the closed layer under a solved brick came out half
+open, and the coarse levels solved for a pool whose pressure is fixed at its floor. Their
+corrections were too small, and a V-cycle left 0.6 to 0.8 of the residual where a tank
+leaves 0.1 to 0.3. `tests/held.html?mode=pool&floor=1&bump=3&solve=1` now: 0.18 and 0.28 in
+2D, 0.13 and 0.33 in 3D, and round-off after the third cycle; the residual a step leaves
+behind is a quarter of what it was.)
+
 *Waking and sleeping.* The per-brick reports also carry: how many cells are not at rest
 (faster than 0.02 cells per step, pressure more than 0.15 cells of head or density more than
 0.6 from rest), the bounding box of the cells faster than 0.06 ("waking"), the liquid above
@@ -493,8 +505,16 @@ the state of rest, and what a held brick took in. From these, per report:
 * waves slower than 0.15 cells per step wake the same brick once in 10 s at most (`rewake`):
   a brick at the edge of what a wake reaches would otherwise change state with every group
   of waves. Faster water (something has fallen in, a bow wave) wakes it whenever it comes;
-* while 3000 bricks are solved only a body or the brush wakes more: the held bricks then
-  take the waves in;
+* while 3000 bricks are solved waves wake no more: the held bricks then take them in. A
+  body and the brush still get their bricks, and so does liquid that falls into the water
+  or is thrown up from it, by sending the calmest solved brick to sleep for each brick it
+  needs: it splashes, whatever else is going on;
+* the brick over the surface is solved whenever the one below it is. (The level of these
+  scenes is a quarter of a cell above a brick boundary, so the top quarter-row of the sea
+  lies in a brick of its own. That brick has no cell with liquid above it, counted as at
+  rest and went to sleep first. Held, it is no lid, because the face under a cell that is
+  not full stays open, and it took in every crest that rose into it: the solved water under
+  it could not rise above rest, in patches the shape of the bricks.);
 * a held brick with no solved brick beside it is dropped.
 
 Speed counts below the surface only. A surface that has moved stays smeared over two or
@@ -508,10 +528,11 @@ difference as *Unaccounted for*.
 *Rigid bodies* (`src/world/world.js`) are those of the tank simulators, with the terrain as
 one more thing to collide with; scripted solids follow a function of time. Forces are
 measured in the bricks around a body only. A body goes to sleep once, for 90 steps, it has
-moved less than 0.02 cells per step and its height has stayed within 0.1 cells: it stays
-where it is, and its water is free to come to rest and be handed back. (Slow alone is not
-enough. A buoy that bobs a quarter of a cell up and down is slow all the time, and was
-stopped at the bottom of its bob, 0.3 cells under its float line, every time.) It wakes
+moved less than 0.02 cells per step and its height has stayed within a band of 0.2 cells,
+at the moment it passes the middle of that band: it stays where it is, and its water is
+free to come to rest and be handed back. (Slow alone is not enough. A buoy that bobs a
+quarter of a cell up and down is slow all the time, and would be stopped wherever in its
+bob it happens to be.) It wakes
 when grabbed, when a moving body comes near, to water faster than 0.15 cells per step next
 to it, and to any waking water once that water has been at rest for 4 s. (The water a body
 stirred up itself must not wake it again.)
@@ -522,20 +543,23 @@ Three scenes use this, and a *Crate* tool drops crates into any of them:
 |---|---|---|---|
 | Cell size | 5 cm | 10 cm | 10 cm |
 | Scene | a 50 × 40 × 50 cm crate falls 1.2 m into a sea without shores or bed | five buoys up to 50 m apart; from 15 s on a 380 l lump of water drops next to one of them every 5 s | a 2.6 m launch goes round a 30 m × 13 m basin behind breakwaters once in 28 s; two buoys and a crate ride its wake |
-| Bricks stored at most (solved at most) | 715 (537) | 1138 (745) | 997 (709) |
-| Cells stored then, of those in the box around them | 0.37 M of 0.60 M | 0.58 M of 6.88 M | 0.51 M of 0.87 M |
-| Step, mean over 60 s | 2.3 ms | 14.6 ms | 13.9 ms |
-| Books off by, of the liquid stored at the peak | 3.3e-6 | 2.0e-5 | 3.4e-5 |
-| Bodies | crate asleep after 7.2 s | each lump wakes the buoy next to it and no other; asleep again 0.01 to 0.26 cells below the float line (half of the eight times within 0.08) | the buoys woken twice, once per round of the launch, the crate once; asleep 0.04 to 0.14 cells below their float lines |
+| Bricks stored at most (solved at most) | 717 (539) | 1269 (883) | 1204 (860) |
+| Cells stored then, of those in the box around them | 0.37 M of 0.60 M | 0.65 M of 5.53 M | 0.62 M of 1.11 M |
+| Step, mean over 60 s | 4.6 ms | 24.6 ms | 23.7 ms |
+| Books off by, of the liquid stored at the peak | 3.0e-6 | 2.1e-5 | 3.4e-5 |
+| Bodies | crate asleep after 7.9 s | each lump wakes the buoy next to it and no other; all 13 times a buoy goes to sleep it is 0.01 to 0.06 cells below its float line | the buoys woken twice, once per round of the launch, the crate once; asleep 0.02 to 0.05 cells below their float lines, the crate 0.12 to 0.14 |
 | Most changes between solved and held of one brick in 60 s | 2 | 6 | 9 |
 | Wet cells at the edge of the stored bricks, bricks refused | 0, 0 | 0, 0 | 0, 0 |
 
 (Chrome 154, RTX 3090, `tests/sea.html?scene=…&time=1`, without drawing. The step times
-were taken while another job kept the machine busy, a load of 26 to 33 on 32 threads; the
-app's own GPU timer read 7 to 12 ms per step with the buoys and in the harbour at the same
-time, and it draws all three scenes at 60 frames per second.)
+were taken while another job kept the machine and its GPU busy, and say little on their
+own. The code as it was before the map of the surface below, the brick over the surface
+and the later sleep of the bodies, timed in turn with this one: 3.7, 23.5 and 22.7 ms. The
+map is 0.5 to 0.8 ms of the difference in the first scene, where it runs for 38 of the 60 s,
+and about 1 ms in the other two. On a machine less busy the earlier code took 2.3, 14.6 and
+13.9 ms, and the app draws all three scenes at 60 frames per second.)
 
-In the first scene nothing is stored from 10.8 s on: the crate is asleep, its waves have
+In the first scene nothing is stored from 11.5 s on: the crate is asleep, its waves have
 left, and the sea is a formula once more. Where water stays solved for the whole minute the
 books drift by 2 to 3e-5, which is the solver's own loss in the solved cells (the dense
 solver ends its scene of four floating bodies 1e-6 short per second). The buoys and the
@@ -545,8 +569,10 @@ far apart make nine multigrid levels.
 
 How far a wave travels before the sea counts as at rest is the waking speed. Halving both
 thresholds (`?p.wakeSpeed=0.03&p.sleepSpeed=0.01`) keeps the rings of the crate for longer
-and further out: 3235 bricks at the most instead of 715, and the sea is empty again after
-15.1 s instead of 10.8.
+and further out: 3845 bricks at the most instead of 717 (2880 of them solved, which is the
+budget but for 120), and the sea is empty again after 17.8 s instead of 11.5. The rings
+still end at a brick edge, further out. What carries them on is the map of the surface
+below.
 
 `tests/held.html` checks the pieces on fixed sets of bricks in 2D and 3D: a pool with only
 its middle third solved stays at rest for 120 s with every column within 0.01 cells and no
@@ -556,13 +582,64 @@ solver either); a brick held and released every 10 steps for 600 steps changes s
 by less than 1e-6; a block of water three cells high on the solved band has left through
 the held bricks after 4 s (the surface is back within 0.1 cells of rest); and a ball of
 water dropped into an open sea leaves nothing stored afterwards, also when the reports are
-acted on 1, 3 or 6 steps late or read back without blocking.
+acted on 1, 3 or 6 steps late or read back without blocking. (In 2D waves do not thin out
+as they spread, and with reports that are not waited for a group of them outlasts the
+minute in about one run in six. The test then asks that nothing be stored within 300 cells
+of where the ball fell.)
 
 `tests/sea.html` runs the three scenes for a minute each without drawing them and checks
 the books, the storage and the bodies (the table above). With `&lump=9` a ball of water
 lands 1.6 m from the crate nine seconds after it, on water that has just gone back to rest:
-it has to splash all the same (1040 bricks at the most) and leave nothing stored (after
-22 s).
+it has to splash all the same (1038 bricks at the most) and leave nothing stored (after
+20 s). With `&lump=2&lumpAt=150,0&p.maxSolved=400` the ball lands 7.5 m away while the
+crate's waves hold the whole of a budget of 400 bricks: 139 of the calmest are sent to sleep
+and the splash gets its 28 (with `&p.evict=0` it gets none: the sea takes the ball in
+without a ripple and a patch of mist is left hanging over it).
+
+**Waves beyond the solved water** (`src/world/swell.js`, `src/shaders/swell.js`)
+
+Water is solved while it moves faster than the waking speed. A ring that has slowed down
+below that used to end where the solved bricks end, along a straight line. Lower thresholds
+do not help: halving them takes the crate scene from 717 bricks to 3845, and the rings
+then end a little further out. What carries them on instead is a map of the surface: 512 ×
+512 texels of 2 × 2 cells around the scene's point of view, each with the height h of the
+surface above rest and its rate of change.
+
+* *The waves of the map* are linear waves on water of one depth, ω² = g q tanh(q d), stepped
+  exactly in Fourier space: two transforms per step, 39 passes in all. (A stencil in real
+  space, as in iWave, cannot represent √q for waves much longer than its width: a 13 × 13
+  kernel is 70 % off at 30 cells.) A band along the edge of the window takes out what
+  arrives there, and the mean level is pinned to rest.
+* *Solved water writes the map.* Where the brick that holds the surface is solved, the map
+  takes h and dh/dt from the solver: the height at which ρ′ crosses 0.5 in each column, and
+  the liquid's vertical velocity there. Over the last solved brick before water at rest the
+  two are blended, the solver's weight going from 1 to 0. That is where the solver damps
+  its waves anyway. A column in which the liquid ends at a solid has no surface, and counts
+  as water at rest. (Under a floating crate the liquid ends at its underside. Taken for the
+  surface, that was a dent two cells deep in the map for as long as the water around the
+  crate was solved, and a ring of waves out of nowhere when that water went back to rest.)
+* *The renderer draws both as one surface.* Water that is not solved is the plane of its
+  level displaced by h, found by bracketing and regula falsi along the ray. Solved bricks
+  are marched as before, with the density lookup shifted by the difference between the map
+  and the solver's surface, which is zero inside and grows over the blend, so the two
+  surfaces meet. Normals of the mapped water come from the slopes of h.
+* *The map is one-way.* The solver knows nothing of it: with and without the map its fields
+  agree to the bit, and so do the books. Once no brick is solved and the map has calmed
+  down (no wave above 0.02 cells or faster than 2.5e-3 cells per step) it is switched off,
+  and the sea is a formula again: in the crate scene after 38 s, 26 s after the last brick
+  was dropped.
+
+A step of the map costs 0.30 ms (0.13 ms at 256², 0.67 ms at 1024²).
+
+`tests/swell.html`: the transform and its inverse return a field to 2e-6; standing waves 13
+to 171 cells long keep their period and height to 5e-5 cells over two and a half swings, on
+deep water and on water 16 cells deep; a hump spreads in rings and 0.3 % of them is left
+after a minute; a ball of water dropped into the sea makes rings that run on beyond the
+solved bricks, the same along the axes of the bricks as along their diagonals (correlation
+0.99, heights within 7 %), although the solved region ends at different distances there.
+`tests/sea.html?scene=sea` checks what the map holds at the moment the last brick is dropped
+(rings of 0.08 cells on their way out and no dent where the crate floats) and that it is
+switched off before the minute is over.
 
 **Limits of world mode as it stands**
 
@@ -581,17 +658,22 @@ it has to splash all the same (1040 bricks at the most) and leave nothing stored
 * A body of water has a fixed level. What the held bricks take in is entered in the books
   and gone: a lake does not rise when a river runs into it. (Levels that follow the volume
   come with the height field.)
-* Waves slower than the waking speed (0.06 cells per step: 18 cm/s at 5 cm cells) end at the
-  held bricks instead of travelling on, and a held face only lets waves of one speed out
-  cleanly; others are partly reflected. Where the last ripples of a wake end is a straight
-  line along the bricks.
+* The map of the surface is one-way. Its waves are drawn, and nothing else: they do not
+  enter solved water (a ring that reaches the solved water around another body fades out
+  over the last brick before it), they move no body and wake nothing. They know one depth
+  and no obstacles: they pass through hulls, and stop dead where the ground comes within a
+  cell of the surface. Beyond the window of 1024 cells the sea is flat.
+* A held face only lets waves of one speed out cleanly; others are partly reflected back
+  into the solved water.
 * Water that waves have woken is not woken again for 10 s by waves slower than 0.15 cells
-  per step: the outer, slow rings of a second disturbance that soon after the first end
-  where the water is still solved.
-* Beyond the budget of 3000 solved bricks nothing more is woken by water. Liquid that falls
-  onto water at rest is then taken in by it without a splash.
+  per step: the solved region does not grow again for a second disturbance soon after the
+  first unless that one is fast. (Its slow rings are carried by the map.)
+* Beyond the budget of 3000 solved bricks waves wake nothing more. Liquid that falls in then
+  gets the bricks of its splash and no others: the rings around it are the map's.
 * A sleeping body stays exactly where it is until something wakes it, so a slow drift ends
-  when it goes to sleep.
+  when it goes to sleep. Bodies float a little low: the balls 0.01 to 0.06 cells under
+  their float lines, the crate of the harbour 0.13. That is where the solver has them, not
+  where they happened to be stopped.
 * With `pushRel` and `sliverSide` a slower flow remains at a tilted solid in a pool at rest:
   0.03 to 0.05 cells per step in the dense 64³ test after 15 to 40 s. In the scenes the body
   is asleep and its water handed back before that.
@@ -637,8 +719,8 @@ src/bodies.js                  rigid bodies and contacts
 src/render2d.js, render3d.js   renderers
 src/scenes2d.js, scenes3d.js   scenarios
 src/world/                     world mode: bricks.js (page table), sparsesim.js (solver on bricks),
-                               water.js (water at rest), terrain.js, world.js, scenes.js,
-                               render3d.js, app3d.js
+                               water.js (water at rest), swell.js (waves beyond the solved water),
+                               terrain.js, world.js, scenes.js, render3d.js, app3d.js
 tests/, tools/                 headless diagnostics and interaction checks (puppeteer-core)
 docs/screenshots/              the pictures above (tools/screenshots.mjs regenerates them)
 ```

@@ -32,8 +32,11 @@ const SHOTS = [
   { name: 'world-cascade-bricks', page: 'world3d.html?scene=cascade&bricks', steps: 900 },
   { name: 'world-sea', page: 'world3d.html?scene=sea&dist=150&pitch=0.42', steps: 110 },
   { name: 'world-sea-bricks', page: 'world3d.html?scene=sea&dist=150&pitch=0.42&bricks', steps: 110 },
+  { name: 'world-sea-rings', page: 'world3d.html?scene=sea', steps: 300 },
+  { name: 'world-sea-rings-bricks', page: 'world3d.html?scene=sea&bricks', steps: 300 },
   { name: 'world-harbour', page: 'world3d.html?scene=harbour', steps: 600 },
   { name: 'world-harbour-bricks', page: 'world3d.html?scene=harbour&bricks', steps: 600 },
+  { name: 'world-buoys', page: 'world3d.html?scene=buoys', steps: 1260 },
   { name: 'world-buoys-bricks', page: 'world3d.html?scene=buoys&bricks', steps: 1260 },
 ];
 

@@ -25,6 +25,7 @@ const state = {
   brush: 6,                 // brush radius in cells
   overlay: q.has('bricks'),
   mist: !q.has('nomist'),
+  swell: !q.has('noswell'),
   renderScale: Number(q.get('rs')) || 1,
   stepsPerFrame: Number(q.get('spf')) || 1,
   overrides: {},
@@ -205,6 +206,8 @@ function buildPanel() {
     'Outlines of the 8 x 8 x 8 cell bricks that are stored: blue where they hold liquid, amber where they hold water at rest that is kept but not solved, grey where they are kept as a margin.');
   P.checkbox('mist', 'Show spray', state.mist, (v) => { state.mist = v; },
     'Density below the surface threshold of 0.5 (sheets and drops thinner than a cell) drawn as a white haze.');
+  P.checkbox('swell', 'Show the waves beyond the solved water', state.swell, (v) => { state.swell = v; },
+    'Where the water of a sea is not solved, a map of its surface carries the waves on. Off: the sea is drawn flat there, which is all the solver itself knows of it.');
   P.select('rs', 'Render scale', [[0.5, '50 %'], [0.75, '75 %'], [1, '100 %']], state.renderScale, (v) => { state.renderScale = Number(v); });
 
   P.section('Storage');
@@ -302,7 +305,7 @@ function tick() {
       applyPointer();
     }
     const showBrush = pointer.pos && state.tool !== 'orbit' && (pointer.inside || pointer.down);
-    renderer.render(world, camera, { overlay: state.overlay, mist: state.mist, cursor: showBrush ? [...pointer.pos, state.brush] : null });
+    renderer.render(world, camera, { overlay: state.overlay, mist: state.mist, swell: state.swell, cursor: showBrush ? [...pointer.pos, state.brush] : null });
     if (frame % 6 === 0) {
       // the totals of the sources and drains follow the same report the storage counters come from
       if (glc.readback !== 'scrambled') world.sim.readLedgerAsync();

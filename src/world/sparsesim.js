@@ -15,6 +15,7 @@ import { BRICK, NB_REACH, MAX_WATER } from '../shaders/common.js';
 import { farLevel } from './water.js';
 import { sparseShaders } from '../shaders/sparse.js';
 import { BrickSet } from './bricks.js';
+import { Swell } from './swell.js';
 
 export const SPARSE_PARAMS = {
   // Two options of FluidSim that are off there (the dense solver is the reference) and on here: with
@@ -56,10 +57,16 @@ export const SPARSE_PARAMS = {
   maxSolved: 0,      // moving water wakes water at rest only while fewer bricks than this are solved (0: no limit;
                      // the default is 3000 in 3D, 600 in 2D). Beyond it the held bricks at the edge of the solved
                      // region take the waves in. Pins always wake.
+  evict: 1,          // ... and liquid that falls into the water gets the bricks it lands in by sending the calmest
+                     // solved bricks to sleep in exchange: it splashes, whatever else is going on
   rewake: 600,       // steps before moving water may wake the same brick again (pins and fast water always wake)
   pinHold: 120,      // steps a pinned brick stays solved after the pin has left it. A body that bobs moves the
                      // edge of its box across a brick boundary and back once per bob; without this the brick
                      // there went to sleep and was woken again every second.
+  heldFloor: 1,      // on the coarse levels of the pressure solve held water above and below solved water is closed
+                     // to it, as on the finest (0: coupled through the averaged face weights, as it was at first)
+  swell: 1,          // 3D, with bodies of water: a map of the surface carries the waves on over the water that is
+                     // not solved (src/world/swell.js)
 };
 
 const MAX_LEVELS = 24;
@@ -118,10 +125,15 @@ export class SparseSim extends FluidSim {
   // brush); a solved brick is held once it has been at rest for a while; a held brick that no
   // solved brick reaches is dropped.
 
-  /** The bodies of water: [{ box: [x0, z0, x1, z1] (cells, as the primitives), level }], at most MAX_WATER. */
-  setWater(bodies) {
+  /**
+   * The bodies of water: [{ box: [x0, z0, x1, z1] (cells, as the primitives), level }], at most MAX_WATER.
+   * swell: { center: [x, z], params } for the map of the surface (Swell).
+   */
+  setWater(bodies, swell = {}) {
     if (bodies.length > MAX_WATER) throw new Error(`too many bodies of water (${bodies.length} > ${MAX_WATER})`);
     this.water = bodies;
+    if (this.swell) { this.swell.dispose(); this.swell = null; }
+    if (this.dim === 3 && bodies.length && this.params.swell) this.swell = new Swell(this, swell);
   }
 
   _farUniforms() {
@@ -164,6 +176,26 @@ export class SparseSim extends FluidSim {
   }
 
   /**
+   * Is brick (x, y, z) the one over the surface of a body of water: wet at rest, but not even its
+   * lowest row is full? (A level a quarter of a cell above a brick boundary: the brick below
+   * holds the top liquid row, this one the quarter.) Such a brick is solved whenever the one
+   * below it is. Held, it is no lid to the water below (the face under a cell that is not full
+   * stays open), and it takes in every crest that rises into it: the surface of the solved water
+   * under it could not rise above rest, in patches the shape of the bricks.
+   */
+  _overSurface(x, y, z) {
+    const B = this.B, a = this.anchor;
+    const x0 = x * B - a[0], y0 = y * B - a[1], z0 = z * B - a[2];
+    for (const w of this.water) {
+      if (y0 >= w.level || y0 <= w.level - 1) continue;
+      if (x0 + B - 0.5 < w.box[0] || x0 + 0.5 > w.box[2]) continue;
+      if (this.dim === 3 && (z0 + B - 0.5 < w.box[1] || z0 + 0.5 > w.box[3])) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Store, held, the water at rest around brick (x, y, z), on its level: the solver exchanges
    * liquid with water at rest sideways only (pass "solid" closes the faces above and below).
    */
@@ -193,7 +225,10 @@ export class SparseSim extends FluidSim {
     } else if (set.state(s) === 2) {
       this.setHeld(x, y, z, false);
     }
-    if (this.water.length) this._ring(x, y, z);
+    if (this.water.length) {
+      this._ring(x, y, z);
+      if (this._overSurface(x, y + 1, z)) this._activate(x, y + 1, z);
+    }
     return s;
   }
 
@@ -259,7 +294,7 @@ export class SparseSim extends FluidSim {
     };
   }
 
-  _coefUniforms(l) { return { uHeldInv: l ? 1 / (0.5 + 2 ** -(l + 1)) : 0, uHeldK: 1 / this.params.farZ }; }
+  _coefUniforms(l) { return { uHeldInv: l ? 1 / (0.5 + 2 ** -(l + 1)) : 0, uHeldK: 1 / this.params.farZ, uHeldFloor: this.params.heldFloor ? 1 : 0 }; }
   _projectUniforms() { return { uHeldK: 1 / this.params.farZ }; }
 
   _afterDensity() {
@@ -353,12 +388,14 @@ export class SparseSim extends FluidSim {
     this._lag = 0;                    // steps the reports took to arrive lately (reportAsync)
     this.report = null;               // summary of the last report acted on
     this.refused = 0;                 // bricks that were wanted while the pool was full
+    this.evicted = 0;                 // solved bricks sent to sleep to make room for fast liquid (params.evict)
     // (x, y, z, size) -> true if the cube of `size` cells at world cell (x, y, z) lies inside a
     // solid that never moves, at least a cell and a half deep everywhere. Such bricks are not
     // stored (a missing brick is a wall already). Set by the owner; null = store everything.
     this.solidBrick = null;
     this.freedMass = 0;               // density (traces below wetMin, mist that hovered) in the bricks that were dropped
     this.water = [];
+    this.swell = null;
     this.nHeld = 0;
     this.heldList = glc.tileList();
     this.absorbed = 0;                // liquid that went into held bricks (net)
@@ -372,7 +409,8 @@ export class SparseSim extends FluidSim {
     this.wakingAt = [];               // per level-0 slot: the last report (its stamp) in which the brick had waking cells
     this.strongAt = [];               // ... and cells fast enough to wake a body
     this.since = [];                  // ... and the frame of its last change of state
-    this.wakeOf = [];
+    this.wakeOf = [];                 // ... the last report in which waking cells could reach it
+    this.hardOf = [];                 // ... and in which those cells were fast (strongSpeed)
     this.wokenAt = new Map();         // brick -> frame at which moving water last woke it
     this.onState = null;              // (x, y, z, 'wake' | 'sleep' | 'store' | 'drop') => for tests
     this._resolved = new Map();
@@ -634,6 +672,7 @@ export class SparseSim extends FluidSim {
     if (this._farPending) { this.glc.clear(this.R.d); this._farPending = false; }
     this._lastRest = null;
     this.displaced = 0;
+    if (this.swell) this.swell.reset();
     this.wokenAt.clear();
     this.reports = [];
     this._unbooked = [];
@@ -772,6 +811,7 @@ export class SparseSim extends FluidSim {
     if (this.params.lifecycle) this._lifecycle();
     this._syncBricks();
     super.step();
+    if (this.swell) this.swell.step();
     if (this.params.lifecycle && this.frame % this.params.reportEvery === 0) this.makeReport();
   }
 
@@ -891,7 +931,7 @@ export class SparseSim extends FluidSim {
     const steps = Math.max(rep.steps, this.frame - rep.frame + p.reportEvery + 1);
     const far = NB_REACH * B;        // what the flags of the GPU cover
     const stamp = ++this._stamp;
-    const want = [], wake = [], hard = [], dry = [], held = [], sleep = [];
+    const want = [], wake = [], hard = [], falls = [], dry = [], held = [], sleep = [];
     const sum = { frame: rep.frame, wet: 0, dry: 0, held: 0, edge: 0, mass: 0, excess: 0, maxSpeed: 0, looked: 0, refused: 0 };
     const inflow = p.inflow * B ** (dim - 1) * p.reportEvery;
     const lo = [0, 0, 0], hi = [0, 0, 0];
@@ -945,9 +985,15 @@ export class SparseSim extends FluidSim {
       const strong = D[4 * s + 1] >= 4194304;
       if (strong) this.strongAt[s] = stamp;
       if (water && C[4 * s] >= 0 && (flags & 1 || late)) {
+        // (fast liquid that is not of the sea, or in the brick over its surface: something is
+        // falling in, or being thrown up)
+        const falling = strong && !(fw && !this._overSurface(b[0], b[1], b[2]));
         each(b, Math.round(C[4 * s]), Math.round(C[4 * s + 1]), r, (x, y, z, t) => {
-          if (t >= 0) this.wakeOf[t] = stamp;
-          if (t >= 0 ? set.state(t) === 2 : !set.marked(x, y, z)) (strong ? hard : wake).push(x, y, z);
+          if (t >= 0) { this.wakeOf[t] = stamp; if (strong) this.hardOf[t] = stamp; }
+          if (t >= 0 ? set.state(t) === 2 : !set.marked(x, y, z)) {
+            (strong ? hard : wake).push(x, y, z);
+            if (strong) falls.push(falling);
+          }
         });
       }
       if (fw) {
@@ -971,7 +1017,40 @@ export class SparseSim extends FluidSim {
     // in, a bow wave) wakes the water whenever it comes. Refused, a lump of water landing on
     // water that had just gone back to rest was taken in by the held bricks without a splash,
     // and the mist of its tail stayed in the air above them for good.
+    // With the budget used up, liquid that falls into the water (`falls`) still gets the bricks
+    // it lands in: for each, the calmest solved brick goes to sleep (what moved in it is taken
+    // in like a wave at the edge, and counted). Not the fast water of the sea itself: its waves
+    // would take the solved bricks along with them, further and further out, for as long as
+    // they stay fast, which in 2D is a long time.
     let room = (p.maxSolved || (dim === 3 ? 3000 : 600)) - (set.count - this.nHeld);
+    let calmest = null;
+    const evict = () => {
+      if (!calmest) {
+        // (not: the bricks fast liquid is in or can reach, those around bodies and the brush, and
+        // the bricks over the surface, which go with the ones below them)
+        calmest = [];
+        for (let s = 0; s < rep.high; s++) {
+          if (!rep.used[s] || !set.used[s] || set.state(s) === 2 || set.bx[s] !== rep.bx[s] || set.by[s] !== rep.by[s] || set.bz[s] !== rep.bz[s]) continue;
+          if (this.strongAt[s] === stamp || this.hardOf[s] === stamp || this.pinOf[s] > this._pinStamp - p.pinHold) continue;
+          if (!this._farWet(set.bx[s], set.by[s], set.bz[s]) || this._overSurface(set.bx[s], set.by[s], set.bz[s])) continue;
+          calmest.push(s);
+        }
+        // the calmest last (taken from the end): first those no moving liquid reaches, then by speed
+        const reached = (s) => (this.wakeOf[s] === stamp ? 1 : 0);
+        calmest.sort((u, v) => reached(v) - reached(u) || A[4 * v + 1] - A[4 * u + 1]);
+      }
+      while (calmest.length) {
+        const s = calmest.pop();
+        if (set.state(s) === 2) continue;
+        const x = set.bx[s], y = set.by[s], z = set.bz[s];
+        const before = this.nHeld;
+        this.setHeld(x, y, z, true);
+        if (this._overSurface(x, y + 1, z)) this.setHeld(x, y + 1, z, true);
+        this.evicted += this.nHeld - before;
+        return this.nHeld - before;
+      }
+      return 0;
+    };
     for (const list of [hard, wake]) {
       for (let i = 0; i < list.length; i += 3) {
         const x = list[i], y = list[i + 1], z = list[i + 2];
@@ -979,19 +1058,32 @@ export class SparseSim extends FluidSim {
         if (t < 0 || set.state(t) === 2) {
           if (water && this._farWet(x, y, z)) {
             const k = `${x},${y},${z}`;
-            if (room <= 0 || (list === wake && this.frame - (this.wokenAt.get(k) ?? -Infinity) < p.rewake)) { sum.refused++; continue; }
+            if (list === wake && this.frame - (this.wokenAt.get(k) ?? -Infinity) < p.rewake) { sum.refused++; continue; }
+            // (a brick under the surface brings the one over it along: room for two)
+            while (room <= 0 && list === hard && falls[i / 3] && p.evict) { const n = evict(); if (!n) break; room += n; }
+            if (room <= 0) { sum.refused++; continue; }
             this.wokenAt.set(k, this.frame);
           }
+          const before = set.count - this.nHeld;
           t = this._activate(x, y, z);
-          room--;
+          room -= Math.max(set.count - this.nHeld - before, 0);
         }
         if (t >= 0) this.wakeOf[t] = stamp;
       }
     }
     if (this.wokenAt.size > 20000) for (const [k, f] of this.wokenAt) if (this.frame - f >= p.rewake) this.wokenAt.delete(k);
+    const going = new Set();
     for (const s of sleep) {
-      if (this.wakeOf[s] === stamp) { this.calm[s] = 0; this.drift[s] = 0; continue; }
-      this.setHeld(set.bx[s], set.by[s], set.bz[s], true);
+      if (this.wakeOf[s] === stamp) { this.calm[s] = 0; this.drift[s] = 0; } else going.add(s);
+    }
+    for (const s of going) {
+      const x = set.bx[s], y = set.by[s], z = set.bz[s];
+      // (the brick over the surface goes to sleep with the one below it, not before: _overSurface)
+      if (this._overSurface(x, y, z)) {
+        const t = set.get(x, y - 1, z);
+        if (t >= 0 && set.state(t) !== 2 && !going.has(t)) continue;
+      }
+      this.setHeld(x, y, z, true);
     }
     // held bricks are there for the solved ones next to them
     const K = dim === 3 ? 1 : 0;
@@ -1105,6 +1197,7 @@ export class SparseSim extends FluidSim {
     super.dispose();
     const glc = this.glc;
     for (const L of this.levels) L.set.dispose();
+    if (this.swell) this.swell.dispose();
     for (const t of [...this.R.s, ...this.R.f, this.R.d, ...this._resolved.values(), this._noTerrain, this.ledger, ...this.M]) glc.deleteTexture(t);
     this.heldList.dispose();
     this.freshList.dispose();
