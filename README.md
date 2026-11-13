@@ -11,8 +11,9 @@ few rigid bodies and sums a small reduced texture for the on-screen statistics.
 
 A third app, **World** (`world3d.html`, and `world2d.html` in section), runs the same passes
 on an unbounded grid of which only the 8×8×8 bricks around the liquid are stored, over a
-height-map terrain, with ships that flood and sink when they are holed: see
-[World mode](#world-mode).
+height-map terrain: twelve scenes, from a waterfall and a sea without shores to a river
+720 m long and a ship that floods and sinks when she is holed. What it adds to the paper,
+scene by scene and piece by piece, is under [World mode](#world-mode).
 
 ![3D simulator: dam break in a 192×96×96 tank](docs/screenshots/app-3d.png)
 
@@ -139,10 +140,12 @@ The scatter steps of the advection and sharpening (the part the paper calls expe
 are drawn as `GL_POINTS`, one point per (cell, stencil corner), with additive blending into
 32-bit float targets.
 
-Scenes: dam break, splat, ball into pool / crown splash, double dam, jet, filling a dry tank,
-dam break over a step, fast moving obstacle, rotating paddle, round and spherical containers,
-shaken container, floating rigid bodies, still pool. Mouse: push, pour, drain, spawn / grab /
-throw rigid bodies; orbit and zoom in 3D.
+Scenes of the tank simulators: dam break, splat, ball into pool / crown splash, double dam,
+jet, filling a dry tank, dam break over a step, fast moving obstacle, rotating paddle, round
+and spherical containers, shaken container, floating rigid bodies, still pool. Mouse: push,
+pour, drain, spawn / grab / throw rigid bodies; orbit and zoom in 3D. The twelve scenes of
+World are listed under [World mode](#world-mode); there the mouse also drops crates and
+holes ships.
 
 ## Measured
 
@@ -349,6 +352,57 @@ The four steps towards large scenes that were planned are in: storage in bricks,
 rest that is neither solved nor stored, a height field for water that moves but needs no 3D
 solver, and ships with compartments that flood when they are holed. `world2d.html` is the
 same in section, with one scene.
+
+**The twelve scenes** (`world3d.html?scene=…`; 11 is `world2d.html`)
+
+| | Scene | Cells | What carries the water | Stored at the most | Step |
+|---|---|---|---|---|---|
+| 1 | `waterfall`: High waterfall, a 16 m fall | 10 cm | bricks around the liquid, a source and a drain | 3720 bricks, 1.91 M cells | 16.5 ms |
+| 2 | `cascade`: Terraced cascade, six basins | 5 cm | the same | 3757, 1.92 M | 15.2 ms |
+| 3 | `sea`: Crate into open sea | 5 cm | a sea that is a level and nothing else; bricks while the crate's water moves; a map for its rings | 656, 0.34 M; none after 10.6 s | 2.3 ms |
+| 4 | `buoys`: Scattered buoys, 50 m apart | 10 cm | the same, an island of bricks around each buoy that is disturbed | 1215, 0.62 M | 12.0 ms |
+| 5 | `harbour`: Boat across a harbour | 10 cm | the same, the bricks following a scripted launch and its wake | 1214, 0.62 M | 11.8 ms |
+| 6 | `river`: Mountain river to the sea, 720 m | 10 cm | shallow water on a map; 3D bricks around the view target and where the flow leaves the bed | 3429, 1.76 M | 19.6 ms |
+| 7 | `surf`: Surf on a beach | 10 cm | the map, a formula for the swell beyond it, 3D where it breaks in view | 2486, 1.27 M | 11.4 ms |
+| 8 | `dam`: Dam failure | 10 cm | the map, a gate that goes up, 3D in view | 2625, 1.34 M | 15.4 ms |
+| 9 | `cave`: Sea cave and blowhole | 10 cm | the map, and a box under a roof of rock that is always 3D | 2113, 1.08 M | 12.7 ms |
+| 10 | `spring`: Sinkhole and spring | 10 cm | the map, two lakes joined by a link under the ground | 2164, 1.11 M | 12.5 ms |
+| 11 | `flood`: Flooding compartments, a ship in section | 5 cm | a sea that is a level; a hull, solved together with the water | 57 bricks of 16 × 16 afloat | 5 to 7 ms |
+| 12 | `ship`: Holed ship off an island | 10 cm | the same in 3D | 1764, 0.90 M | 12 to 28 ms |
+
+(RTX 3090, Chrome 154. The step times are those of the sections below, taken when each
+group of scenes was finished and not all on an idle machine. The dense solver stores
+4.2 M cells in its largest tank and takes 15 ms for a step of it.)
+
+**What is added to the paper.** The paper's solver stores every cell of one closed box. Its
+numerics are untouched here (the hashes of the tank simulators' fields are what they were);
+what changes is where cells exist and what stands in for them where they do not.
+
+| Addition | What it does | Described under |
+|---|---|---|
+| Pooled bricks | cells live in bricks of 8³ (2D: 16²) in pool textures, found through a page table; a missing brick reads as air or as water at rest | Storage |
+| Bricks that come and go | every brick reports where its liquid is and how fast; bricks are stored ahead of moving liquid and dropped when it has gone | Which bricks exist |
+| Water at rest as a formula | a sea is a level and an extent; below it a brick is solved, held (stored and kept at rest) or not stored at all | Water at rest |
+| The solver's own state of rest | held water carries the discrete hydrostatic pressure of this solver, which differs from the textbook one by up to 0.09 cells of head | Water at rest |
+| Waking and sleeping | water is solved while it moves faster than a waking speed and handed back below a lower one; bodies and the mouse keep theirs solved; bodies sleep too | Water at rest |
+| A budget | at most 3000 solved bricks; when they are used up the calmest are sent to sleep for a new splash | Water at rest |
+| A map of the surface | linear waves stepped exactly in Fourier space, written by the solver where water is solved: rings run on past the last brick (drawn only) | Waves beyond the solved water |
+| A height field | rivers and lakes are shallow water on a map of 2 × 2 cells per texel; a column is 3D near the view target, near a body, and where it is no height field | A height field for water that moves |
+| Hand-overs that lose nothing | under solved bricks the map takes the sums of the 3D columns; held bricks are refilled from the map | A height field for water that moves |
+| Sources, drains, links | boxes that are filled or emptied, pipes between two waters driven by their levels, all metered | Ground, sources, drains |
+| Ground and ships as functions | the ground is a height map read in the shader, a ship a distance field on a lattice that a hole edits | Ground, sources, drains; Ships |
+| Bodies inside the pressure solve | the velocity of every body is an unknown of the step, with a measured added mass; a film of damping under a body on the ground | Bodies and liquid solved together |
+| Books for water without an end | stored water above the state of rest − what solids displace + what held water took in − sources + drains is constant | Water at rest |
+| One surface to look at | solved bricks are ray-marched and empty space skipped; water at rest is its level displaced by the map; the two are made to meet | Rendering; Waves beyond the solved water |
+
+**What a scene fixes when it loads.** Nothing is compiled into the shaders or worked out
+beforehand. Which bricks exist and who has each column of water is decided anew every step,
+bodies wake and sleep, a hull is holed while it runs. Fixed at load, but as data the passes
+read every step and that only lacks a tool to change it: the heights of the ground (a
+texture), the level and extent of each water at rest, the bed, the sources, drains and links
+of a height field, the window of the surface map (512² texels around the scene's view target,
+one depth) and the swell of the surf scene. Fixed in the design: one cell size everywhere,
+ground without overhangs, pools and budgets allocated at the start.
 
 **Storage** (`src/world/bricks.js`, `src/world/sparsesim.js`)
 
