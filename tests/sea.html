@@ -14,6 +14,9 @@
 //     lines when they do; a body in the air above water at rest leaves it at rest
 //   and per scene what should be stored at the end (see below).
 //   ?scene=sea|buoys|harbour  &steps=  &every=  &p.<solver param>=  &w.<world param>=  &o.<scene option>=
+//   &c.<name>=: parameters of the Coupler (src/couple.js); &w.couple=0: bodies and liquid by turns
+//   &bob=1: where a body was in the four seconds before it went to sleep; &bob=2: per line of the
+//     log, how far from its float line each body was since the last line (mean, lowest, highest)
 //   &async=1 (reports read back without blocking)  &time=1 (ms per step, synced)  &until=s (sources stop)
 //   &lump=s: after s seconds a ball of water drops 30 cells from the middle (&lumpAt=x,z: there).
 //     With scene=sea&lump=9 it lands on water that has just gone back to rest, which waves may
@@ -29,11 +32,12 @@ const q = new URLSearchParams(location.search);
 const name = q.get('scene') || 'sea';
 const steps = Number(q.get('steps') || { sea: 1500, buoys: 1500, harbour: 1500 }[name] || 1200);
 const every = Number(q.get('every') || Math.max(1, Math.floor(steps / 10)));
-const params = {}, wparams = {}, opts = {};
+const params = {}, wparams = {}, opts = {}, cparams = {};
 for (const [k, v] of q) {
   if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
   if (k.startsWith('w.')) wparams[k.slice(2)] = Number(v);
   if (k.startsWith('o.')) opts[k.slice(2)] = Number(v);      // options of the scene's build()
+  if (k.startsWith('c.')) cparams[k.slice(2)] = Number(v);   // parameters of the Coupler (src/couple.js)
 }
 if (q.get('async') === '1') params.reportAsync = 1;
 const log = (s) => console.log(s);
@@ -47,6 +51,7 @@ try {
   log(`readback ${glc.readback} | ${glc.renderer}`);
   const scene = WORLD_SCENES[name].build(opts);
   if (q.get('until')) for (const e of scene.emitters || []) e.until = Number(q.get('until'));
+  if (Object.keys(cparams).length) scene.couple = { ...scene.couple, ...cparams };
   const world = new World(glc, 3, scene, { params, world: wparams });
   const sim = world.sim;
   const level = scene.water[0].level;
@@ -82,6 +87,8 @@ try {
   const lumpAt = (q.get('lumpAt') || '30,10').split(',').map(Number);
   let lumpStep = 0, splash = 0, solvedThen = 0;
   const bob = world.bodies.map(() => []), rests = [];     // heights above the float line: while awake; on going to sleep
+  const fresh = () => ({ s: 0, n: 0, lo: Infinity, hi: -Infinity });
+  const swing = world.bodies.map(fresh);                  // &bob=2: the same between two lines of the log (mean, lowest, highest)
   const timed = q.get('time') === '1';
   const history = [];
   for (let i = 1; i <= steps; i++) {
@@ -144,6 +151,7 @@ try {
     world.bodies.forEach((b, k) => {
       const f = floatLine(b);
       if (f !== null && !b.asleep && i % 4 === 0) bob[k].push(b.pos[1] - level - f);
+      if (f !== null && !b.asleep) { const d = b.pos[1] - level - f, a = swing[k]; a.s += d; a.n++; a.lo = Math.min(a.lo, d); a.hi = Math.max(a.hi, d); }
       if (b.asleep && !wasAsleep[k]) {
         if (f !== null) rests.push({ k, i, d: b.pos[1] - level - f });
         // &bob=1: where it was every fourth step of the last four seconds before it went to sleep
@@ -166,6 +174,10 @@ try {
         `in ${sim.added.toFixed(1)}, out ${sim.removed.toFixed(1)}, evaporated ${sim.freedMass.toExponential(1)}: off by ${off.toExponential(2)} | fastest ${(st.maxSpeed * dt).toFixed(3)} cells/step, residual ${st.residual.toExponential(1)} | ` +
         world.bodies.map((b, k) => `${k}: y ${(b.pos[1] - level).toFixed(2)}${b.asleep ? ' asleep' : ` v ${(Math.hypot(...b.vel) * dt).toFixed(3)}`}`).join(', ') +
         (sim.swell ? ` | map ${sim.swell.active ? `in use, waves up to ${sim.swell.peak[0].toFixed(3)} cells, ${(sim.swell.peak[1] * dt).toExponential(1)} cells/step` : 'off'}` : ''));
+      if (q.get('bob') === '2') {
+        log('  from their float lines since the last line: ' + swing.map((a, k) => (a.n ? `${k}: ${(a.s / a.n).toFixed(4)} (${a.lo.toFixed(3)} to ${a.hi.toFixed(3)})` : `${k}: asleep`)).join(', '));
+        swing.forEach((a, k) => { swing[k] = fresh(); });
+      }
       if (!Number.isFinite(st.mass)) { worst = Infinity; break; }
       await new Promise((r) => setTimeout(r));
     }

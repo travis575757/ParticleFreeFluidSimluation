@@ -165,10 +165,25 @@ export class Body {
   /** Apply impulse J (per unit of this body's mass) at world point p. */
   applyImpulse(J, p) {
     if (this.kinematic) return;
-    this.vel = add(this.vel, J);
     const r = sub(p, this.pos);
     if (this.dim === 2) r[2] = 0;
+    if (this.react) {
+      // (the liquid around the body answers at once: `react` is what is left of the change, see src/couple.js)
+      const [dv, dw] = this.react(J, this.invInertia(cross(r, J)));
+      this.vel = add(this.vel, dv);
+      this.omega = add(this.omega, dw);
+      return;
+    }
+    this.vel = add(this.vel, J);
     this.omega = add(this.omega, this.invInertia(cross(r, J)));
+  }
+
+  /** How fast the point at r from the centre moves along n after a unit impulse along n there. */
+  pointResponse(r, n) {
+    const w = 1 / (this.density * this.volume);
+    let dv = mul(n, w), dw = mul(this.invInertia(cross(r, n)), w);
+    if (this.react) [dv, dw] = this.react(dv, dw);
+    return dot(add(dv, cross(dw, r)), n);
   }
 
   integrate(dt) {
@@ -338,10 +353,19 @@ function preVelocity(o, p) {
  * (the liquid sees that velocity as a boundary condition; a residual would pump liquid).
  */
 function resolveContacts(bodies, statics) {
+  solveContacts(findContacts(bodies, statics));
+}
+
+/**
+ * The first half of resolveContacts: bodies that overlap another solid are moved apart, and
+ * the points at which they touch are returned as constraints for solveContacts.
+ */
+export function findContacts(bodies, statics, touching = false) {
   const contacts = [];
   for (let i = 0; i < bodies.length; i++) {
     const a = bodies[i];
     a.near = [];               // normals of the solids within BODY_PARAMS.near cells, for the next step
+    a.film = [];               // (touching:) its surface points that close to a solid nothing moves: { p, n: the solid's normal, vel: its velocity there, d: how far it is }
     if (a.kinematic) continue;
     const others = [...statics, ...bodies.filter((_, j) => j !== i)];
     for (const o2 of others) {
@@ -359,13 +383,19 @@ function resolveContacts(bodies, statics) {
         const d = o2.sd(p);
         if (d < deepest) { deepest = d; hit = p; }
         if (d < closest) { closest = d; closestPoint = p; }
+        if (touching && fixedB && d < BODY_PARAMS.near) a.film.push({ p, n: o2.normal(p), vel: o2.velocityAt ? o2.velocityAt(p) : [0, 0, 0], d: Math.max(d, 0) });
       }
       if (closestPoint) a.near.push(o2.normal(closestPoint));
-      if (!hit) continue;
-      const nd = o2.normal(hit);                 // points out of o2, i.e. the way `a` must move
-      const corr = -deepest * BODY_PARAMS.correction;
-      a.pos = add(a.pos, mul(nd, (corr * wA) / (wA + wB)));
-      if (!fixedB) o2.pos = sub(o2.pos, mul(nd, (corr * wB) / (wA + wB)));
+      // (touching: bodies that merely touch are in contact too. stepBodies moves a body with the
+      // velocity gravity has just given it, so one that rests on something is found a little way
+      // inside it every step; the Coupler moves bodies with the velocities the contacts left them.)
+      if (!hit && !(touching && closest <= 0.05)) continue;
+      if (hit) {
+        const nd = o2.normal(hit);                 // points out of o2, i.e. the way `a` must move
+        const corr = -deepest * BODY_PARAMS.correction;
+        a.pos = add(a.pos, mul(nd, (corr * wA) / (wA + wB)));
+        if (!fixedB) o2.pos = sub(o2.pos, mul(nd, (corr * wB) / (wA + wB)));
+      }
       // velocity: one constraint per sample point that is (still) touching
       for (const p of a.samplePoints()) {
         if (o2.sd(p) > 0.05) continue;
@@ -379,6 +409,8 @@ function resolveContacts(bodies, statics) {
           if (a.dim === 2) rB[2] = 0;
           k += wB * dot(cross(o2.invInertia(cross(rB, n)), rB), n);
         }
+        // (bodies solved together with the liquid: what an impulse does to them includes the liquid's answer)
+        if (a.react || (!fixedB && o2.react)) k = a.pointResponse(rA, n) + (fixedB ? 0 : o2.pointResponse(rB, n));
         // approach speed without the velocity gained from this step's forces: a body at rest
         // picks up g dt (and more when the liquid presses on it) every step and must not bounce
         const vn0 = dot(sub(preVelocity(a, p), preVelocity(o2, p)), n);
@@ -387,10 +419,19 @@ function resolveContacts(bodies, statics) {
       }
     }
   }
+  return contacts;
+}
+
+/**
+ * The second half: impulses at the contacts until no body moves into what it touches. May be
+ * called again with other velocities (it starts from no impulse every time).
+ */
+export function solveContacts(contacts) {
   const apply = (c, J) => {
     c.a.applyImpulse(mul(J, c.wA), c.p);
     if (!c.fixedB) c.b.applyImpulse(mul(J, -c.wB), c.p);
   };
+  for (const c of contacts) { c.lambda = 0; c.jt = [0, 0, 0]; }
   for (let iter = 0; iter < BODY_PARAMS.iterations; iter++) {
     for (const c of contacts) {
       let vrel = sub(c.a.velocityAt(c.p), c.b.velocityAt(c.p));

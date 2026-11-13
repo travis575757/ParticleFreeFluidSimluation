@@ -6,7 +6,9 @@ import { SparseSim } from './sparsesim.js';
 import { HeightField } from './heightfield.js';
 import { Terrain, staticSolidTest, primDistance } from './terrain.js';
 import { Body, stepBodies, quatFromAxisAngle } from '../bodies.js';
-import { MAX_PRIMS } from '../shaders/common.js';
+import { MAX_PRIMS, MAX_HULLS } from '../shaders/common.js';
+import { Hull } from './hull.js';
+import { Coupler } from '../couple.js';
 
 export const WORLD_PARAMS = {
   pinMargin: 8,           // cells of water kept solved around a body that is awake
@@ -21,8 +23,11 @@ export const WORLD_PARAMS = {
   // of that band: where it would come to rest by itself.
   bodySleepRange: 0.1,
   bodySleepAfter: 90,     // steps a body has to be at rest before it sleeps
+  bodySleepDrift: 0.01,   // [cells] ... and how far the middle of the swing of one that stands on the ground may have moved in that time
   bodyArmAfter: 240,      // steps the water next to a sleeping body has to be at rest before moving water wakes the body
   // with a height field: the water around what the camera looks at is solved, as far as the budget of solved bricks allows
+  // rigid bodies and the liquid are solved together (src/couple.js; 0: they take turns, stepBodies in src/bodies.js)
+  couple: 1,
   focusRadius: 0,         // cells around the focus (setFocus) within which the height field's water is solved (0: nowhere on that account)
   focusHold: 1.5,         // ... and stays solved within this many times the radius
 };
@@ -96,6 +101,7 @@ export class World {
       this.sim.solidBrick = (x, y, z, size) => x + size <= x0 || x >= x1 || (dim === 3 && (z + size <= z0 || z >= z1)) || solid(x, y, z, size);
     }
     this.focus = null;
+    this.coupler = this.params.couple ? new Coupler(dim, scene.couple) : null;
     this.reset();
   }
 
@@ -119,13 +125,15 @@ export class World {
     this.time = 0;
     this.emitters = (sc.emitters || []).map((e) => ({ from: 0, until: Infinity, ...e }));
     this.drains = sc.drains || [];
+    for (const b of this.kin || []) if (b.dispose) b.dispose();
     this.kin = (sc.kinematic ? sc.kinematic(0) : []).map((spec) => {
-      const b = new Body(dim, { ...spec, kinematic: true });
+      const b = spec.shape === 'hull' ? new Hull(this.glc, dim, { ...spec, kinematic: true }) : new Body(dim, { ...spec, kinematic: true });
       b.scripted = true;
       b.still = 0;
       this._pose(b, spec, 0);
       return b;
     });
+    if (this.bodies) this.removeBodies();
     this.bodies = [];
     for (const spec of sc.bodies || []) this.addBody(spec);
     this.sim.pins = [];
@@ -145,6 +153,15 @@ export class World {
       this.sim.hfLock();
     }
     this.sim.reset(this.solidPrims(), sc.liquid || []);
+    // a hull starts with nothing in it, unless the scene says otherwise (`flooded`): the water
+    // the scene laid out where it floats is the water it displaces
+    // (on water at rest nothing is stored there yet: the bricks would arrive full of it)
+    const dry = [...this.kin, ...this.bodies].filter((b) => b instanceof Hull && !b.flooded);
+    if (dry.length) {
+      const shells = dry.map((b) => b.shellPrim());
+      if (this.sim.water.length) this.sim.ensurePrims(shells, 2);
+      this.sim.editLiquid(shells, 2);
+    }
     this.mass0 = this.sim.measureSync().mass;     // the liquid the scene starts with ...
     this.excess0 = this.sim.water.length ? this.sim.excessSync() : 0;   // ... and how much of it is not water at rest
     this.water0 = this.hf ? this.sim.hfWaterSync() : 0;                 // with a height field: all the water there is
@@ -195,18 +212,41 @@ export class World {
   solidPrims() { return [...this.solids, ...this.kin.map((b) => b.prim()), ...this.bodies.map((b) => b.prim())]; }
 
   /** Kind per solid primitive for the renderer: 0 fixed obstacle, 1 scripted body, 2 + colour for a rigid body. */
-  solidKinds() { return [...this.solids.map((s) => (s.rock ? 6 : 0)), ...this.kin.map(() => 1), ...this.bodies.map((b) => 2 + (b.color % 4))]; }
+  /** Per primitive, what the renderers draw it as: 0 obstacle, 1 scripted body, 2..5 rigid bodies, 6 rock, 7 hull. */
+  solidKinds() {
+    return [...this.solids.map((s) => (s.rock ? 6 : 0)), ...this.kin.map((b) => (b instanceof Hull ? 7 : 1)),
+      ...this.bodies.map((b) => (b instanceof Hull ? 7 : 2 + (b.color % 4)))];
+  }
+
+  /**
+   * A hole of `radius` cells through the hull at the world point p, if there is a hull within
+   * `reach` cells of it. Returns that hull, or null. (The hull wakes: what floats now may not
+   * float with a hole in it.)
+   */
+  breachAt(p, radius, reach = 1) {
+    for (const b of [...this.bodies, ...this.kin]) {
+      if (!(b instanceof Hull) || b.sd(p) > reach) continue;
+      b.breach(p, radius);
+      if (b.asleep) this.wake(b);
+      return b;
+    }
+    return null;
+  }
 
   canAddBody() { return this.solids.length + this.kin.length + this.bodies.length < MAX_PRIMS; }
+  /** A rigid body (src/bodies.js), or with shape 'hull' one with a shape of its own (src/world/hull.js). */
   addBody(spec) {
     if (!this.canAddBody()) return null;
-    const b = new Body(this.dim, spec);
+    const hull = spec.shape === 'hull';
+    if (hull && this.hulls.length >= MAX_HULLS) return null;
+    const b = hull ? new Hull(this.glc, this.dim, spec) : new Body(this.dim, spec);
     b.asleep = false;
     b.still = 0;
     this.bodies.push(b);
     return b;
   }
-  removeBodies() { this.bodies = []; }
+  removeBodies() { for (const b of this.bodies) if (b.dispose) b.dispose(); this.bodies = []; }
+  get hulls() { return this.bodies.filter((b) => b instanceof Hull); }
 
   get gravityCells() {
     const g = this.sim.params.gravity, h = this.sim.params.h;
@@ -216,19 +256,35 @@ export class World {
   /** Put a scripted body where its script says it is at the end of a step of dt (0: at once). */
   _pose(b, s, dt) {
     const dim = this.dim;
-    const np = [s.pos[0], s.pos[1], dim === 2 ? 0.5 : s.pos[2]];
+    let np = [s.pos[0], s.pos[1], dim === 2 ? 0.5 : s.pos[2]];
+    const was = b.pos;
     const a = (dim === 2 ? s.angle : s.yaw) || 0;
     const axis = dim === 2 ? [0, 0, 1] : [0, 1, 0];
     if (dt > 0) {
-      b.vel = [(np[0] - b.pos[0]) / dt, (np[1] - b.pos[1]) / dt, (np[2] - b.pos[2]) / dt];
       let da = a - b.angle1;
       da -= 2 * Math.PI * Math.round(da / (2 * Math.PI));     // (the script's angle may wrap)
       const w = da / dt;
       b.omega = [axis[0] * w, axis[1] * w, axis[2] * w];
     }
-    b.pos = np;
     b.angle1 = a;
     b.quat = quatFromAxisAngle(axis, a);
+    if (s.quat && dim === 3) {
+      // (a script may give the attitude whole; it is then the script's business to turn slowly)
+      const q0 = b.quat0 || s.quat, q1 = s.quat;
+      if (dt > 0) {
+        // the turn from q0 to q1 as a vector: 2 * (q1 * conj(q0)).xyz for a small turn
+        const w = [q1[3] * -q0[0] + q1[0] * q0[3] - q1[1] * q0[2] + q1[2] * q0[1],
+          q1[3] * -q0[1] + q1[1] * q0[3] - q1[2] * q0[0] + q1[0] * q0[2],
+          q1[3] * -q0[2] + q1[2] * q0[3] - q1[0] * q0[1] + q1[1] * q0[0]];
+        b.omega = w.map((v) => (2 * v) / dt);
+      }
+      b.quat = [...q1];
+      b.quat0 = [...q1];
+    }
+    // (a hull's script says where the origin of its drawing is: the body is where its centre of mass is)
+    if (b.com) { b.pos = np; np = b.toWorld(b.com); if (dim === 2) np[2] = 0.5; }
+    if (dt > 0) b.vel = [(np[0] - was[0]) / dt, (np[1] - was[1]) / dt, (np[2] - was[2]) / dt];
+    b.pos = np;
   }
 
   /** Box of cells [lo, hi) around a body, `margin` cells wider. */
@@ -257,10 +313,12 @@ export class World {
     b.kinematic = false;
     b.still = 0;
     b.heights = [];
+    b.middles = [];
   }
 
   _sleep(b) {
     b.asleep = true;
+    b.rested = true;          // for the Coupler: when it wakes, the first guess is that it stays where it is
     b.armed = 0;              // what wakes it: see _sleepBodies
     b.calmFor = 0;
     b.kinematic = true;       // to the other bodies and to the liquid: a solid that stays where it is
@@ -297,12 +355,22 @@ export class World {
       const before = ys.length ? ys[ys.length - 1] : b.pos[1];
       ys.push(b.pos[1]);
       if (ys.length > P.bodySleepAfter) ys.shift();
-      b.still = b.grabbed || moves(b) ? 0 : b.still + 1;
-      if (b.still < P.bodySleepAfter) continue;
       let lo = Infinity, hi = -Infinity;
       for (const y of ys) { lo = Math.min(lo, y); hi = Math.max(hi, y); }
       const mid = 0.5 * (lo + hi);
-      if (hi - lo <= 2 * P.bodySleepRange && (before - mid) * (b.pos[1] - mid) <= 0) this._sleep(b);
+      const mids = b.middles || (b.middles = []);
+      mids.push(mid);
+      if (mids.length > P.bodySleepAfter) mids.shift();
+      b.still = b.grabbed || moves(b) ? 0 : b.still + 1;
+      if (b.still < P.bodySleepAfter) continue;
+      // One that stands on the ground and goes over slowly (a hull on her bow, the last of her
+      // compartments filling) is slow, and what the film under it leaves of its motion takes it
+      // through the middle of its swing: but that middle moves. (Body.film: the points of it
+      // next to a solid that nothing moves, see the Coupler.)
+      if ((b.film || []).length && Math.abs(mid - mids[0]) > P.bodySleepDrift) continue;
+      // (in the middle of its swing, not at the top of it; or not swinging at all: one that lies
+      // on the ground and creeps one way never passes the middle)
+      if (hi - lo <= 2 * P.bodySleepRange && ((before - mid) * (b.pos[1] - mid) <= 0 || hi - lo <= 0.02 * P.bodySleepRange)) this._sleep(b);
     }
   }
 
@@ -311,7 +379,11 @@ export class World {
     const P = this.params, sim = this.sim, dt = sim.params.dt;
     const pins = [];
     for (const b of [...this.kin, ...this.bodies]) {
-      if (b.asleep || (b.scripted && b.still >= P.bodySleepAfter)) continue;
+      const rests = b.asleep || (b.scripted && b.still >= P.bodySleepAfter);
+      // (a hull at rest keeps its own water solved: what is in it is not water at rest, and
+      // held bricks hold nothing else)
+      if (rests && b instanceof Hull) pins.push(this.bodyBox(b, 2));
+      if (rests) continue;
       pins.push(this.bodyBox(b, P.pinMargin + 4 * dt * len(b.vel)));
     }
     const m = sim.mouse;
@@ -362,19 +434,26 @@ export class World {
     this._swellSources(t1);
 
     if (this.kin.length) sc.kinematic(t1).forEach((s, i) => this._pose(this.kin[i], s, dt));
+    const cp = this.coupler;
     if (this.bodies.length) {
       this._sleepBodies();
-      if (this.bodies.some((b) => !b.asleep)) stepBodies(this.bodies, [...this.statics, ...this.kin], { dt, gravity: this.gravityCells });
-    }
+      const statics = [...this.statics, ...this.kin];
+      if (cp) {
+        const first = this.solids.length + this.kin.length;
+        cp.begin(this.bodies, statics, { dt, gravity: this.gravityCells, index: (b) => first + this.bodies.indexOf(b) });
+      } else if (this.bodies.some((b) => !b.asleep)) stepBodies(this.bodies, statics, { dt, gravity: this.gravityCells });
+    } else if (cp) cp.active = [];
     if (this.kin.length || this.bodies.length) sim.setSolids(this.solidPrims());
     this._pins();
 
     const awake = this.bodies.filter((b) => !b.asleep);
-    sim.twoWay = awake.some((b) => (b.wet ?? 1) > 0);
+    sim.coupler = cp;
+    sim.twoWay = !cp && awake.some((b) => (b.wet ?? 1) > 0);
     sim.step();
     this.time = t1;
-    // resolves once the liquid forces of this step have arrived (within a frame in the app)
-    this.forcesReady = this._requestForces(awake, dt);
+    // resolves once the liquid forces of this step have arrived (within a frame in the app;
+    // solved together with the liquid, they are part of the step)
+    this.forcesReady = cp ? Promise.resolve() : this._requestForces(awake, dt);
   }
 
   /** The liquid's force on the bodies that are awake (as Runner._requestForces of the tank simulators). */

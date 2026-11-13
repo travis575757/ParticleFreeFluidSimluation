@@ -11,7 +11,7 @@
 // given relative to `anchor`.
 import { FluidSim, makeGrid, packPrims } from '../sim.js';
 import { VS_TILES } from '../gl.js';
-import { BRICK, NB_REACH, MAX_WATER, LEAF_LOG } from '../shaders/common.js';
+import { BRICK, NB_REACH, MAX_WATER, LEAF_LOG, MAX_HULLS } from '../shaders/common.js';
 import { farLevel } from './water.js';
 import { sparseShaders } from '../shaders/sparse.js';
 import { hfCoupleShaders } from '../shaders/hfcouple.js';
@@ -133,6 +133,13 @@ export class SparseSim extends FluidSim {
 
   /** The ground (src/world/terrain.js), or null. Takes effect at the next step. */
   setTerrain(terrain) { this.terrain = terrain; }
+
+  /** (programs of this backend know distance fields on a lattice: every one of them needs its textures) */
+  _prims(list, P) {
+    const U = packPrims(list, P, this.dim);
+    for (let h = 0; h < MAX_HULLS; h++) U[`u${P}H${h}`] ??= this._noTerrain;
+    return U;
+  }
 
   _solidUniforms() {
     return { ...(this.terrain ? this.terrain.uniforms : { uTer: this._noTerrain, uTerMap: [0, 0, 1, 0] }), ...this._farUniforms() };
@@ -1134,6 +1141,7 @@ export class SparseSim extends FluidSim {
     const drop = [T.vel[1], T.rho[1], T.sdf, T.us, T.frac, T.trace, T.beta, T.fwd, T.res, ...T.stats, ...T.force,
       L.cA, L.cB, L.p[1], L.rhs, L.exA, L.exB];
     for (const t of drop) glc.deleteTexture(t);
+    this._dropFields();           // (the coupler's: it makes them anew)
     const usedH = set.rows * this.B;
     const { baseline, stats } = this;
     set.resize(Math.min(maxRows, set.rows * 2));
@@ -1230,8 +1238,11 @@ export class SparseSim extends FluidSim {
 
   /** World cells [lo, hi) around a primitive, `margin` cells wider. */
   _primBox(p, margin) {
+    const h = p.half, R = p.rot, n = this.dim;
     const r = p.type === 'ball' ? [p.radius, p.radius, p.radius]
-      : p.rot ? Array(3).fill(Math.hypot(p.half[0], p.half[1], this.dim === 3 ? p.half[2] : 0)) : p.half;
+      // (a body with a distance field of its own is long and thin: the box around the turned box, not around its sphere)
+      : p.type === 'sdf' && R ? [0, 1, 2].map((d) => { let e = 0; for (let j = 0; j < n; j++) e += Math.abs(R[3 * d + j]) * h[j]; return e; })
+      : R ? Array(3).fill(Math.hypot(h[0], h[1], n === 3 ? h[2] : 0)) : h;
     const lo = [0, 1, 2].map((d) => Math.floor(p.center[d] - r[d] - margin) + this.anchor[d]);
     const hi = [0, 1, 2].map((d) => Math.ceil(p.center[d] + r[d] + margin) + this.anchor[d]);
     if (this.dim === 2) { lo[2] = 0; hi[2] = 1; }
@@ -1309,6 +1320,7 @@ export class SparseSim extends FluidSim {
       else fill(T.vel[0], [0, 0, 0, 0]);
       fill(T.rho[0], [0, 1, 0, 0]);
       fill(L0.p[0], [0, 0, 0, 0]);
+      for (const t of this.fields) fill(t, [0, 0, 0, 0]);
       this._only = this.freshList;
       try {
         this._updateSolids();
@@ -1420,7 +1432,7 @@ export class SparseSim extends FluidSim {
     }
     if (!slots.size) return;
     this.editList.set([...slots]);
-    const U = packPrims(prims, 'L', this.dim);
+    const U = this._prims(prims, 'L');
     const copy = (from, to) => glc.drawTiles(P.copyTiles, to, { uSrc: from }, this.editList, set.tile);
     this._only = this.editList;
     try {
@@ -1872,8 +1884,8 @@ export class SparseSim extends FluidSim {
     super._drawStats();
   }
 
-  /** As FluidSim.measureBodyForces, over the bricks around the bodies only. */
-  measureBodyForces(prims) {
+  /** As FluidSim._drawBodyForces, over the bricks around the bodies only. */
+  _drawBodyForces(prims, vel) {
     this._syncBricks();
     // the force comes from the cells within a cell and a half of a body's surface
     const set = this.levels[0].set, B = this.B;
@@ -1897,7 +1909,7 @@ export class SparseSim extends FluidSim {
     }
     this._scatterSlots = runs;
     try {
-      return super.measureBodyForces(prims);      // (the pass is drawn before this returns; the result follows)
+      super._drawBodyForces(prims, vel);
     } finally {
       this._scatterSlots = null;
     }

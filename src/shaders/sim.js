@@ -1,6 +1,6 @@
 // Simulation passes for "Mass-Conserving Eulerian Liquid Simulation" (Chentanez & Mueller, SCA 2012).
 // Section/equation numbers in comments refer to that paper unless another reference is named.
-import { header, TRACE as TRACE_ABS, TRACE_REL, prims, EPSV, TERRAIN, FAR } from './common.js';
+import { header, TRACE as TRACE_ABS, TRACE_REL, prims, EPSV, TERRAIN, FAR, MAX_PRIMS } from './common.js';
 
 const VMIN = '0.05';   // floor on V when normalising row sums of nearly solid cells
 
@@ -10,6 +10,7 @@ const VMIN = '0.05';   // floor on V when normalising row sums of nearly solid c
  */
 export function simShaders(dim, floatLinear, backend = 'dense', opts = {}) {
   const H = header(dim, floatLinear, backend);
+  const sparse = backend === 'sparse';             // ... which also knows bodies with a distance field of their own
   const FARS = backend === 'sparse' ? FAR : '';      // the state of water at rest, for the passes that meet held bricks
   const TRACE = opts.pushRel ? TRACE_REL : TRACE_ABS;
   const S = {};
@@ -36,7 +37,7 @@ vec2 sdSolids(vec3 x) {
 `;
   S.solid = `${H}
 uniform Grid G;
-${prims('S')}${terrain}${backend === 'sparse' ? FAR : ''}
+${prims('S', sparse)}${terrain}${backend === 'sparse' ? FAR : ''}
 layout(location = 0) out vec4 oSdf;
 layout(location = 1) out vec4 oUs;
 layout(location = 2) out vec4 oFrac;
@@ -60,8 +61,10 @@ void main() {
   float dc = D(0.5, 0.5, 0.5);
   vec3 xf;
   vec3 us = vec3(0.0);
-  xf = X(0.0, 0.5, 0.5); vec2 sx = sdS(xf); if (sx.y >= 0.0) us.x = velS(int(sx.y), xf).x;
-  xf = X(0.5, 0.0, 0.5); vec2 sy = sdS(xf); if (sy.y >= 0.0) us.y = velS(int(sy.y), xf).y;
+  // (who: the primitive each face takes its velocity from, counted from 1; 0 = none. For "usBody".)
+  ivec3 who = ivec3(0);
+  xf = X(0.0, 0.5, 0.5); vec2 sx = sdS(xf); if (sx.y >= 0.0) { us.x = velS(int(sx.y), xf).x; who.x = int(sx.y) + 1; }
+  xf = X(0.5, 0.0, 0.5); vec2 sy = sdS(xf); if (sy.y >= 0.0) { us.y = velS(int(sy.y), xf).y; who.y = int(sy.y) + 1; }
   vec3 g = vec3(D(1.0, 0.5, 0.5) - sx.x, D(0.5, 1.0, 0.5) - sy.x, 0.0);
   vec3 A = vec3(0.0);
   vec3 W = vec3(vol(sx.x), vol(sy.x), 0.0);
@@ -70,7 +73,7 @@ void main() {
   A.x = ramp(sx.x - bias, abs(n01 - n00));
   A.y = ramp(sy.x - bias, abs(n10 - n00));
 #else
-  xf = X(0.5, 0.5, 0.0); vec2 sz = sdS(xf); if (sz.y >= 0.0) us.z = velS(int(sz.y), xf).z;
+  xf = X(0.5, 0.5, 0.0); vec2 sz = sdS(xf); if (sz.y >= 0.0) { us.z = velS(int(sz.y), xf).z; who.z = int(sz.y) + 1; }
   g.z = D(0.5, 0.5, 1.0) - sz.x;
   W.z = vol(sz.x);
   // edge mid-points: e_ab = edge through corner (a, b) of the two named axes
@@ -95,7 +98,7 @@ void main() {
   // nearest obstacle however far away it is, and belongs to a face only if that obstacle is
   // what closes it. (Left in, every face at the edge of the stored cells moved with the nearest
   // body: a crate falling through the air pushed the water under it before it arrived.)
-  for (int d = 0; d < DIM; d++) if (!hasCell(G, gc - AX[d])) { if (W[d] > 0.0) us[d] = 0.0; W[d] = 0.0; A[d] = 0.0; }
+  for (int d = 0; d < DIM; d++) if (!hasCell(G, gc - AX[d])) { if (W[d] > 0.0) { us[d] = 0.0; who[d] = 0; } W[d] = 0.0; A[d] = 0.0; }
   // Water at rest (a held brick, see SparseSim) under solved cells is a floor to them, and a lid
   // above them: held and solved cells exchange liquid sideways only. Through an open floor the
   // whole solved column would move up and down as one (nothing but its own inertia resists),
@@ -105,18 +108,115 @@ void main() {
     int sb = slotOf(G, gc - AX[1]);
     if (sb < G.tiles.x * G.tiles.y) {
       bool heldBelow = texelFetch(uSl0, ivec2(sb % G.tiles.x, sb / G.tiles.x), 0).w > 1.5;
-      if (heldBelow != g_held && farState(g_held ? gc : gc - AX[1]).x >= 1.0) { if (W[1] > 0.0) us[1] = 0.0; W[1] = 0.0; A[1] = 0.0; }
+      if (heldBelow != g_held && farState(g_held ? gc : gc - AX[1]).x >= 1.0) { if (W[1] > 0.0) { us[1] = 0.0; who[1] = 0; } W[1] = 0.0; A[1] = 0.0; }
     }
   }
 #endif
   oSdf = vec4(g, dc);
-  oUs = vec4(us, 0.0);
+  oUs = vec4(us, float(who.x + 16 * who.y + 256 * who.z));
   oFrac = vec4(A, clamp(0.5 + dc, 0.0, 1.0));
   oW = vec4(W, 0.0);
 #ifdef SPARSE
   oW.a = g_held ? 1.0 : 0.0;    // held cells: see "coef"
 #endif
 }`;
+
+  // The solid velocities with the rigid bodies moving otherwise than the solid pass was told
+  // (src/couple.js): to the velocity of every face that belongs to a primitive, the change of
+  // that primitive's velocity is added (uBase 1), or the faces carry that change alone (uBase 0:
+  // one body moving at unit speed in an otherwise resting world).
+  S.usBody = `${H}
+uniform Grid G;
+uniform sampler2D uUs;
+uniform float uBase;
+uniform vec3 uDV[${MAX_PRIMS}];      // per primitive: change of its velocity ...
+uniform vec3 uDW[${MAX_PRIMS}];      // ... and of its spin
+uniform vec3 uDC[${MAX_PRIMS}];      // its centre
+out vec4 o;
+void main() {
+  ivec2 t = ivec2(gl_FragCoord.xy);
+  ivec3 c = cellOf(G, t);
+  vec4 us = texelFetch(uUs, t, 0);
+  int code = int(us.a + 0.5);
+  vec3 v = us.xyz * uBase;
+  for (int d = 0; d < DIM; d++) {
+    int i = (code >> (4 * d)) & 15;
+    if (i == 0) continue;
+    vec3 off = vec3(0.5);
+    off[d] = 0.0;
+    vec3 r = shapePos(cellPos(c, off)) - uDC[i - 1];
+#if DIM == 2
+    r.z = 0.0;
+#endif
+    v[d] += (uDV[i - 1] + cross(uDW[i - 1], r))[d];
+  }
+  o = vec4(v, us.a);
+}`;
+
+  // The right-hand side of the pressure equation for liquid at rest between solids that move
+  // as uUs says: the part of "rhs" that is linear in the solid velocity, without the sources
+  // and without the separating condition (the pressure may pull). Its solution is how the
+  // liquid answers a body's motion, i.e. the body's added mass (src/couple.js).
+  S.rhsBody = `${H}
+uniform Grid G;
+uniform sampler2D uUs;
+uniform sampler2D uW;
+uniform sampler2D uLiq;
+out vec4 o;
+void main() {
+  ivec2 t = ivec2(gl_FragCoord.xy);
+  ivec3 c = cellOf(G, t);
+  vec2 l = texelFetch(uLiq, t, 0).rg;
+  vec4 Wc = texelFetch(uW, t, 0);
+  float b = 0.0;
+#ifdef SPARSE
+  if (Wc.a > 0.5) { o = vec4(0.0, -BIG, 0.0, 0.0); return; }
+#endif
+  if (l.r < 0.0) {
+    vec4 sc = texelFetch(uUs, t, 0);
+    for (int d = 0; d < DIM; d++) {
+      b -= (Wc[d] - l.g) * sc[d];
+      ivec3 hi = c + AX[d];
+      if (hasCell(G, hi)) {
+        ivec2 th = texelOf(G, hi);
+        b += (texelFetch(uW, th, 0)[d] - l.g) * texelFetch(uUs, th, 0)[d];
+      }
+    }
+  }
+  o = vec4(b, -BIG, 0.0, 0.0);
+}`;
+
+  // A pressure plus multiples of up to four others, in the cells the pressure is solved in
+  // (uCA's diagonal positive); cells whose pressure is held keep uKeep.y of theirs, all other
+  // cells are zero. src/couple.js: the pressure follows a change of the bodies' velocities by
+  // the stored answers of the liquid to each of them.
+  S.combine = `${H}
+uniform sampler2D uP;
+uniform sampler2D uCA;
+uniform sampler2D uQ0;
+uniform sampler2D uQ1;
+uniform sampler2D uQ2;
+uniform sampler2D uQ3;
+uniform vec4 uC;
+uniform vec2 uKeep;
+out vec4 o;
+void main() {
+  ivec2 t = ivec2(gl_FragCoord.xy);
+  float w = texelFetch(uCA, t, 0).w;
+  float p = texelFetch(uP, t, 0).r;
+  float r = 0.0;
+  if (w > 0.0) {
+    r = uKeep.x * p + uC.x * texelFetch(uQ0, t, 0).r + uC.y * texelFetch(uQ1, t, 0).r
+      + uC.z * texelFetch(uQ2, t, 0).r + uC.w * texelFetch(uQ3, t, 0).r;
+  } else if (w < 0.0) r = uKeep.y * p;
+  o = vec4(r, 0.0, 0.0, 0.0);
+}`;
+
+  // A texture as it is (params.oldCapacity: the solid fractions before the solid pass).
+  S.keep = `${H}
+uniform sampler2D uSrc;
+out vec4 o;
+void main() { o = texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0); }`;
 
   // ---------------------------------------------------------------- liquid classification
   // rho' = rho / V (Eq. 20), extrapolated into (nearly) solid cells from their neighbours.
@@ -250,6 +350,10 @@ void main() {
   //             gamma = 1 <=> incompressible.
   // Solids generalise both: capacities are the non-solid volume fractions V, i.e. the scheme
   // transports rho' = rho / V and gamma_i = (sum_l A_il V_l) / V_i.
+  // A solid that moves changes the capacities before the densities follow (the solid pass comes
+  // first). As printed, V_l of a source is the new one; with params.oldCapacity it is the one
+  // the source's density was full or not full of (uFracOld), and a cell next to a moving wall
+  // that was full is asked for, and delivers, a full cell's worth.
   //
   // Step 1: backward characteristic x- of every cell and its row scale s_i.
   //   uMode 1: s = gamma~   semi-Lagrangian advected previous row sum, as printed in steps 3-4.
@@ -262,6 +366,7 @@ uniform Grid G;
 ${TRACE}
 uniform sampler2D uRho;   // r = rho, g = gamma
 uniform sampler2D uFrac;
+uniform sampler2D uFracOld;   // the capacities the densities belong to (params.oldCapacity; else uFrac again)
 uniform float uDt;
 uniform int uMode;
 out vec4 o;               // xyz = x-, w = row scale s_i
@@ -281,7 +386,7 @@ void main() {
       ivec2 ts = texelOf(G, clampCell(G, cellAt(f) + cornerOffset(k)));
       float w = cornerWeight(k, a);
       gt += w * texelFetch(uRho, ts, 0).g;
-      Vsrc += w * texelFetch(uFrac, ts, 0).a;
+      Vsrc += w * texelFetch(uFracOld, ts, 0).a;
     }
     s = V / max(Vsrc, 1.0e-2);
     if (uMode == 1) s *= gt;
@@ -356,6 +461,7 @@ uniform sampler2D uRho;
 uniform sampler2D uTraceTex;
 uniform sampler2D uBeta;
 uniform sampler2D uFrac;
+uniform sampler2D uFracOld;
 uniform float uDt;
 layout(location = 0) out vec4 oRho;   // (rho, gamma) before the forward scatter
 layout(location = 1) out vec4 oFwd;   // xyz = x+, w = (1 - beta_j) / capacity normalisation
@@ -379,7 +485,7 @@ void main() {
       if (keep && heldCell(G, cellAt(f) + cornerOffset(k))) continue;
 #endif
       ivec2 ts = texelOf(G, clampCell(G, cellAt(f) + cornerOffset(k)));
-      acc += cornerWeight(k, a) * vec2(texelFetch(uRho, ts, 0).r, texelFetch(uFrac, ts, 0).a) / max(1.0, texelFetch(uBeta, ts, 0).r);
+      acc += cornerWeight(k, a) * vec2(texelFetch(uRho, ts, 0).r, texelFetch(uFracOld, ts, 0).a) / max(1.0, texelFetch(uBeta, ts, 0).r);
     }
     acc *= tr.w;
     acc.y /= max(V, ${VMIN});
@@ -412,10 +518,10 @@ void main() {
 
   // Steps 6-7: rho_k += rho_j (1 - beta_j) w+_jk, and the same entries added to the row sums.
   S.scatterFwdVS = scatterVS(
-    `uniform sampler2D uRho; uniform sampler2D uFrac;`,
+    `uniform sampler2D uRho; uniform sampler2D uFrac; uniform sampler2D uFracOld;`,
     `if (src.w > 0.0) {
     float Vt = texelFetch(uFrac, tt, 0).a;
-    val = vec4(texelFetch(uRho, st, 0).r, texelFetch(uFrac, st, 0).a / max(Vt, ${VMIN}), 0.0, 0.0) * (src.w * (Vt + ${EPSV}));
+    val = vec4(texelFetch(uRho, st, 0).r, texelFetch(uFracOld, st, 0).a / max(Vt, ${VMIN}), 0.0, 0.0) * (src.w * (Vt + ${EPSV}));
   }`,
   );
 
@@ -1193,7 +1299,7 @@ void main() {
   //   uOp 2: remove       rho = rho * (1 - coverage)
   S.sourceRho = `${H}
 uniform Grid G;
-${prims('L')}
+${prims('L', sparse)}
 uniform sampler2D uRho;
 uniform sampler2D uFrac;
 uniform int uOp;
@@ -1214,7 +1320,7 @@ void main() {
   //   uOp 1: add         v = mix(v, primitive velocity, coverage)
   S.sourceVel = `${H}
 uniform Grid G;
-${prims('L')}
+${prims('L', sparse)}
 uniform sampler2D uVel;
 uniform int uOp;
 out vec4 o;
@@ -1251,7 +1357,7 @@ uniform sampler2D uLiq;
 uniform sampler2D uVel;
 uniform float uSlots;
 uniform int uBase;
-${prims('B')}
+${prims('B', sparse)}
 out vec4 vA;   // xyz = pressure force, w = surface band weight
 out vec4 vB;   // xyz = torque, w = wet part of the band
 out vec4 vC;   // xyz = liquid velocity summed over the wet band, w = its weight

@@ -46,6 +46,18 @@ const SHOTS = [
   { name: 'world-cave', page: 'world3d.html?scene=cave', steps: 1445 },
   { name: 'world-spring', page: 'world3d.html?scene=spring', steps: 2400 },
   { name: 'app-world-surf', page: 'world3d.html?scene=surf', steps: 2400, ui: true },
+  // ... a ship: holed under the bow, going down after the second hole, on the bed
+  { name: 'world-ship', page: 'world3d.html?scene=ship', steps: 840 },
+  { name: 'world-ship-bricks', page: 'world3d.html?scene=ship&bricks', steps: 840 },
+  { name: 'world-ship-sinking', page: 'world3d.html?scene=ship', steps: 2310 },
+  { name: 'world-ship-sunk', page: 'world3d.html?scene=ship', steps: 3300 },
+  { name: 'app-world-ship', page: 'world3d.html?scene=ship', steps: 840, ui: true },
+  // ... and in section (world2d.html): one compartment open; two (the second hole made by the page, at 12 s)
+  { name: 'world2d-flood', page: 'world2d.html?scene=flood', steps: 600 },
+  { name: 'world2d-flood-bricks', page: 'world2d.html?scene=flood&bricks', steps: 600 },
+  { name: 'world2d-flood-sinking', page: 'world2d.html?scene=flood&second=12', steps: 1200 },
+  { name: 'world2d-flood-sunk', page: 'world2d.html?scene=flood&second=12', steps: 3000 },
+  { name: 'app-world2d', page: 'world2d.html?scene=flood', steps: 600, ui: true },
 ];
 
 const argv = process.argv.slice(2);

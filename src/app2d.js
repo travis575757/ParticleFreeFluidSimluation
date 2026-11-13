@@ -38,6 +38,7 @@ const state = {
   brush: 0.05,              // brush radius in tank units
   view: q.get('view') || 'liquid',
   postProcess: q.has('pp'),
+  couple: q.has('couple'),  // rigid bodies and liquid solved together (src/couple.js) instead of taking turns
   stepsPerFrame: Number(q.get('spf')) || 1,
   overrides: {},            // solver parameters changed in the panel (kept across scene changes)
 };
@@ -49,7 +50,7 @@ const pointer = { down: false, pos: [0, 0, 0.5], vel: [0, 0, 0], last: null, las
 function loadScene() {
   if (runner) runner.dispose();
   scene = buildScene(SCENES2D[state.scene], state.N);
-  runner = new Runner(glc, 2, scene, state.overrides);
+  runner = new Runner(glc, 2, scene, state.overrides, { couple: state.couple });
   window.runner = runner;
   plot?.clear();
   fitCanvas();
@@ -210,6 +211,8 @@ function buildPanel() {
   P.checkbox('separate', 'Separating solid boundaries [CM11a]', !!p.separate, (v) => setParam('separate', v ? 1 : 0),
     'Liquid may peel off walls instead of sticking to them.');
   P.slider('vc', 'V-cycles / step', { min: 1, max: 8, step: 1, value: p.vcycles }, (v) => setParam('vcycles', v));
+  P.checkbox('couple', 'Bodies and liquid solved together', state.couple, (v) => { state.couple = v; loadScene(); },
+    'Off: a body feels the pressure of the step before, with its added mass estimated (the default here). On: the velocity of every body is iterated within the pressure solve until body and liquid agree, with the added mass measured (src/couple.js; the World pages always do this). Calmer where bodies ride on each other or cover the surface; reads back from the GPU once or twice per step. Restarts the scene.');
   P.note(`At least ${p.vcyclesBodies} while rigid bodies are in the liquid.`);
 
   P.section('Keys', { collapsible: true, open: false });
@@ -304,7 +307,7 @@ try {
   glc = new GLContext(canvas, { preserveDrawingBuffer: q.has('capture') });
   renderer = new Renderer2D(glc);
   scene = buildScene(SCENES2D[state.scene], state.N);
-  runner = new Runner(glc, 2, scene, state.overrides);
+  runner = new Runner(glc, 2, scene, state.overrides, { couple: state.couple });
   window.runner = runner;
   fitCanvas();
   panel = buildPanel();

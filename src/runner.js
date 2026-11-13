@@ -3,6 +3,7 @@
 import { FluidSim } from './sim.js';
 import { MAX_PRIMS } from './shaders/common.js';
 import { Body, Container, stepBodies, quatFromAxisAngle } from './bodies.js';
+import { Coupler } from './couple.js';
 
 export class Runner {
   /**
@@ -10,11 +11,17 @@ export class Runner {
    *   { nx, ny, nz, params, liquid:[prims], container(t)->prim, kinematic?(t)->[body specs],
    *     bodies?:[body specs], emitters?:[{ from, until, period, duty, prim(t) }] }
    */
-  constructor(glc, dim, scene, overrides = {}) {
+  /**
+   * @param options  { couple: true | { params of the Coupler } }: bodies and liquid are solved together
+   *                 (src/couple.js) instead of taking turns (stepBodies in src/bodies.js)
+   */
+  constructor(glc, dim, scene, overrides = {}, options = {}) {
     this.glc = glc;
     this.dim = dim;
     this.scene = scene;
     this.sim = new FluidSim(glc, { dim, nx: scene.nx, ny: scene.ny, nz: scene.nz, params: { ...scene.params, ...overrides } });
+    // (needs read-back that works: without it the bodies take turns with the liquid, as far as that goes)
+    this.coupler = options.couple && glc.readback !== 'scrambled' ? new Coupler(dim, options.couple === true ? {} : options.couple) : null;
     this.reset();
   }
 
@@ -81,8 +88,11 @@ export class Runner {
     this.container = c1;
 
     if (this.bodies.length) {
-      stepBodies(this.bodies, [new Container(dim, c1), ...this.kin], { dt, gravity: this.gravityCells });
+      const statics = [new Container(dim, c1), ...this.kin];
+      if (this.coupler) this.coupler.begin(this.bodies, statics, { dt, gravity: this.gravityCells, index: (b) => 1 + this.kin.length + this.bodies.indexOf(b) });
+      else stepBodies(this.bodies, statics, { dt, gravity: this.gravityCells });
     }
+    sim.coupler = this.coupler && this.bodies.length ? this.coupler : null;
     sim.setSolids(this._solidPrims());
 
     for (const e of sc.emitters || []) {
@@ -97,7 +107,7 @@ export class Runner {
     if (!this._checked) { this._checked = true; this.glc.checkErrors(`the first step on a ${sim.grid.n.slice(0, dim).join('x')} grid`); }
     // resolves once the liquid forces of this step have arrived (within a frame in the apps;
     // tests await it so that their timing matches a real-time run)
-    this.forcesReady = this._requestForces(dt);
+    this.forcesReady = this.coupler ? Promise.resolve() : this._requestForces(dt);
   }
 
   _requestForces(dt) {

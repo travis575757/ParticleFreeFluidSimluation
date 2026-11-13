@@ -8,7 +8,7 @@
 //   3. velocity advection + forces
 //   4. incompressibility                 (Sec. 3.7, multigrid of [CM11a])
 import { simShaders } from './shaders/sim.js';
-import { MAX_PRIMS } from './shaders/common.js';
+import { MAX_PRIMS, MAX_HULLS } from './shaders/common.js';
 
 export const DEFAULT_PARAMS = {
   dt: 1 / 60,            // time step [s]
@@ -57,6 +57,10 @@ export const DEFAULT_PARAMS = {
   // 1 = interpolate in the shader with exact weights instead of the GPU's texture filtering (which
   // rounds the weights to 8 bits). Slower; the reference the sparse solver is compared against.
   manualFilter: 0,
+
+  // 1 = the density advection takes a source cell's capacity from before the solids moved in
+  // this step (the capacity its density belongs to) instead of the new one. Off: as printed.
+  oldCapacity: 0,
 };
 
 /** Atlas layout for an nx*ny*nz grid: z-slices tiled tx across. */
@@ -98,18 +102,28 @@ export function packPrims(list, P, dim) {
   const V = new Float32Array(3 * MAX_PRIMS);
   const W = new Float32Array(3 * MAX_PRIMS);
   for (let i = 0; i < MAX_PRIMS; i++) R.set(IDENTITY3, 9 * i);
+  // distance fields on a lattice (type 'sdf', src/world/hull.js; only programs built with them know these)
+  const HN = new Int32Array(4 * MAX_HULLS);
+  const out = {};
+  let hulls = 0;
   list.forEach((p, i) => {
-    const type = (p.type === 'ball' ? 1 : 2) * (p.inverted ? -1 : 1);
+    const type = (p.type === 'ball' ? 1 : p.type === 'sdf' ? (p.shell ? 4 : 3) : 2) * (p.inverted ? -1 : 1);
     A.set([p.center[0], p.center[1], dim === 2 ? 0.5 : p.center[2], type], 4 * i);
     if (p.type === 'ball') B.set([p.radius, 0, 0, 0], 4 * i);
-    else B.set([p.half[0], p.half[1], dim === 2 ? 1e6 : p.half[2], p.round || 0], 4 * i);
+    else if (p.type === 'sdf') {
+      if (hulls >= MAX_HULLS) throw new Error(`too many bodies with a distance field of their own (more than ${MAX_HULLS})`);
+      B.set([p.half[0], p.half[1], dim === 2 ? 1e6 : p.half[2], hulls], 4 * i);
+      HN.set(p.lattice.n, 4 * hulls);
+      out[`u${P}H${hulls}`] = p.lattice.tex;
+      hulls++;
+    } else B.set([p.half[0], p.half[1], dim === 2 ? 1e6 : p.half[2], p.round || 0], 4 * i);
     R.set(p.rot || IDENTITY3, 9 * i);
     const v = p.vel || [0, 0, 0];
     const w = p.omega || [0, 0, 0];
     V.set([v[0], v[1], dim === 2 ? 0 : v[2] || 0], 3 * i);
     W.set(dim === 2 ? [0, 0, w[2] || 0] : [w[0] || 0, w[1] || 0, w[2] || 0], 3 * i);
   });
-  return { [`u${P}N`]: list.length, [`u${P}A`]: A, [`u${P}B`]: B, [`u${P}R`]: R, [`u${P}V`]: V, [`u${P}W`]: W };
+  return { [`u${P}N`]: list.length, [`u${P}A`]: A, [`u${P}B`]: B, [`u${P}R`]: R, [`u${P}V`]: V, [`u${P}W`]: W, [`u${P}HN`]: HN, ...out };
 }
 
 export class FluidSim {
@@ -128,6 +142,12 @@ export class FluidSim {
     // solve leaves out arrives a step late, and bodies that touch each other or a wall (where
     // the multigrid converges slowest) turn that delay into a hopping motion that never dies.
     this.twoWay = false;
+    // Set by the owner while rigid bodies and the liquid are solved together (src/couple.js):
+    // the pressure solve then finds the bodies' velocities along with the pressure.
+    this.coupler = null;
+    this._scr = {};
+    this.fields = new Set();        // textures like the pressure's that the coupler keeps (newField)
+    this.fieldsVersion = 0;
     this.mouse = { pos: [0, 0, 0], vel: [0, 0, 0], dir: [0, 0, 0], radius: 0, strength: 0 };
     this._buildPrograms();
     this._buildGrid(nx, ny, dim === 2 ? 1 : nz);
@@ -142,7 +162,7 @@ export class FluidSim {
     const P = {};
     const fragmentPasses = ['solid', 'liq', 'extrapInit', 'extrapPull', 'extrapPush', 'advTrace',
       'advGather', 'advPlain', 'diffuse', 'sharpen', 'velAdvect', 'downsample', 'coef', 'rhs', 'smooth', 'restrict',
-      'prolong', 'residual', 'project', 'sourceRho', 'sourceVel'];
+      'prolong', 'residual', 'project', 'sourceRho', 'sourceVel', 'usBody', 'rhsBody', 'combine', 'keep'];
     for (const name of fragmentPasses) P[name] = glc.program(name, S[name], vs);
     P.stats = glc.program('stats', S.stats);
     P.scatterBeta = glc.program('scatterBeta', S.scatterFS, S.scatterBetaVS);
@@ -243,9 +263,11 @@ export class FluidSim {
     const { prog: P, T } = this;
     const L0 = this.levels[0];
     this._draw(P.solid, [T.sdf, T.us, T.frac, L0.W], L0,
-      { uVthr: this.params.closeSlivers ? this.params.vthr : 0, ...packPrims(this.solids, 'S', this.dim), ...this._solidUniforms() });
+      { uVthr: this.params.closeSlivers ? this.params.vthr : 0, ...this._prims(this.solids, 'S'), ...this._solidUniforms() });
   }
 
+  /** The uniforms of a list of primitives for the programs that name them `P`. */
+  _prims(list, P) { return packPrims(list, P, this.dim); }
   /** What the backend adds to the solids (the sparse one: a terrain). */
   _solidUniforms() { return {}; }
   /** What the backend adds to the matrix coefficients of level l ... */
@@ -267,7 +289,7 @@ export class FluidSim {
     const L0 = this.levels[0];
     this.setSolids(solids);
     this._updateSolids();
-    const L = packPrims(liquid, 'L', this.dim);
+    const L = this._prims(liquid, 'L');
     this._draw(P.sourceRho, T.rho[1], L0, { ...L, uRho: T.rho[0], uFrac: T.frac, uOp: 0 });
     this._swap(T.rho);
     this._draw(P.sourceVel, T.vel[1], L0, { ...L, uVel: T.vel[0], uOp: 0 });
@@ -286,7 +308,7 @@ export class FluidSim {
   editLiquid(prims, op = 1) {
     const { prog: P, T } = this;
     const L0 = this.levels[0];
-    const L = packPrims(prims, 'L', this.dim);
+    const L = this._prims(prims, 'L');
     this._draw(P.sourceRho, T.rho[1], L0, { ...L, uRho: T.rho[0], uFrac: T.frac, uOp: op });
     this._swap(T.rho);
     if (op === 1) {
@@ -301,6 +323,7 @@ export class FluidSim {
   step() {
     const p = this.params;
     this._extrapolate();
+    this._keepCapacity();
     this._updateSolids();
     if (p.advection === 0) this._advectDensityPlain(p.dt);
     else this._advectDensity(p.dt);
@@ -331,16 +354,29 @@ export class FluidSim {
     this._swap(T.vel);
   }
 
+  /** params.oldCapacity: the solid fractions as they are before the solid pass of this step. */
+  _keepCapacity() {
+    const T = this.T;
+    this._fracOld = null;
+    if (!this.params.oldCapacity) return;
+    const old = this._scratch('fracOld', T.frac);
+    // (fractions that no solid pass has written yet, after the grid was laid out anew: as printed, for this step)
+    if (this._fracNew !== T.frac) { this._fracNew = T.frac; return; }
+    this._draw(this.prog.keep, old, this.levels[0], { uSrc: T.frac });
+    this._fracOld = old;
+  }
+
   // 2a. conservative density advection -----------------------------------------
   _advectDensity(dt) {
     const { prog: P, T, params: p } = this;
     const L0 = this.levels[0];
     const tr = { uVel: T.vel[0], uSdf: T.sdf, uTraceSteps: p.traceSteps };
-    this._draw(P.advTrace, T.trace, L0, { ...tr, uRho: T.rho[0], uFrac: T.frac, uDt: dt, uMode: p.advection });
+    const old = this._fracOld || T.frac;
+    this._draw(P.advTrace, T.trace, L0, { ...tr, uRho: T.rho[0], uFrac: T.frac, uFracOld: old, uDt: dt, uMode: p.advection });
     this._scatter(P.scatterBeta, T.beta, L0, { uSrc: T.trace }, this.nc, { clear: true });
     this._draw(P.advGather, [T.rho[1], T.fwd], L0,
-      { ...tr, uRho: T.rho[0], uTraceTex: T.trace, uBeta: T.beta, uFrac: T.frac, uDt: dt });
-    this._scatter(P.scatterFwd, T.rho[1], L0, { uSrc: T.fwd, uRho: T.rho[0], uFrac: T.frac }, this.nc);
+      { ...tr, uRho: T.rho[0], uTraceTex: T.trace, uBeta: T.beta, uFrac: T.frac, uFracOld: old, uDt: dt });
+    this._scatter(P.scatterFwd, T.rho[1], L0, { uSrc: T.fwd, uRho: T.rho[0], uFrac: T.frac, uFracOld: old }, this.nc);
     this._swap(T.rho);
     const pairs = p.diffusionPairs ? [0, 1] : [-1];
     for (let it = 0; it < p.diffusionIters; it++) {
@@ -438,22 +474,156 @@ export class FluidSim {
     }
   }
 
-  _project(dt) {
+  /** The right-hand side of the pressure equation, with the solids moving as `us` says. */
+  _rhs(dt, us = this.T.us) {
     const { prog: P, T, levels, params: p } = this;
-    const invThetaMax = 1 / p.thetaMin;
     const L0 = levels[0];
-    this._buildMatrix();
     this._draw(P.rhs, L0.rhs, L0, {
-      uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uSdf: T.sdf,
+      uVel: T.vel[0], uUs: us, uW: L0.W, uLiq: L0.liq, uSdf: T.sdf,
       uSrcScale: p.lambda / dt, uSrcMax: p.eta / dt, uSinkScale: p.compress / dt, uSinkMax: p.compressMax / dt,
       uSeparate: p.separate,
     });
-    const PU = this._projectUniforms();
-    const cycles = this.twoWay ? Math.max(p.vcycles, p.vcyclesBodies) : p.vcycles;
-    for (let i = 0; i < cycles; i++) this._vcycle(0);
-    this._draw(P.project, T.vel[1], L0,
-      { uVel: T.vel[0], uUs: T.us, uW: L0.W, uLiq: L0.liq, uP: L0.p[0], uInvThetaMax: invThetaMax, ...PU });
+  }
+
+  _project(dt) {
+    const { T, params: p } = this;
+    this._buildMatrix();
+    let us = T.us;
+    if (this.coupler && this.coupler.active.length) {
+      // pressure and the velocities of the bodies together
+      us = this.coupler.solve(this, dt);
+    } else {
+      this._rhs(dt);
+      const cycles = this.twoWay ? Math.max(p.vcycles, p.vcyclesBodies) : p.vcycles;
+      for (let i = 0; i < cycles; i++) this._vcycle(0);
+    }
+    this._drawProject(us);
     this._swap(T.vel);
+  }
+
+  /**
+   * The velocity the pressure as it stands leaves, with the solids moving as `us` says: into
+   * the spare of the velocity's two textures, which is returned (not swapped in).
+   */
+  _drawProject(us) {
+    const { prog: P, T, levels, params: p } = this;
+    const L0 = levels[0];
+    this._draw(P.project, T.vel[1], L0,
+      { uVel: T.vel[0], uUs: us, uW: L0.W, uLiq: L0.liq, uP: L0.p[0], uInvThetaMax: 1 / p.thetaMin, ...this._projectUniforms() });
+    return T.vel[1];
+  }
+
+  // ---- what src/couple.js needs of the solver
+  /** A work texture laid out and formatted like `like` (kept until the grid changes its size). */
+  _scratch(name, like) {
+    let t = this._scr[name];
+    if (!t || t.w !== like.w || t.h !== like.h || t.fmt !== like.fmt) {
+      if (t) this.glc.deleteTexture(t);
+      t = this._scr[name] = this.glc.texture(like.w, like.h, like.fmt);
+    }
+    return t;
+  }
+
+  /**
+   * The solid velocities with the primitives moving otherwise than the solid pass was told:
+   * dV, dW per primitive (arrays of 3 * MAX_PRIMS) are added to its velocity and spin
+   * (base 1), or are all that moves (base 0). Returns the texture.
+   */
+  _usBody(base, dV, dW, name = 'us') {
+    const { prog: P, T } = this;
+    const out = this._scratch(name, T.us);
+    const C = new Float32Array(3 * MAX_PRIMS);
+    this.solids.forEach((s, i) => C.set([s.center[0], s.center[1], this.dim === 2 ? 0.5 : s.center[2]], 3 * i));
+    this._draw(P.usBody, out, this.levels[0], { uUs: T.us, uBase: base, uDV: dV, uDW: dW, uDC: C });
+    return out;
+  }
+
+  /** A texture like the pressure's, zero. It lives until dropField(), or until the grid is laid out anew (fieldsVersion counts that). */
+  newField() {
+    const like = this.levels[0].p[0];
+    const t = this.glc.texture(like.w, like.h, like.fmt);
+    this.glc.clear(t);
+    this.fields.add(t);
+    return t;
+  }
+
+  dropField(t) { if (this.fields.delete(t)) this.glc.deleteTexture(t); }
+
+  _dropFields() {
+    for (const t of this.fields) this.glc.deleteTexture(t);
+    this.fields.clear();
+    this.fieldsVersion++;
+  }
+
+  /**
+   * out = keep * p + the sum of coefs[k] * fields[k] (four at most) in the cells the pressure
+   * is solved in; held * p in cells whose pressure is held, zero elsewhere.
+   */
+  _combine(out, p, keep, held, fields = [], coefs = []) {
+    const L0 = this.levels[0];
+    const q = (k) => fields[k] || p;
+    this._draw(this.prog.combine, out, L0, {
+      uP: p, uCA: L0.cA, uKeep: [keep, held], uQ0: q(0), uQ1: q(1), uQ2: q(2), uQ3: q(3),
+      uC: [0, 1, 2, 3].map((k) => (fields[k] ? coefs[k] : 0)),
+    });
+  }
+
+  /** pressure += the sum of coefs[k] * fields[k]. */
+  addToPressure(fields, coefs) {
+    const L0 = this.levels[0];
+    for (let i = 0; i < fields.length; i += 4) {
+      this._combine(L0.p[1], L0.p[0], 1, 1, fields.slice(i, i + 4), coefs.slice(i, i + 4));
+      this._swap(L0.p);
+    }
+  }
+
+  /**
+   * How the liquid, at rest, answers solids that move as `us` says: `cycles` V-cycles on the
+   * pressure of that, which stands in place of the pressure until `done()` is called (the
+   * right-hand side is the caller's to rebuild). `pair`: two fields, the first with the guess
+   * the solve starts from; afterwards the first of the pair is the answer.
+   */
+  _response(us, cycles, pair) {
+    const { prog: P, levels } = this;
+    const L0 = levels[0];
+    const keep = L0.p;
+    // (the guess: nothing where no pressure is solved for, the liquid may have moved since)
+    this._combine(pair[1], pair[0], 1, 0);
+    this._swap(pair);
+    L0.p = pair;
+    this._draw(P.rhsBody, L0.rhs, L0, { uUs: us, uW: L0.W, uLiq: L0.liq });
+    for (let i = 0; i < cycles; i++) this._vcycle(0);
+    return () => { L0.p = keep; };
+  }
+
+  /** The pass of measureBodyForces. `vel`: the velocity of the liquid to go by (the solver's, unless given). */
+  _drawBodyForces(prims, vel = this.T.vel[0]) {
+    const { prog: P, T } = this;
+    const L0 = this.levels[0];
+    this._scatter(P.bodyForce, T.force, L0,
+      { uP: L0.p[0], uLiq: L0.liq, uVel: vel, uSlots: MAX_PRIMS, ...this._prims(prims, 'B') },
+      1, { clear: true });
+  }
+
+  /**
+   * As measureBodyForces, at once (the read-back blocks), of the pressure as it stands.
+   * `all`: with the wet share of each body's surface and the velocity of the liquid around it.
+   * `vel`: a velocity field to take the latter from, instead of the solver's as it stands.
+   */
+  bodyForcesSync(prims, all = true, vel = undefined) {
+    const { glc, T } = this;
+    this._drawBodyForces(prims, vel);
+    const a = glc.read(T.force[0]), b = glc.read(T.force[1]), c = all ? glc.read(T.force[2]) : null;
+    const NONE = 1e-6;
+    return prims.map((_, i) => {
+      const out = { force: [a[4 * i], a[4 * i + 1], a[4 * i + 2]], torque: [b[4 * i], b[4 * i + 1], b[4 * i + 2]] };
+      if (all) {
+        const w = c[4 * i + 3];
+        out.wet = a[4 * i + 3] > NONE ? b[4 * i + 3] / a[4 * i + 3] : 0;
+        out.fluidVel = w > NONE ? [c[4 * i] / w, c[4 * i + 1] / w, c[4 * i + 2] / w] : [0, 0, 0];
+      }
+      return out;
+    });
   }
 
   // ------------------------------------------------------------------ diagnostics
@@ -514,9 +684,7 @@ export class FluidSim {
     if (this._forceBusy || prims.length === 0) return null;
     this._forceBusy = true;
     try {
-      this._scatter(P.bodyForce, T.force, L0,
-        { uP: L0.p[0], uLiq: L0.liq, uVel: T.vel[0], uSlots: MAX_PRIMS, ...packPrims(prims, 'B', this.dim) },
-        1, { clear: true });
+      this._drawBodyForces(prims);
       const [a, b, c] = await Promise.all(T.force.map((tex) => glc.readAsync(tex)));
       // the weights are sums of O(1) terms: "none" is tested against a threshold because some
       // browsers return zeros with their last bits flipped (see GLContext._testReadback)
@@ -541,5 +709,7 @@ export class FluidSim {
       this.T.res, ...this.T.stats, ...this.T.force];
     for (const L of this.levels) all.push(L.W, L.liq, L.cA, L.cB, ...L.p, L.rhs, L.exA, L.exB, L.exF);
     for (const t of all) glc.deleteTexture(t);
+    for (const t of Object.values(this._scr)) glc.deleteTexture(t);
+    this._dropFields();
   }
 }

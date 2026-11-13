@@ -9,8 +9,9 @@ in 2D and 3D. The whole solver runs on the GPU as WebGL2 shader passes over floa
 (about 190–215 passes per time step). JavaScript only sequences the passes, integrates the
 few rigid bodies and sums a small reduced texture for the on-screen statistics.
 
-A third app, **World** (`world3d.html`), runs the same passes on an unbounded grid of which
-only the 8×8×8 bricks around the liquid are stored, over a height-map terrain: see
+A third app, **World** (`world3d.html`, and `world2d.html` in section), runs the same passes
+on an unbounded grid of which only the 8×8×8 bricks around the liquid are stored, over a
+height-map terrain, with ships that flood and sink when they are holed: see
 [World mode](#world-mode).
 
 ![3D simulator: dam break in a 192×96×96 tank](docs/screenshots/app-3d.png)
@@ -66,9 +67,27 @@ blue: the 3D solver, amber: copies of the map next to solved water, violet: sour
 | ![Sea cave and blowhole](docs/screenshots/world-cave.png) | ![Sinkhole and spring](docs/screenshots/world-spring.png) |
 | Swell squeezed into a slot under a roof of rock comes out of a hole in it, t = 24 s | A lake (left) drains through its floor into a spring 6 m lower, t = 40 s |
 
+A ship is a distance field on a lattice, solved together with the water in and around her
+(scenario 12, 10 cm cells; scenario 11 is the same in section, `world2d.html`, 5 cm cells):
+
+| | |
+|:-:|:-:|
+| ![Holed ship, down by the head](docs/screenshots/world-ship.png) | ![Holed ship, stored bricks](docs/screenshots/world-ship-bricks.png) |
+| t = 14 s: nine seconds after a hole opened under her bow she lies 4.6° by the head, asleep | The 1568 bricks (0.80 M cells) around her are all that is stored: blue solved, amber water at rest next to it. The sea beyond is a formula |
+| ![Holed ship going down](docs/screenshots/world-ship-sinking.png) | ![Holed ship on the bed](docs/screenshots/world-ship-sunk.png) |
+| t = 38.5 s: a second hole amidships, and the sea has come over the bulkhead of the last compartment | t = 55 s: on the bed, 3.4 m down |
+| ![Ship in section, one compartment open](docs/screenshots/world2d-flood.png) | ![Ship in section, stored bricks](docs/screenshots/world2d-flood-bricks.png) |
+| In section, t = 10 s: the foremost of four compartments is open to the sea | 57 bricks of 16 × 16 cells are stored |
+| ![Ship in section, going down](docs/screenshots/world2d-flood-sinking.png) | ![Ship in section, on the bed](docs/screenshots/world2d-flood-sunk.png) |
+| t = 20 s: eight seconds after a second hole | t = 50 s: on the bed |
+
 ![World app: the terraced cascade with its bricks](docs/screenshots/app-world.png)
 
 ![World app: surf on a beach, with the map of who has the water](docs/screenshots/app-world-surf.png)
+
+![World app: the holed ship](docs/screenshots/app-world-ship.png)
+
+![World in section: flooding compartments](docs/screenshots/app-world2d.png)
 
 The pictures are produced from the real apps by `node tools/screenshots.mjs`.
 
@@ -76,7 +95,7 @@ The pictures are produced from the real apps by `node tools/screenshots.mjs`.
 
 ```sh
 node tools/serve.mjs          # or: python3 -m http.server 8080
-# open http://localhost:8080/   (2d.html, 3d.html, world3d.html)
+# open http://localhost:8080/   (2d.html, 3d.html, world3d.html, world2d.html)
 ```
 
 ES modules do not load from `file://`, so the folder has to be served. Requirements: WebGL2
@@ -163,7 +182,8 @@ float read-back is exact) and with `node tools/interact.mjs 2d|3d`, which drives
 apps with synthetic mouse input (`2d|3d|world`). Both tools take
 `--browser chrome|firefox|librewolf`; `npm test` runs the interaction checks in Chrome,
 `npm run test:firefox` and `npm run test:librewolf` in the other two. The pages for world mode
-(`golden.html`, `sparse.html`, `world.html`) are described [there](#world-mode).
+(`golden.html`, `sparse.html`, `world.html`, `held.html`, `sea.html`, `swell.html`,
+`heightfield.html`, `handover.html`, `hull.html`) are described [there](#world-mode).
 
 ## Where the paper leaves a choice open
 
@@ -309,6 +329,14 @@ velocity and can be thrown.
 
 This is a partitioned, explicit coupling, not a strongly coupled solve with the bodies inside
 the pressure system as in [BBB07]; the consequences are listed under the limitations below.
+
+**Solved together instead.** `src/couple.js` makes the velocities of the bodies unknowns of
+the pressure solve and iterates on them with a measured added mass matrix (described under
+[World mode](#world-mode), where it is the rule: a hull with water in it cannot be done by
+turns). Here it is an option, *Solver → Bodies and liquid solved together* or `?couple`: it
+waits for a read-back from the GPU once or twice per step, and the dense solver's reference
+hashes were taken without it. Bodies that ride on each other or cover the surface are calmer
+with it (the table there).
 Because contacts use surface sample points, two boxes meeting edge to edge between sample
 points can interpenetrate slightly before the contact is seen.
 
@@ -317,9 +345,10 @@ points can interpenetrate slightly before the contact is seen.
 `world3d.html` runs the solver without the box. Cells are world integers on an unbounded grid;
 only bricks of 8×8×8 cells that hold liquid, or that liquid can reach before anyone looks again,
 are stored, and the ground is a height map. The numerics are the passes described above.
-Three of four planned steps towards large scenes are in: storage in bricks, water at rest
-that is neither solved nor stored, and a height field for water that moves but needs no 3D
-solver. Still to come: ships with compartments.
+The four steps towards large scenes that were planned are in: storage in bricks, water at
+rest that is neither solved nor stored, a height field for water that moves but needs no 3D
+solver, and ships with compartments that flood when they are holed. `world2d.html` is the
+same in section, with one scene.
 
 **Storage** (`src/world/bricks.js`, `src/world/sparsesim.js`)
 
@@ -542,13 +571,18 @@ sources put in + what drains took and what evaporated is constant. The app shows
 difference as *Unaccounted for*.
 
 *Rigid bodies* (`src/world/world.js`) are those of the tank simulators, with the terrain as
-one more thing to collide with; scripted solids follow a function of time. Forces are
+one more thing to collide with; scripted solids follow a function of time. (Since the ships
+below, bodies and liquid are solved together here and no longer by turns.) Forces are
 measured in the bricks around a body only. A body goes to sleep once, for 90 steps, it has
 moved less than 0.02 cells per step and its height has stayed within a band of 0.2 cells,
 at the moment it passes the middle of that band: it stays where it is, and its water is
 free to come to rest and be handed back. (Slow alone is not enough. A buoy that bobs a
 quarter of a cell up and down is slow all the time, and would be stopped wherever in its
-bob it happens to be.) It wakes
+bob it happens to be. A body whose height has not changed by 0.002 cells in those 90 steps
+sleeps at once: a wreck on the bed creeps one way and never passes a middle. And a body
+next to the ground does not sleep while the middle of the band itself has moved by more
+than 0.01 cells in those 90 steps: a hull that stands on her bow while her last compartment
+fills goes over slowly, and jitters through the middle of a band that travels.) It wakes
 when grabbed, when a moving body comes near, to water faster than 0.15 cells per step next
 to it, and to any waking water once that water has been at rest for 4 s. (The water a body
 stirred up itself must not wake it again.)
@@ -559,23 +593,24 @@ Three scenes use this, and a *Crate* tool drops crates into any of them:
 |---|---|---|---|
 | Cell size | 5 cm | 10 cm | 10 cm |
 | Scene | a 50 × 40 × 50 cm crate falls 1.2 m into a sea without shores or bed | five buoys up to 50 m apart; from 15 s on a 380 l lump of water drops next to one of them every 5 s | a 2.6 m launch goes round a 30 m × 13 m basin behind breakwaters once in 28 s; two buoys and a crate ride its wake |
-| Bricks stored at most (solved at most) | 717 (539) | 1269 (883) | 1204 (860) |
-| Cells stored then, of those in the box around them | 0.37 M of 0.60 M | 0.65 M of 5.53 M | 0.62 M of 1.11 M |
-| Step, mean over 60 s | 4.6 ms | 24.6 ms | 23.7 ms |
-| Books off by, of the liquid stored at the peak | 3.0e-6 | 2.1e-5 | 3.4e-5 |
-| Bodies | crate asleep after 7.9 s | each lump wakes the buoy next to it and no other; all 13 times a buoy goes to sleep it is 0.01 to 0.06 cells below its float line | the buoys woken twice, once per round of the launch, the crate once; asleep 0.02 to 0.05 cells below their float lines, the crate 0.12 to 0.14 |
-| Most changes between solved and held of one brick in 60 s | 2 | 6 | 9 |
+| Bricks stored at most (solved at most) | 656 (494) | 1215 (840) | 1214 (863) |
+| Cells stored then, of those in the box around them | 0.34 M of 0.52 M | 0.62 M of 6.88 M | 0.62 M of 1.11 M |
+| Step, mean over 60 s | 2.3 ms | 12.0 ms | 11.8 ms |
+| Books off by, of the liquid stored at the peak | 3.4e-6 | 2.1e-5 | 3.4e-5 |
+| Bodies | crate asleep after 7.0 s | each lump wakes the buoy next to it and no other; all 13 times a buoy goes to sleep it is 0.003 to 0.06 cells below its float line | the buoys woken twice, once per round of the launch, the crate once; asleep 0.003 to 0.04 cells below their float lines, the crate 0.10 to 0.11 |
+| Most changes between solved and held of one brick in 60 s | 4 | 6 | 9 |
 | Wet cells at the edge of the stored bricks, bricks refused | 0, 0 | 0, 0 | 0, 0 |
 
-(Chrome 154, RTX 3090, `tests/sea.html?scene=…&time=1`, without drawing. The step times
-were taken while another job kept the machine and its GPU busy, and say little on their
-own. The code as it was before the map of the surface below, the brick over the surface
-and the later sleep of the bodies, timed in turn with this one: 3.7, 23.5 and 22.7 ms. The
-map is 0.5 to 0.8 ms of the difference in the first scene, where it runs for 38 of the 60 s,
-and about 1 ms in the other two. On a machine less busy the earlier code took 2.3, 14.6 and
-13.9 ms, and the app draws all three scenes at 60 frames per second.)
+(Chrome 154, RTX 3090, `tests/sea.html?scene=…&time=1`, without drawing, one scene at a
+time, with bodies and liquid solved together as the scenes run since the ships below. Step
+times depend on what else the machine does: measured while another job kept its GPU busy,
+the scenes took 4.6, 24.6 and 23.7 ms. The map of the surface below is 0.5 to 0.8 ms of a
+step in the first scene, where it runs for 38 of the 60 s, and about 1 ms in the other two.
+The app draws all three scenes at 60 frames per second. With bodies and liquid by turns,
+as they were until the ships, the scenes stored 717 (539), 1269 (883) and 1204 (860)
+bricks, the crate was asleep after 7.9 s and the sea empty after 11.5 s.)
 
-In the first scene nothing is stored from 11.5 s on: the crate is asleep, its waves have
+In the first scene nothing is stored from 10.6 s on: the crate is asleep, its waves have
 left, and the sea is a formula once more. Where water stays solved for the whole minute the
 books drift by 2 to 3e-5, which is the solver's own loss in the solved cells (the dense
 solver ends its scene of four floating bodies 1e-6 short per second). The buoys and the
@@ -586,8 +621,8 @@ far apart make nine multigrid levels.
 How far a wave travels before the sea counts as at rest is the waking speed. Halving both
 thresholds (`?p.wakeSpeed=0.03&p.sleepSpeed=0.01`) keeps the rings of the crate for longer
 and further out: 3845 bricks at the most instead of 717 (2880 of them solved, which is the
-budget but for 120), and the sea is empty again after 17.8 s instead of 11.5. The rings
-still end at a brick edge, further out. What carries them on is the map of the surface
+budget but for 120), and the sea is empty again after 17.8 s instead of 11.5 (both with
+the bodies by turns). The rings still end at a brick edge, further out. What carries them on is the map of the surface
 below.
 
 `tests/held.html` checks the pieces on fixed sets of bricks in 2D and 3D: a pool with only
@@ -606,9 +641,9 @@ of where the ball fell.)
 `tests/sea.html` runs the three scenes for a minute each without drawing them and checks
 the books, the storage and the bodies (the table above). With `&lump=9` a ball of water
 lands 1.6 m from the crate nine seconds after it, on water that has just gone back to rest:
-it has to splash all the same (1038 bricks at the most) and leave nothing stored (after
-20 s). With `&lump=2&lumpAt=150,0&p.maxSolved=400` the ball lands 7.5 m away while the
-crate's waves hold the whole of a budget of 400 bricks: 139 of the calmest are sent to sleep
+it has to splash all the same (1059 bricks at the most) and leave nothing stored (after
+19 s). With `&lump=2&lumpAt=150,0&p.maxSolved=400` the ball lands 7.5 m away while the
+crate's waves hold the whole of a budget of 400 bricks: 119 of the calmest are sent to sleep
 and the splash gets its 28 (with `&p.evict=0` it gets none: the sea takes the ball in
 without a ripple and a patch of mist is left hanging over it).
 
@@ -642,7 +677,7 @@ surface above rest and its rate of change.
 * *The map is one-way.* The solver knows nothing of it: with and without the map its fields
   agree to the bit, and so do the books. Once no brick is solved and the map has calmed
   down (no wave above 0.02 cells or faster than 2.5e-3 cells per step) it is switched off,
-  and the sea is a formula again: in the crate scene after 38 s, 26 s after the last brick
+  and the sea is a formula again: in the crate scene after 38 s, 27 s after the last brick
   was dropped.
 
 A step of the map costs 0.30 ms (0.13 ms at 256², 0.67 ms at 1024²).
@@ -654,7 +689,7 @@ after a minute; a ball of water dropped into the sea makes rings that run on bey
 solved bricks, the same along the axes of the bricks as along their diagonals (correlation
 0.99, heights within 7 %), although the solved region ends at different distances there.
 `tests/sea.html?scene=sea` checks what the map holds at the moment the last brick is dropped
-(rings of 0.08 cells on their way out and no dent where the crate floats) and that it is
+(rings of 0.11 cells on their way out and no dent where the crate floats) and that it is
 switched off before the minute is over.
 
 **A height field for water that moves** (`src/world/heightfield.js`, `src/shaders/heightfield.js`,
@@ -845,6 +880,205 @@ Where these miss what was aimed at:
 * In LibreWolf `swap` returns the depths within 3e-6 cells, not to the last bit: that
   browser alters the last bits of everything read back, and the test allows 1e-5 there.
 
+**Ships** (`src/world/hull.js`)
+
+A ship is a rigid body whose shape no formula describes: a shell with compartments, and
+holes that appear while it runs.
+
+* The shape is given as a distance function in the frame of a drawing (boxes and planes
+  joined, cut and intersected). It is sampled once on a lattice one cell apart, around the
+  centre of mass, and that lattice is the body from then on: a texture with two numbers per
+  sample, the distance to the *material* and the distance to the *shell*, the body with its
+  hollows filled. The solid pass reads it as a third kind of primitive in its table of twelve
+  (up to two hulls), interpolated between the samples; beyond the lattice the distance is a
+  lower bound. A flat face is exact wherever it lies (to 3e-8 cells), edges and corners are
+  rounded off by 0.3 cells.
+* Mass, centre of mass and inertia are sums over samples half a cell apart, each counted
+  by how much of it is inside, plus point masses for ballast. For a hollow rectangle
+  and a hollow box they are the formulas' to five digits.
+* A hole is `max(d, r − |x − c|)` on the samples and a new upload (`World.breachAt`, the
+  *Hole* tool; in 3D the ball is centred half a wall inside the surface the pointer's ray
+  meets). Mass and centre of mass stay as they are.
+* Walls are three cells thick. (Two is the least that keeps the liquid on the two sides of
+  a wall apart wherever the wall lies in the grid.)
+* Contacts use points on the shell about two cells apart, against the ground, the fixed
+  solids and the other bodies, with the impulses of the balls and boxes.
+* The sea is water at rest everywhere below its level, also where a hull is about to be put.
+  At the start the bricks around a hull are stored and its shell is emptied, and they stay
+  solved while she sleeps: water at rest knows nothing of a compartment that is dry below
+  the waterline, and bricks that are held hold nothing else.
+
+**Bodies and liquid solved together** (`src/couple.js`)
+
+The tank simulators let bodies and liquid take turns: the force measured after one step moves
+the body in the next, with an estimate of the added mass to make up for the delay (see
+[Rigid bodies](#rigid-bodies)). The water inside a hull is added mass of 14 to 16 times her
+own, and every error of an estimate comes back multiplied by that. Let go in the air, a box
+with water in it fell at 1.17 g that way. In the World pages the velocity of every body at
+the end of the step is therefore an unknown of the pressure solve:
+
+    M (v − v₀) = Δt M g + J(v)        J(v): the impulse of the pressure that belongs to v
+
+J is linear in v but for the separating boundaries, J(v) = J(vᵢ) − A (v − vᵢ) with A the
+added mass matrix, so this is Newton's method on three (2D) or six unknowns per body:
+v ← v + (M + A)⁻¹ (M (v₀ + Δt g) + J(v) − M v).
+
+* J(v) is the sum of the pressure over the body's surface, the `bodyForce` pass of the tank
+  simulators, read back at once.
+* A is measured. Column k is the force on the body of the pressure with which liquid at
+  rest answers the body moving at unit speed in its degree of freedom k: one pressure solve
+  per degree of freedom, with the right-hand side of that motion alone.
+* Those pressure fields are kept, one per body and degree of freedom, and each is the
+  starting guess of its next solve: one of them per step, in turn, with two V-cycles (a body
+  that has just met the liquid gets all of them from nothing, with four). The multigrid
+  cycle converges slowly on water enclosed by thin walls, because the coarse levels cannot
+  tell the two sides of a wall apart. Two cycles from nothing find 6.5 of the 14 to 16 hull
+  masses, and Newton's method diverges on less than half the slope: the hull's velocity
+  changed sign every step.
+* The pressure is linear in the velocities, so the pressure that belongs to a Newton step
+  is known at once: p += Σ δvₖ · field k (pass `combine`). The last thing a step does is
+  thus to make the velocity of the body and the pressure on its surface agree. What the
+  fields lack is left as a residual of the pressure equation, a little divergence that the
+  density correction of the next step takes, and not as momentum the body has and the
+  liquid never gave.
+* Contacts are inside the iteration: every iterate goes through the contact solver, whose
+  effective masses include A, before the liquid sees it.
+* The drag of the tank simulators (the solver is inviscid) is in the equation too,
+  implicitly, against the velocity of the liquid around the body as the pressure of the
+  first iteration leaves it: one more projection pass, into the spare velocity texture.
+  (Read before the projection, that velocity still carries the gravity of the step. A body
+  afloat was then dragged down by water that seemed to fall, by 1.5 % of its weight, and a
+  crate floated 0.05 cells lower than with the coupling by turns.)
+* A body that lies on the ground has a film of liquid under it that is thinner than a
+  cell. To close it the liquid has to leave sideways many times faster than the body comes
+  down, faster than the advection carries it: cells of the film are over-full in one step
+  and empty in the next, with the pressure of the whole depth in them or none. The wreck of
+  scenario 11 hopped on the bed at 0.1 to 0.3 cells per step, and whether it ever lay still
+  was a matter of chance. A real film does the opposite, the narrower the more: it resists
+  being squeezed out and being drawn in. So the points of a body's surface within 1.5 cells
+  of a solid that nothing moves are damped in their motion towards and away from it, in
+  the same equation and implicitly: 600 s⁻¹ for a body in the liquid where it touches,
+  falling off with the distance d as (0.3 / (d + 0.3))², shared among those points. (At
+  the points, not on the body as a whole: a hull that stands on her bow is free to turn
+  about it.)
+* The first guess of a step is that the body accelerates as it did in the last one; a
+  body that is new to the liquid falls. One that wakes from sleep stays where it is: woken
+  with the guess that it falls, the hull of scenario 11 was jolted to 0.007 cells per step
+  (the answers of the liquid, measured from nothing at that moment, are too small to take
+  all of the guess back within four iterations), and 0.002 with this one.
+* At most four iterations, until no velocity changes by more than 0.002 g Δt. Afloat and
+  calm it is one per step (1.00 to 1.06 in the tests below), two to four while a compartment
+  floods or a body lands.
+
+The tank simulators offer it under *Solver* (*Bodies and liquid solved together*, or
+`?couple`); their default stays the coupling by turns, against which the reference hashes
+were taken.
+
+`tests/hull.html?case=…` (2D unless `&dim=3`; Chrome 154, RTX 3090):
+
+| | Result | Aim |
+|---|---|---|
+| `mass`: hollow rectangle, hollow box | mass, volume, centre and inertia as the formulas (0.000 %) | within 0.5 % |
+| `dry`: a hull held in a basin, its compartment below the waterline, at five places within a cell and heels up to 15°, 10 s | no liquid inside (0 exactly), 2D and 3D | stays dry |
+| `speed`: the same hull driven through the water, 6 s | 1e-5 cells of liquid inside at 0.1 cells per step, 0.006 at 0.25, 0.3 at 1; 2e-5 bobbing 3 cells up and down at 0.38 g, 1.1 bobbing 6 cells at 0.75 g, 11 bobbing 3 cells at 1.5 g | measured; below 0.02 up to 0.25 cells per step |
+| `tank`: a sealed tank shaken for 8 s | half full: 1e-6 of the water gets out (3D 3e-6). Full to the lid: 0.23 % in 2D, none in 3D | below 0.5 % |
+| `fall`: an open box with water in it, let go in the air | both fall at 1.014 g (3D 1.002 g), no single step off by more than 5.8 % (4.5 %), all the water stays in | g within 2 % |
+| `float&sea=1`: the box with water in it on an open sea, 30 s | 0.02 cells below where Archimedes puts it; heaving 0.12, 0.014, 0.005, 0.009, 0.006 and 0.007 cells in successive 5 s; 0.0011 cells per step at the end; upright within 0.02° | within 0.25 cells, below 0.005 cells per step |
+| the same let go a cell too high (`&lift=1`) | 0.02 below; heaving 1.22, 0.10, 0.018, 0.008, 0.007, 0.010; 0.0004 cells per step | |
+| the same in 3D, 15 s | 0.03 below; heaving 0.08, 0.014, 0.007; 0.0003 cells per step; upright within 0.02° | |
+| `loll`: a top-heavy hull with one tank across it | lolls at 18.9°; the hydrostatics (height of the centre of gravity over that of the buoyancy, least) say 19.0° | within 2° |
+| the tank divided down the middle | upright within 0.08°; hydrostatics 0° | within 2° |
+| `breach`: a hole 5 cells wide in the floor of a held hull, 11 cells under the sea | dry before; 90 % full after 3.01 s. Torricelli with the jet as wide as the hole: 2.09 s; with the 0.61 of it that a sharp-edged slot leaves: 3.42 s (−12 %). Ends at 99.0 % | within 25 % |
+| the same in 3D (a round hole) | 6.11 s; 4.61 s and 7.54 s (−19 %). Ends at 100.1 % | within 25 % |
+| `flood`: scenario 11, a ship in section with four compartments. Hole in the floor of the foremost | trims 8.3° by the bow with 468 cells of water in it; the hydrostatics of lost buoyancy: 7.5° and 441; the other three dry; asleep within 5 s | within 2° |
+| a second hole, in the next one | hydrostatics: cannot float. She goes down by the bow, stands on it at 21° while the last compartment fills, and lies flat on the bed 28 s after the hole; asleep 35 s after it, trim 0.02°, her lowest corner 0.01 cells above the bed | at rest on the bed |
+| `ship&dim=3`: scenario 12 with its holes at 3 s and 16 s. Afloat | draws 10.07 cells, her weight in water 9.99 | within 0.25 |
+| bow compartment open | trims 4.78° by the bow with 1698 cells of water in it; hydrostatics 4.59° and 1768; the other two dry; asleep after 8 s | within 2° |
+| the one amidships as well | hydrostatics: the sea would stand 6.3 cells over the bulkhead of the last one. On the bed 19 s later, asleep within 27 s, 0.05 cells above it, her rim 18 cells under the sea | at rest on the bed |
+| Water and ledger, of the liquid stored at the most | `float`, 30 s: off by 1.3e-5 (1.9e-5 let go too high, 2.8e-6 in 3D after 15 s). `flood`: 2.4e-5 after 43 s, 3.2e-5 after 103 s. `ship`: 5.8e-6 after 16 s, 2.4e-5 after 46 s | 1e-5 |
+
+The hydrostatics are worked out in the test pages: polygons clipped at the waterline in 2D,
+a lattice of points in 3D, with the open compartments carrying nothing and the level and
+trim found at which weight and moment balance.
+
+Floating bodies in contact, the six arrangements of `tests/contact2d.html` at three pool
+depths each (0.33, 0.34 and 0.35 of the tank), mean kinetic energy of the bodies between
+60 s and 120 s, by turns → solved together (`&couple=1`):
+
+| | By turns, at the three depths | mean | Solved together | mean |
+|---|---|---|---|---|
+| single box | 0.02, 0.1, 0.073 | 0.065 | 0.2, 0.13, 0.19 | 0.17 |
+| two balls | 0.17, 0.056, 0.12 | 0.12 | 0.32, 0.0092, 0.18 | 0.17 |
+| three boxes covering the surface | 2.3, 0.41, 0.12 | 0.95 | 0.026, 0.18, 0.24 | 0.15 |
+| ball on two boxes | 0.14, 0.019, 0.021 | 0.061 | 0.1, 0.0081, 0.052 | 0.054 |
+| five bodies | 0.05, 0.11, 0.031 | 0.064 | 0.071, 0.12, 0.023 | 0.07 |
+| block on a raft | 0.29, 0.32, 1.3 | 0.65 | 0.29, 0.055, 0.09 | 0.14 |
+
+(Both columns were run again for this table. The 0.90 that the raft was to improve on was
+measured at other depths; runs that differ only in the depth differ by up to a factor of
+ten, so a single figure says little.)
+
+*Scenario 11, Flooding compartments* (`world2d.html`, 5 cm cells). A ship in section, 6 m
+long and 1.2 m deep with four compartments open at the top, drawing 51 cm on a sea 2.8 m
+deep that is not stored: 57 bricks of 16 × 16 cells around her are, and after the first hole
+(the scene's, at 3 s, in the floor of the foremost compartment) she lies 8° by the bow.
+Every further hole is the mouse's. One step takes 5 to 7 ms while she is awake (up to 14
+while the compartment floods, 3.5 asleep), most of it the 430 to 730 passes of a step on
+so few cells and the read-backs of the iteration.
+
+*Scenario 12, Holed ship off an island* (`world3d.html`, 10 cm cells). A hull 7.2 m long,
+2.4 m wide and 1.6 m deep with a pointed bow and three compartments, drawing 1 m, in 3.4 m
+of water off the foot of an island's slope. A hole of 25 cm radius opens under her bow at
+5 s: she settles 4.6° by the head and is asleep at 13 s. A second one amidships at 30 s is
+more than she has: a few seconds later the sea comes over the bulkhead of the last
+compartment, she goes down by the bow at 21° and lies on the bed at 50 s, asleep at 57 s.
+1344 bricks (0.69 M cells) are stored around her at the start, 1764 at the most, 660
+around the wreck; a step takes 12 to 17 ms while she is afloat and awake, 18 to 28 ms
+while she goes down and 7 to 11 ms while she sleeps (read off the app while another job
+kept the machine busy).
+
+Where these miss what was aimed at, and what else was found:
+
+* *The books.* 1e-5 was the aim. With a hull afloat the solver loses about 1e-6 of the
+  liquid it solves per second, as it does with the crate and the buoys above: 2.8e-6 to
+  3.2e-5 in the runs of the table, which the tests allow as 1e-6 plus 1e-6 per second.
+* *Torricelli.* The time to fill is within 25 % only of the formula with the contraction of
+  the jet in it. The hole is five cells across; the effective share of it that carries the
+  jet goes from 0.55 at the start to 0.69 at the end (0.61 for a sharp-edged slot).
+* *The angle of loll* depends steeply on how top-heavy the hull is: with 3 % less ballast
+  (`&ballast=227`) the hydrostatics say 14.9° instead of 19.0°. The hull follows, at 15.3°.
+* *In a closed basin* the same hull does not come to rest: its heaving grows from 0.14 to
+  0.32 cells in 30 s (`case=float` without `&sea=1`; reported, not a check). The coupling is
+  not the cause: converged harder it is the same 0.32, and it is 0.20 with the
+  volume correction off (`&p.compress=0`), which contracts the under-full cells a moving
+  hull leaves at the walls it passes and so pulls on the hull. On a sea the waves it makes
+  leave and take the energy with them.
+* *The advection with the capacities of the step before* (`oldCapacity`: a solid has moved
+  before the density is advected, so a source cell's capacity belongs to the new position
+  and its density to the old) was tried as planned. The force ripple on a body pushed
+  through the liquid goes from 0.206 to 0.171 of its weight; floating bodies come to rest no
+  sooner. It is left in as an option, off.
+* *Bodies in contact* (the table above): the raft is at 0.14 on the mean of three depths
+  and not under the 0.1 aimed at (0.055 and 0.09 at two of them, 0.29 at the third; 0.65
+  by turns). The two arrangements that were worst by turns (boxes covering the surface,
+  the raft) are five to six times calmer solved together, the ball on two boxes and the
+  five bodies are the same, and the single box and the two balls are less calm (0.17
+  against 0.065 and 0.12), the box at all three depths. With the drag as it first was,
+  against the liquid's velocity before the projection, all six were calmer and the raft at
+  0.081: the fall of a step counted as speed through the water and the drag was the
+  larger for it. That was an error (it also pulled every floating body down by 1.5 % of
+  its weight), and what it bought is gone with it.
+* *A body on the ground.* Without the damping of the film under it the wreck of `flood`
+  was still hopping on the bed when the test ended, and after 45 s in three variants of
+  the case. With it the wreck is at rest as soon as it lies flat and asleep 5 to 15 s
+  later, in the case and in five variants (two other sizes of hole, more ballast, two
+  V-cycles between iterations, all responses every step). The 600 s⁻¹ and their fall-off
+  with the distance are chosen, not derived, and a body is the slower for them over the
+  last cell above the ground and in coming off it: by the formula about two seconds for
+  the wreck, which was not measured on its own.
+* A sealed tank that is full to the lid loses 0.23 % of its water through its walls in 2D
+  when shaken for 8 s (none half full, none in 3D).
+
 **Limits of world mode as it stands**
 
 * It needs read-back from the GPU to decide which bricks to store. With
@@ -900,13 +1134,24 @@ Where these miss what was aimed at:
 * Beyond the budget of 3000 solved bricks waves wake nothing more. Liquid that falls in then
   gets the bricks of its splash and no others: the rings around it are the map's.
 * A sleeping body stays exactly where it is until something wakes it, so a slow drift ends
-  when it goes to sleep. Bodies float a little low: the balls 0.01 to 0.06 cells under
-  their float lines, the crate of the harbour 0.13. That is where the solver has them, not
+  when it goes to sleep. Bodies float a little low: the balls up to 0.06 cells under
+  their float lines, the crate of the harbour 0.11. That is where the solver has them, not
   where they happened to be stopped.
 * With `pushRel` and `sliverSide` a slower flow remains at a tilted solid in a pool at rest:
   0.03 to 0.05 cells per step in the dense 64³ test after 15 to 40 s. In the scenes the body
   is asleep and its water handed back before that.
-* No 2D app (2D exists in the tests).
+* The air is a void for ships too. A compartment that is open to the sea fills to the level
+  outside whether or not it has a lid: no air is trapped, and nothing bubbles out.
+* A hull is its lattice: one cell between samples, edges rounded by 0.3 cells, walls of
+  three cells, holes that are balls. Its mass, centre of mass and inertia do not change
+  when it is holed. Two hulls at the most, among the twelve solids of a scene.
+* A hull keeps the bricks around it stored and solved while it sleeps (660 around the
+  wreck of scenario 12, 1152 around the ship afloat): what is in it is not water at rest.
+* Bodies and liquid solved together need one read-back per iteration that the step waits
+  for, and a page whose read-back is scrambled cannot run them (World does not start there).
+* Ships have been tested on a sea at rest only: not on a height field, in swell that is
+  solved, or against each other. The waves of the surface map pass through them.
+* The 2D page has one scene, and no map of the surface beyond the solved water.
 
 ## Known limitations
 
@@ -919,7 +1164,7 @@ Where these miss what was aimed at:
 * At 384² a pool at rest starts a slow long slosh after about a minute (±1.4 cells of 153
   after 120 s). The pressure residual sits at 1.6e-3 from the first step there and more
   V-cycles do not lower it, which points at 32-bit float precision of the pressure solve.
-* Rigid bodies are coupled explicitly (see above) and floating bodies do not come to complete
+* By default rigid bodies are coupled explicitly (see above) and floating bodies do not come to complete
   rest. Two minutes after four bodies were dropped into the 128² pool they still move by
   ±0.1 to ±0.5 cells (slowly decaying), in 3D at 64 cells by about ±1 cell, and bodies packed
   against each other keep creeping at up to 0.04 cells per step. Three things feed this:
@@ -939,19 +1184,21 @@ Where these miss what was aimed at:
 
 ```
 2d.html, 3d.html, index.html   apps and landing page
-world3d.html                   the World app
+world3d.html, world2d.html     the World app, and the same in section
 src/gl.js                      WebGL2 helpers (programs, float targets, scatter, async readback)
 src/sim.js                     FluidSim: textures, hierarchy, the time step
 src/shaders/                   GLSL for every pass (sparse.js: brick bookkeeping passes; heightfield.js,
                                hfcouple.js: the map and its hand-overs)
 src/runner.js                  scene driver: obstacles, bodies, emitters, interaction verbs
 src/bodies.js                  rigid bodies and contacts
+src/couple.js                  bodies and liquid solved together (Newton on the bodies' velocities)
 src/render2d.js, render3d.js   renderers
 src/scenes2d.js, scenes3d.js   scenarios
 src/world/                     world mode: bricks.js (page table), sparsesim.js (solver on bricks),
                                water.js (water at rest), swell.js (waves beyond the solved water),
-                               heightfield.js (shallow water on a map), terrain.js, world.js,
-                               scenes.js, render3d.js, app3d.js
+                               heightfield.js (shallow water on a map), hull.js (bodies with a shape
+                               of their own), terrain.js, world.js, scenes.js, render3d.js,
+                               render2d.js, app3d.js, app2d.js
 tests/, tools/                 headless diagnostics and interaction checks (puppeteer-core)
 docs/screenshots/              the pictures above (tools/screenshots.mjs regenerates them)
 ```

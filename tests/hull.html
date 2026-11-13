@@ -1,0 +1,831 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>hulls: bodies with a shape of their own</title>
+<canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// A hull (src/world/hull.js) is a rigid body whose shape is a distance field on a lattice.
+//   ?case=mass    mass, centre and inertia by lattice sums against the formulas (hollow rectangle / box)
+//   ?case=dry     a hull held in a basin, its compartment below the waterline: it stays dry,
+//                 upright and heeled, at several places within a cell
+//   ?case=speed   ... and while the hull is driven through the water (leak against speed)
+//   ?case=tank    a sealed tank full of water, shaken: it keeps its water and the water stays with it
+//   ?case=fall    a hull with water in it, let go in the air: both fall as one, at g
+//   ?case=float   a hull with water in it afloat (&sea=1: on an open sea; &lift= cells it starts too high)
+//   ?case=loll    2D: a top-heavy hull with a tank across it lolls; the same tank divided down the middle does not
+//   ?case=breach  a hole in a hull that is held: the time it takes to fill against Torricelli
+//   ?case=flood   2D: a ship in section; one compartment open: the trim of the hydrostatics; two: to the bed
+//   ?case=ship    3D: scenario 12 of the app with its two holes sooner, against the same hydrostatics
+//   &dim=2|3  &wall=cells  &steps=  &p.<solver param>=
+import { GLContext } from '../src/gl.js';
+import { makeGrid } from '../src/sim.js';
+import { World } from '../src/world/world.js';
+import { Hull, sdBox, sdCut } from '../src/world/hull.js';
+import { WORLD_SCENES } from '../src/world/scenes.js';
+import { quatFromAxisAngle } from '../src/bodies.js';
+
+const q = new URLSearchParams(location.search);
+const kind = q.get('case') || 'mass';
+const dim = Number(q.get('dim') || 2);
+const num = (k, d) => (q.get(k) === null ? d : Number(q.get(k)));
+const params = {};
+for (const [k, v] of q) if (k.startsWith('p.')) params[k.slice(2)] = Number(v);
+// &c.<name>=: parameters of the Coupler (src/couple.js)
+const cparams = {};
+for (const [k, v] of q) if (k.startsWith('c.')) cparams[k.slice(2)] = Number(v);
+const log = (s) => console.log(s);
+let failed = 0;
+const check = (ok, what) => { if (!ok) failed++; log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); };
+
+// An open box: outside 2a x 2b (x 2c), walls `wall` thick, no lid. The origin of the drawing is
+// the middle of the outside.
+function openBox(a, b, c, wall, lid = false) {
+  const outer = sdBox(dim, [0, 0, 0], [a, b, c]);
+  const top = lid ? b - wall : b + 20;
+  const cavity = sdBox(dim, [0, (top - b + wall) / 2, 0], [a - wall, (top + b - wall) / 2, c - wall]);
+  return { sd: sdCut(outer, cavity), shell: outer, box: [[-a, -b, -c], [a, b, c]], cavity };
+}
+
+// A basin: floor at y = 0, walls at x = 0 and x = W (3D: z = -D/2 and D/2), water up to `level`.
+function basin(W, level, D = 64) {
+  const m = 12, tall = 2 * level + 40;
+  const solids = [{ type: 'box', center: [W / 2, -m, 0], half: [W / 2 + 2 * m, m, D / 2 + 2 * m] },
+    { type: 'box', center: [-m, tall / 2, 0], half: [m, tall / 2, D / 2 + 2 * m] },
+    { type: 'box', center: [W + m, tall / 2, 0], half: [m, tall / 2, D / 2 + 2 * m] }];
+  if (dim === 3) {
+    solids.push({ type: 'box', center: [W / 2, tall / 2, -D / 2 - m], half: [W / 2 + 2 * m, tall / 2, m] });
+    solids.push({ type: 'box', center: [W / 2, tall / 2, D / 2 + m], half: [W / 2 + 2 * m, tall / 2, m] });
+  }
+  return { h: 0.05, solids, liquid: [{ type: 'box', center: [W / 2, level / 2, 0], half: [W / 2, level / 2, D / 2] }] };
+}
+
+// the liquid in the cells of a box of the world: [{ x, y, z, rho }] of cells that hold any
+function cells(sim, lo, n) {
+  const glc = sim.glc;
+  const r = glc.read(sim.resolve(sim.T.rho[0], lo, n));
+  const out = [];
+  const nz = dim === 2 ? 1 : n[2];
+  // (the resolved texture is laid out as FluidSim lays out a grid: slices of z in tiles)
+  const cols = makeGrid(n[0], n[1], nz).tx;
+  for (let k = 0; k < nz; k++) {
+    const x0 = (k % cols) * n[0], y0 = Math.floor(k / cols) * n[1];
+    for (let j = 0; j < n[1]; j++) {
+      for (let i = 0; i < n[0]; i++) {
+        const v = r[4 * ((y0 + j) * (cols * n[0]) + x0 + i)];
+        if (v > 1e-6) out.push({ x: lo[0] + i + 0.5, y: lo[1] + j + 0.5, z: dim === 2 ? 0.5 : lo[2] + k + 0.5, rho: v });
+      }
+    }
+  }
+  return out;
+}
+
+// (lets the page breathe: the test runner talks to it between steps)
+const pause = () => new Promise((r) => setTimeout(r, 0));
+
+// a picture of a box of the world (2D): '#' solid, digits tenths of liquid, '.' air
+function picture(sim, lo, n) {
+  const glc = sim.glc;
+  const r = glc.read(sim.resolve(sim.T.rho[0], lo, n)).slice(), f = glc.read(sim.resolve(sim.T.frac, lo, n)).slice();
+  for (let j = n[1] - 1; j >= 0; j--) {
+    let row = '';
+    for (let i = 0; i < n[0]; i++) {
+      const k = 4 * (j * n[0] + i), V = f[k + 3], rho = r[k];
+      row += V < 0.05 ? '#' : rho > 1e-3 ? String(Math.min(9, Math.round((10 * rho) / V))) : V < 0.95 ? '+' : '.';
+    }
+    log(String(lo[1] + j).padStart(4) + ' ' + row);
+  }
+}
+
+// --- hydrostatics: polygons cut by a level
+const below = (poly, c) => {       // the part of a polygon with y <= c
+  const out = [];
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i], n = poly[(i + 1) % poly.length];
+    if (p[1] <= c) out.push(p);
+    if ((p[1] <= c) !== (n[1] <= c)) { const t = (c - p[1]) / (n[1] - p[1]); out.push([p[0] + t * (n[0] - p[0]), c]); }
+  }
+  return out;
+};
+const moments = (poly) => {        // area and centroid
+  let A = 0, cx = 0, cy = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i], n = poly[(i + 1) % poly.length], w = p[0] * n[1] - n[0] * p[1];
+    A += w / 2; cx += (p[0] + n[0]) * w / 6; cy += (p[1] + n[1]) * w / 6;
+  }
+  return A > 1e-12 ? { A, c: [cx / A, cy / A] } : { A: 0, c: [0, 0] };
+};
+const rect = (x0, x1, y0, y1, phi) => [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(([x, y]) => [x * Math.cos(phi) - y * Math.sin(phi), x * Math.sin(phi) + y * Math.cos(phi)]);
+const filled = (poly, A) => {      // the polygon filled from below with an area A
+  let lo = Math.min(...poly.map((p) => p[1])), hi = Math.max(...poly.map((p) => p[1]));
+  for (let i = 0; i < 60; i++) { const m = (lo + hi) / 2; if (moments(below(poly, m)).A < A) lo = m; else hi = m; }
+  return moments(below(poly, (lo + hi) / 2));
+};
+
+try {
+  if (document.readyState !== 'complete') await new Promise((r) => window.addEventListener('load', r));
+  await pause();
+  const glc = new GLContext(document.getElementById('c'));
+  log(`readback ${glc.readback} | ${glc.renderer}`);
+  const wall = num('wall', 3);
+
+  if (kind === 'mass') {
+    // a hollow rectangle (2D) / box (3D), closed, off the origin and with a lump of ballast
+    const a = 20, b = 9.5, c = 8, w = 4.5, rho = 0.7;
+    const off = [3.3, -1.7, dim === 2 ? 0 : 0.6];
+    const outer = sdBox(dim, off, [a, b, c]), inner = sdBox(dim, off, [a - w, b - w, c - w]);
+    const ballast = [{ pos: [off[0] - 6, off[1] - b + 1, off[2]], mass: 40 }];
+    const hull = new Hull(glc, dim, { sd: sdCut(outer, inner), shell: outer, box: [off.map((v, d) => v - [a, b, c][d]), off.map((v, d) => v + [a, b, c][d])], density: rho, ballast, pos: [0, 0, 0] });
+    // by the formulas
+    const vol = (x, y, z) => (dim === 2 ? 4 * x * y : 8 * x * y * z);
+    const Vo = vol(a, b, c), Vi = vol(a - w, b - w, c - w), mShell = rho * (Vo - Vi), M = mShell + ballast[0].mass;
+    const com = [0, 1, 2].map((d) => (mShell * off[d] + ballast[0].mass * ballast[0].pos[d]) / M);
+    // inertia of a solid box about its centre, per unit mass: (sum of the squares of the other half extents) / 3
+    const boxI = (h) => (dim === 2 ? [0, 0, (h[0] ** 2 + h[1] ** 2) / 3] : [(h[1] ** 2 + h[2] ** 2) / 3, (h[0] ** 2 + h[2] ** 2) / 3, (h[0] ** 2 + h[1] ** 2) / 3]);
+    const Io = boxI([a, b, c]), Ii = boxI([a - w, b - w, c - w]);
+    const shift = (m, at) => { const r = at.map((v, d) => v - com[d]); const r2 = r[0] ** 2 + r[1] ** 2 + r[2] ** 2; return [0, 1, 2].map((d) => m * (r2 - r[d] ** 2)); };
+    const sShell = shift(mShell, off), sB = shift(ballast[0].mass, ballast[0].pos);
+    const I = [0, 1, 2].map((d) => (rho * (Vo * Io[d] - Vi * Ii[d]) + sShell[d] + sB[d]) / M);
+    const rel = (x, y) => Math.abs(x - y) / Math.abs(y);
+    log(`  mass ${hull.mass.toFixed(3)} (formula ${M.toFixed(3)}), volume of the shell ${hull.volume.toFixed(2)} (${Vo.toFixed(2)}), centre ${hull.com.map((v) => v.toFixed(4))} (${com.map((v) => v.toFixed(4))})`);
+    log(`  inertia per unit mass ${hull.inertia.map((v) => v.toFixed(3))} (${I.map((v) => v.toFixed(3))}), lattice ${hull.n}, ${hull.samplePoints().length} points on its outside`);
+    check(rel(hull.mass, M) < 0.005, `mass within 0.5 % (${(100 * rel(hull.mass, M)).toFixed(3)} %)`);
+    check(rel(hull.volume, Vo) < 0.005, `volume of the shell within 0.5 % (${(100 * rel(hull.volume, Vo)).toFixed(3)} %)`);
+    const dc = Math.hypot(...hull.com.map((v, d) => v - com[d]));
+    check(dc < 0.02, `centre of mass within 0.02 cells (${dc.toFixed(4)})`);
+    const axes = dim === 2 ? [2] : [0, 1, 2];
+    const worst = Math.max(...axes.map((d) => rel(hull.inertia[d], I[d])));
+    check(worst < 0.005, `inertia within 0.5 % (${(100 * worst).toFixed(3)} %)`);
+    // the lattice against the function it was sampled from, near the surface: on the faces, and at
+    // edges and corners (which a lattice of one sample per cell rounds off)
+    let flat = 0, edgy = 0, n = 0;
+    const f = sdCut(outer, inner);
+    const rnd = (i, k) => { const v = Math.sin(i * k) * 43758.5453; return 2 * (v - Math.floor(v)) - 1; };
+    for (let i = 0; i < 6000; i++) {
+      const p = [off[0] + rnd(i, 12.9898) * (a + 1), off[1] + rnd(i, 78.233) * (b + 1), dim === 2 ? 0 : off[2] + rnd(i, 39.425) * (c + 1)];
+      const d = f(p[0], p[1], p[2]);
+      if (Math.abs(d) > 0.6) continue;
+      // on a face the distance is linear in every direction
+      let bend = 0;
+      for (let k = 0; k < dim; k++) {
+        const e = [0, 0, 0]; e[k] = 2;
+        bend = Math.max(bend, Math.abs(f(p[0] + e[0], p[1] + e[1], p[2] + e[2]) + f(p[0] - e[0], p[1] - e[1], p[2] - e[2]) - 2 * d));
+      }
+      const err = Math.abs(hull.sd(hull.fromDrawing(p)) - d);
+      if (bend < 1e-9) flat = Math.max(flat, err); else edgy = Math.max(edgy, err);
+      n++;
+    }
+    check(flat < 1e-4, `the lattice gives the distance to a face exactly (${n} points within 0.6 cells of the surface: ${flat.toExponential(1)})`);
+    check(edgy < 0.4, `... and rounds edges and corners off by less than 0.4 cells (${edgy.toFixed(3)})`);
+    // points on the outside lie on the outside
+    const far = Math.max(...hull.samplePoints().map((p) => Math.abs(hull.shellSd(p))));
+    check(far < 0.25, `its contact points lie on its outside (${far.toFixed(3)} cells off at most)`);
+  } else if (kind === 'dry' || kind === 'speed') {
+    const W = dim === 2 ? 208 : 128, level = 40, a = dim === 2 ? 30 : 22, b = 12, c = 12;
+    // (driven, the box has a lid: what gets in then came through a wall, not over the rim)
+    const shape = openBox(a, b, c, wall, kind === 'speed');
+    const steps = num('steps', kind === 'dry' ? 600 : 360);
+    const runs = kind === 'dry'
+      ? [[0, 0, 0, 0], [0.31, 0.57, 0, 0], [0.5, 0.5, 0.1, 0], [0.73, 0.19, 0.2, 0], [0.11, 0.83, -0.27, 0]]
+      // speed: cells per step along x, then a bob up and down of that speed
+      : [[0, 0, 0, 0.1], [0, 0, 0, 0.25], [0, 0, 0, 0.5], [0, 0, 0, 1], [0.3, 0.6, 0.15, 0.25], [0.3, 0.6, 0.15, 0.5], [0, 0, 0, -0.25], [0, 0, 0, -0.5], [0, 0, 0, -0.5, 6]];
+    const only = q.get('run');
+    for (const [ri, [ox, oy, angle, speed, amp = 3]] of runs.entries()) {
+      if (only !== null && Number(only) !== ri) continue;
+      const scene = basin(W, level);
+      const dt = 1 / 60;
+      // its floor wall + 8 cells under water; driven: across the basin and back / bobbing 6 cells
+      const x0 = W / 2 + ox, y0 = level - 8 - wall + b + oy;
+      const travel = speed > 0 ? (W / 2 - a - 20) : 0;
+      const pose = (t) => {
+        if (speed > 0) {
+          // there and back at `speed` cells per step, turning smoothly
+          const period = (4 * travel) / (speed / dt), ph = (t / period) % 1;
+          const tri = ph < 0.25 ? ph * 4 : ph < 0.75 ? 2 - ph * 4 : ph * 4 - 4;
+          return { pos: [x0 + travel * Math.sin(0.5 * Math.PI * tri), y0, 0], angle };
+        }
+        if (speed < 0) return { pos: [x0, y0 + amp * Math.sin((-speed / dt / amp) * t), 0], angle };
+        return { pos: [x0, y0, 0], angle };
+      };
+      // (3D: heeled about z, as in 2D)
+      const att = (s) => (dim === 3 ? { pos: s.pos, quat: quatFromAxisAngle([0, 0, 1], s.angle) } : s);
+      scene.kinematic = (t) => [{ shape: 'hull', ...shape, density: 0.5, ...att(pose(t)) }];
+      const world = new World(glc, dim, scene, { params });
+      const sim = world.sim, hull = world.kin[0];
+      // liquid inside: cells whose centre is in the hollow, more than a cell from the material and below the rim
+      const inside = () => {
+        const box = world.bodyBox(hull, 1);
+        let sum = 0, cellsIn = 0, deepest = Infinity;
+        for (const cl of cells(sim, box.lo, box.hi.map((v, d) => v - box.lo[d]))) {
+          const p = [cl.x, cl.y, cl.z], l = hull.toLocal(p).map((v, d) => v + hull.com[d]);
+          if (shape.cavity(l[0], l[1], l[2]) > -1 || l[1] > b - 1) continue;
+          sum += cl.rho; cellsIn++; deepest = Math.min(deepest, l[1]);
+        }
+        return { sum, cellsIn };
+      };
+      const m0 = sim.measureSync().mass, in0 = inside();
+      let worst = in0.sum, edge = 0;
+      for (let i = 1; i <= steps; i++) {
+        world.step();
+        if (i % 30 === 0 || i === steps) { worst = Math.max(worst, inside().sum); await pause(); }
+        if (sim.report) edge += sim.report.edge;
+      }
+      if (q.get('dump')) { const box = world.bodyBox(hull, 4); picture(sim, box.lo, box.hi.map((v, d) => v - box.lo[d])); }
+      const st = sim.measureSync(), fin = inside();
+      const what = kind === 'dry' ? `at (${ox}, ${oy}) of a cell, heeled ${(angle * 180 / Math.PI).toFixed(0)} deg`
+        : speed > 0 ? `driven at ${speed} cells/step${angle ? `, heeled ${(angle * 180 / Math.PI).toFixed(0)} deg` : ''}` : `bobbing ${amp} cells up and down at ${-speed} cells/step (${(speed * speed / (dt * dt) / amp / 200).toFixed(2)} g)`;
+      log(`  ${what}: liquid inside ${in0.sum.toExponential(2)} at the start, ${fin.sum.toExponential(2)} after ${steps} steps (most ${worst.toExponential(2)}, in ${fin.cellsIn} cells); mass ${m0.toFixed(1)} -> ${st.mass.toFixed(1)}, ${sim.bricks} bricks, at an open face ${edge}`);
+      // (faster than a quarter of a cell per step is faster than a hull moves in a scene: measured, not bounded)
+      const lim = kind === 'dry' ? 0.01 : 0.02;
+      if (Math.abs(speed) <= 0.25) check(worst < lim, `${what}: less than ${lim} cells of liquid get inside (${worst.toExponential(2)})`);
+      else log(`      (no bound at this speed)`);
+      if (kind === 'dry') check(Math.abs(st.mass - m0) < 1e-5 * m0, `${what}: the liquid outside is all there (${((st.mass - m0) / m0).toExponential(1)})`);
+      for (const h of world.kin) h.dispose();
+      sim.dispose();
+    }
+  } else if (kind === 'tank') {
+    // a closed box in the air, its hollow full of water; shaken up and down, then rocked
+    const a = dim === 2 ? 24 : 16, b = 10, c = 10, x0 = 60.3, y0 = 40.6;
+    const shape = openBox(a, b, c, wall, true);
+    const steps = num('steps', 480), dt = 1 / 60, every = num('every', 20);
+    // half full, then full to the lid (&fill=0.9: that much of its height only)
+    for (const fill of q.get('fill') ? [num('fill', 1)] : [0.5, 1]) {
+    const hb = (b - wall) * fill;
+    const scene = { h: 0.05, solids: [], liquid: [{ type: 'box', center: [x0, y0 - (b - wall) + hb, 0], half: [a - wall, hb, c - wall] }] };
+    // up and down for four seconds (4 cells, 0.27 cells per step at most), then to and fro while
+    // it rocks 17 degrees; each motion sets in and dies away smoothly
+    const ss = (e0, e1, x) => { const u = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1); return u * u * (3 - 2 * u); };
+    const pose = (t) => {
+      const up = ss(0, 0.5, t) * (1 - ss(3.5, 4, t)), rock = ss(4, 4.5, t);
+      return { pos: [x0 + 4 * rock * Math.sin(3 * (t - 4)), y0 + 4 * up * Math.sin(4 * t), 0], angle: 0.3 * rock * Math.sin(2 * (t - 4)) };
+    };
+    const att = (s) => (dim === 3 ? { pos: s.pos, quat: quatFromAxisAngle([0, 0, 1], s.angle) } : s);
+    scene.kinematic = (t) => [{ shape: 'hull', ...shape, density: 0.5, flooded: true, ...att(pose(t)) }];
+    const world = new World(glc, dim, scene, { params });
+    const sim = world.sim, hull = world.kin[0];
+    const m0 = sim.measureSync().mass;
+    // the liquid that is not in the hollow, and how far the fullest cell is over full
+    const look = () => {
+      const box = world.bodyBox(hull, 6);
+      let out = 0, sum = 0;
+      const wallIn = [0, 0, 0];       // in the material: up to 1, 1.5, deeper
+      for (const cl of cells(sim, box.lo, box.hi.map((v, d) => v - box.lo[d]))) {
+        const l = hull.toLocal([cl.x, cl.y, cl.z]).map((v, d) => v + hull.com[d]);
+        sum += cl.rho;
+        if (shape.shell(l[0], l[1], l[2]) > 0.5) { out += cl.rho; if (q.get('where') && cl.rho > 1e-5) log(`      out: cell ${cl.x},${cl.y} rho ${cl.rho.toExponential(2)} at ${l[0].toFixed(2)},${l[1].toFixed(2)} of the drawing, ${shape.shell(l[0], l[1], l[2]).toFixed(2)} outside`); }
+        const d = shape.sd(l[0], l[1], l[2]);
+        if (d < -0.5) wallIn[d > -1 ? 0 : d > -1.4 ? 1 : 2] += cl.rho;
+      }
+      return { out, sum, wallIn };
+    };
+    let worstOut = 0, fastest = 0, worstRes = 0;
+    for (let i = 1; i <= steps; i++) {
+      world.step();
+      if (i % every === 0 || i === steps) {
+        const st = sim.measureSync(), lk = look();
+        worstOut = Math.max(worstOut, lk.out);
+        // the water against the tank: both move at most 4 * 4 cells/s, i.e. 0.27 cells per step
+        fastest = Math.max(fastest, st.maxSpeed * dt);
+        worstRes = Math.max(worstRes, st.residual);
+        if (q.get('v')) log(`    step ${i}: mass ${st.mass.toFixed(3)}, outside ${lk.out.toExponential(1)}, in the wall ${lk.wallIn.map((v) => v.toExponential(1))}, fastest ${(st.maxSpeed * dt).toFixed(3)} cells/step, residual ${st.residual.toExponential(1)}, gamma ${st.gammaMin.toFixed(3)}..${st.gammaMax.toFixed(3)}`);
+        await pause();
+      }
+    }
+    const st = sim.measureSync();
+    if (q.get('dump')) { const box = world.bodyBox(hull, 3); picture(sim, box.lo, box.hi.map((v, d) => v - box.lo[d])); }
+    const name = fill < 1 ? `a sealed tank ${(100 * fill).toFixed(0)} % full` : 'a sealed tank full to the lid';
+    log(`  ${name} (${m0.toFixed(1)} cells of water), shaken for ${steps} steps: mass ${st.mass.toFixed(3)}, most outside ${worstOut.toExponential(2)}, fastest liquid ${fastest.toFixed(3)} cells/step, largest residual ${worstRes.toExponential(1)}`);
+    check(Math.abs(st.mass - m0) < 1e-5 * m0, `${name}: no water is lost or made (${((st.mass - m0) / m0).toExponential(1)} of it)`);
+    // Full to the lid, the water has no surface to give way at: a cell that holds more than its
+    // volume asks for room (Sec. 3.7 of the paper) that does not exist, the pressure equation has
+    // no solution, and in single steps the solve fails (residuals of several cells per step).
+    // What gets through the walls then is bounded here, not ruled out.
+    if (fill < 1) check(worstOut < 1e-5 * m0, `${name}: none of it gets out (${(worstOut / m0).toExponential(1)} of it at most)`);
+    else check(worstOut < 0.005 * m0, `${name}: less than 0.5 % of it gets out (${(100 * worstOut / m0).toFixed(2)} %, ${worstOut.toFixed(2)} cells)`);
+    for (const h of world.kin) h.dispose();
+    sim.dispose();
+    }
+  } else if (kind === 'fall') {
+    // An open box with water in it, let go in the air: box and water fall together at g. The
+    // water weighs several times the box, and all that holds it up is the pressure the box and
+    // the liquid have to agree on within the step.
+    const a = dim === 2 ? 24 : 14, b = 10, c = 10, x0 = 60.3, y0 = 80.6, depth = num('depth', 9), rho = num('density', 0.3);
+    const shape = openBox(a, b, c, wall);
+    const scene = { h: 0.05, solids: [], liquid: [{ type: 'box', center: [x0, y0 - b + wall + depth / 2, 0], half: [a - wall, depth / 2, c - wall] }],
+      bodies: [{ shape: 'hull', ...shape, density: rho, flooded: true, pos: [x0, y0, 0] }] };
+    const wparams = {};
+    for (const [k, v] of q) if (k.startsWith('w.')) wparams[k.slice(2)] = Number(v);
+    scene.couple = cparams;
+    const world = new World(glc, dim, scene, { params, world: wparams });
+    const sim = world.sim, hull = world.bodies[0], dt = sim.params.dt, g = -world.gravityCells[1];
+    if (world.coupler && q.get('dbg')) world.coupler.debug = true;
+    const m0 = sim.measureSync().mass;
+    log(`  box of ${hull.mass.toFixed(1)} with ${m0.toFixed(1)} of water in it (${(m0 / hull.mass).toFixed(1)} times its mass), g ${g.toFixed(1)} cells/s^2`);
+    const n = num('steps', 20), from = 3;
+    let v0 = 0, worst = 0, sumA = 0, cnt = 0;
+    const inBox = () => {
+      const box = world.bodyBox(hull, 2);
+      let sum = 0;
+      for (const cl of cells(sim, box.lo, box.hi.map((v, d) => v - box.lo[d]))) {
+        const l = hull.toLocal([cl.x, cl.y, cl.z]).map((v, d) => v + hull.com[d]);
+        if (shape.shell(l[0], l[1], l[2]) < 0.5) sum += cl.rho;
+      }
+      return sum;
+    };
+    for (let i = 1; i <= n; i++) {
+      const before = hull.vel[1];
+      world.step();
+      await world.forcesReady;
+      const acc = (hull.vel[1] - before) / dt;
+      if (i === from) v0 = hull.vel[1];
+      if (i > from) { worst = Math.max(worst, Math.abs(acc + g) / g); sumA += acc; cnt++; }
+      if (q.get('v')) log(`    step ${i}: v ${hull.vel[1].toFixed(3)} cells/s, a/g ${(-acc / g).toFixed(4)}, spin ${hull.omega[2].toExponential(1)}, water in the box ${inBox().toFixed(2)}${world.coupler ? `, iterations ${world.coupler.changes.length} (${world.coupler.changes.map((v) => v.toExponential(1)).join(' ')}), A/m ${hull.addedMatrix ? Array.from(hull.addedMatrix).map((v) => (v / hull.mass).toFixed(2)).join(' ') : '-'}` : ''}`);
+    }
+    const mean = -sumA / cnt / g, kept = inBox() / m0;
+    log(`  steps ${from + 1} to ${n}: it accelerates at ${mean.toFixed(4)} g on average, ${(100 * worst).toFixed(2)} % off g at most in a step; ${(100 * kept).toFixed(2)} % of the water is still in it`);
+    check(Math.abs(mean - 1) < 0.02, `box and water fall at g within 2 % (${((mean - 1) * 100).toFixed(2)} %)`);
+    // (In free fall the water lies on the floor of the box without pressing on it: the pressure
+    // there is zero, which is where the separating boundary condition switches between a wall
+    // that holds the water and one that lets go of it. Single steps scatter around g for that.)
+    check(worst < 0.25, `... and in every single step within 25 % (${(100 * worst).toFixed(2)} %)`);
+    check(kept > 0.995, `the water stays in the box (${(100 * kept).toFixed(2)} %)`);
+    world.removeBodies();
+    sim.dispose();
+  } else if (kind === 'float') {
+    // A box with water in it afloat: it lies where the water it displaces weighs what box and
+    // the water inside weigh together, and stays there.
+    //   &sea=1  on a sea at rest without shores (the water around the box is solved, the rest
+    //           is not stored: the waves the box makes leave), else in a closed basin, where
+    //           nothing takes the waves away
+    //   &lift=  how far above its float line it starts (cells)
+    const sea = q.get('sea') === '1';
+    const W = dim === 2 ? 208 : 112, D = 56, level = 40, a = dim === 2 ? 30 : 20, b = 12, c = 14, rho = num('density', 0.5), depth = num('depth', 6);
+    const shape = openBox(a, b, c, wall);
+    const scene = sea ? { h: 0.05, solids: [], liquid: [], water: [{ box: [-1e6, -1e6, 1e6, 1e6], level }] } : basin(W, level, D);
+    const steps = num('steps', 1800), every = num('every', 300), lift = num('lift', 0);
+    const probe = new Hull(glc, dim, { ...shape, density: rho });
+    const foot = dim === 2 ? 2 * a : 4 * a * c, inner = dim === 2 ? 2 * (a - wall) : 4 * (a - wall) * (c - wall);
+    const T0 = (probe.mass + inner * depth) / foot;
+    probe.dispose();
+    const x0 = W / 2 + 0.37, y0 = level - T0 + b + lift;
+    scene.bodies = [{ shape: 'hull', ...shape, density: rho, pos: [x0, y0, 0] }];
+    const wparams = {};
+    for (const [k, v] of q) if (k.startsWith('w.')) wparams[k.slice(2)] = Number(v);
+    scene.couple = cparams;
+    const world = new World(glc, dim, scene, { params, world: { bodySleepAfter: 1e9, ...wparams } });
+    const sim = world.sim, hull = world.bodies[0], dt = sim.params.dt;
+    // the water inside: put in once the hull has been emptied
+    const o = hull.origin;
+    if (depth > 0) sim.editLiquid([{ type: 'box', center: [o[0], o[1] - b + wall + depth / 2, o[2]], half: [a - wall, depth / 2, c - wall] }], 1);
+    // the liquid there is (a sea: what the books cannot account for)
+    const water = () => {
+      if (!sea) return sim.measureSync().mass;
+      sim.readLedger();
+      return sim.excessSync() - sim.displaced + sim.absorbed - sim.added + sim.removed + sim.freedMass;
+    };
+    // where it should float: the water inside and outside as they are now
+    const state = () => {
+      const box = world.bodyBox(hull, 2);
+      let inside = 0;
+      for (const cl of cells(sim, box.lo, box.hi.map((v, d) => v - box.lo[d]))) {
+        const l = hull.toLocal([cl.x, cl.y, cl.z]).map((v, d) => v + hull.com[d]);
+        // (half a wall in: the water outside lies against the shell and reaches into the cells it cuts)
+        if (shape.shell(l[0], l[1], l[2]) < -wall / 2) inside += cl.rho;
+      }
+      const all = water();
+      const T = (hull.mass + inside) / foot;                       // draught
+      const area = dim === 2 ? W : W * D;
+      const L = sea ? level : (all - inside + foot * T) / area;    // level of the water with the hull in it
+      const bottom = hull.fromDrawing([0, -b, 0])[1];
+      const up = hull.toWorldDir ? hull.toWorldDir([0, 1, 0]) : [0, 1, 0];
+      return { inside, all, T, L, off: bottom - (L - T), heel: Math.acos(Math.min(1, up[1])) * 180 / Math.PI };
+    };
+    const first = state(), total0 = first.all, scale = sea ? sim.measureSync().mass : total0;
+    log(`  box of ${hull.mass.toFixed(1)} with ${first.inside.toFixed(1)} of water in it, expected draught ${first.T.toFixed(2)} cells, ${sea ? 'on a sea' : 'in a basin'}${lift ? `, let go ${lift} cells above its float line` : ''}`);
+    let slow = 0, top = 0, ylo = Infinity, yhi = -Infinity;
+    const heave = [];             // (per interval: how far it went up and down)
+    for (let i = 1; i <= steps; i++) {
+      world.step();
+      await world.forcesReady;
+      const sp = Math.hypot(...hull.vel) * dt;
+      if (i > steps - 120) slow = Math.max(slow, sp);
+      top = Math.max(top, sp);
+      ylo = Math.min(ylo, hull.pos[1]);
+      yhi = Math.max(yhi, hull.pos[1]);
+      if (q.get('v') && world.coupler && i <= Number(q.get('v'))) log(`    step ${i}: v ${hull.vel.slice(0, 2).map((v) => v.toFixed(3))} w ${hull.omega[2].toFixed(4)}, changes ${world.coupler.changes.map((v) => v.toExponential(1)).join(' ')}, wet ${hull.wet.toFixed(2)}, A/m ${hull.addedMatrix ? Array.from(hull.addedMatrix).map((v) => (v / hull.mass).toFixed(2)).join(' ') : '-'}`);
+      if (i % every === 0 || i === steps) {
+        const st = state();
+        heave.push(yhi - ylo);
+        log(`    t ${(i * dt).toFixed(1)} s: ${st.off.toFixed(3)} cells above where it should float (draught ${st.T.toFixed(2)}), speed ${sp.toFixed(4)} cells/step (${top.toFixed(4)} at most, heaving ${(yhi - ylo).toFixed(3)} cells), heel ${st.heel.toFixed(2)} deg, water inside ${st.inside.toFixed(1)}, ${sea ? `books off by ${(st.all - total0).toExponential(1)}, ${sim.bricks} bricks (${sim.nHeld} held)` : `all ${st.all.toFixed(1)}`}${world.coupler ? `, iterations ${(world.coupler.stats.iterations / world.coupler.stats.steps).toFixed(2)}, not converged ${world.coupler.stats.unconverged}` : ''}`);
+        if (world.coupler) Object.assign(world.coupler.stats, { iterations: 0, steps: 0, unconverged: 0 });
+        top = 0; ylo = Infinity; yhi = -Infinity;
+        await pause();
+      }
+    }
+    const st = state(), seconds = steps * dt;
+    check(Math.abs(st.off) < 0.25, `it floats within 0.25 cells of where Archimedes puts it (${st.off.toFixed(3)} cells above)`);
+    if (sea) check(slow < 0.005, `after ${seconds.toFixed(0)} s it moves less than 0.005 cells per step (${slow.toFixed(4)} over the last two seconds)`);
+    else {
+      // Nothing takes the waves out of a basin, and the solver makes more of them: the heaving
+      // grows (0.23 to 0.75 cells in 30 s). Not the coupling: converged harder it is the same,
+      // and it is 0.34 with the volume correction off (&p.compress=0), which contracts the
+      // under-full cells a moving hull leaves at the walls. Reported, not asked for; the open
+      // sea (&sea=1) is the check.
+      log(`NOTE  in a basin its heaving goes from ${heave[0].toFixed(3)} to ${heave[heave.length - 1].toFixed(3)} cells up and down (${slow.toFixed(4)} cells per step over the last two seconds)`);
+    }
+    check(st.heel < 2, `upright within 2 degrees (${st.heel.toFixed(2)})`);
+    // (the solver with floating bodies in it: about 1e-6 of the liquid per second, see tests/sea.html)
+    const lost = (st.all - total0) / scale;
+    check(Math.abs(lost) < 1e-6 + 1e-6 * seconds, `no water lost or made (${lost.toExponential(1)} of ${scale.toFixed(0)} cells in ${seconds.toFixed(0)} s)`);
+    world.removeBodies();
+    sim.dispose();
+  } else if (kind === 'loll') {
+    // Free surfaces. A hull that carries its weight high and a slack tank across most of its
+    // beam does not float upright: the water in the tank runs to the low side and holds it at
+    // an angle of loll. The same hull with a bulkhead down the middle of the tank (and the same
+    // water, half on each side) floats upright. Both angles are compared with those of the
+    // hydrostatics: the heel at which the centre of gravity of hull and water lies lowest over
+    // the centre of buoyancy, with the water in every tank level.
+    //   &ballast=  the weight up high (cells of liquid)   &kick=  the spin it starts with [rad/s]
+    // (The angle of loll is steep in the weight: with 227 up high the hydrostatics say 14.9
+    // degrees and the hull lolls at 17.0, with 235 it is 19.0 and 20.1. A hull floats about
+    // 0.2 cells deeper here than Archimedes has it, see the float case.)
+    if (dim !== 2) throw new Error('the loll case is 2D');
+    const a = 30, b = 12, level = 60, mb = num('ballast', 235), yb = 50, kick = num('kick', 0.03);
+    const steps = num('steps', 2400), every = num('every', 600);
+    const top = b + 20, floor = -b + wall;
+    // the spaces of the hull, as [x0, x1] (all open at the top): a tank between two dry wings
+    const wings = [[-a + wall, -22.5], [22.5, a - wall]];
+    const designs = [{ name: 'one tank across', tanks: [[-19.5, 19.5]], depth: 6 },
+      { name: 'the tank divided down the middle', tanks: [[-19.5, -1.5], [1.5, 19.5]], depth: 6.5 }];
+    const cavity = ([x0, x1]) => sdBox(dim, [(x0 + x1) / 2, (floor + top) / 2, 0], [(x1 - x0) / 2, (top - floor) / 2, 1]);
+    // height of the centre of gravity of hull and water over the centre of buoyancy at heel phi
+    // (lengths in the hull's drawing, turned by phi; water: [{ tank, area }])
+    const height = (phi, mass, com, water) => {
+      let W = mass, y = mass * (com[0] * Math.sin(phi) + com[1] * Math.cos(phi));
+      for (const w of water) { const f = filled(rect(w.tank[0], w.tank[1], floor, top, phi), w.area); W += w.area; y += w.area * f.c[1]; }
+      const sub = filled(rect(-a, a, -b, b, phi), W);
+      return y / W - sub.c[1];
+    };
+    const rests = (mass, com, water) => {     // the heels (degrees, >= 0) at which it can rest
+      const out = [], E = (d) => height(d * Math.PI / 180, mass, com, water);
+      for (let d = 0; d <= 35; d += 0.05) if (E(d) <= E(d + 0.05) && (d === 0 || E(d) < E(d - 0.05))) out.push(d);
+      return out;
+    };
+    for (const des of designs) {
+      const sd = sdCut(sdBox(dim, [0, 0, 0], [a, b, 1]), ...[...wings, ...des.tanks].map(cavity));
+      const shape = { sd, shell: sdBox(dim, [0, 0, 0], [a, b, 1]), box: [[-a, -b, -1], [a, b, 1]] };
+      const spec = { shape: 'hull', ...shape, density: 0.5, ballast: [{ pos: [0, yb, 0], mass: mb }] };
+      const probe = new Hull(glc, dim, spec);
+      const areas = des.tanks.map((t) => (t[1] - t[0]) * des.depth);
+      const T0 = (probe.mass + areas.reduce((x, y) => x + y, 0)) / (2 * a);
+      probe.dispose();
+      const scene = { h: 0.05, solids: [], liquid: [], water: [{ box: [-1e6, -1e6, 1e6, 1e6], level }],
+        bodies: [{ ...spec, pos: [0.37, level - T0 + b, 0], omega: kick }], couple: cparams };
+      const wparams = {};
+      for (const [k, v] of q) if (k.startsWith('w.')) wparams[k.slice(2)] = Number(v);
+      const world = new World(glc, dim, scene, { params, world: { bodySleepAfter: 1e9, ...wparams } });
+      const sim = world.sim, hull = world.bodies[0], dt = sim.params.dt, o = hull.origin;
+      // the water that is in each tank now
+      const inTanks = () => {
+        const box = world.bodyBox(hull, 2), sum = des.tanks.map(() => 0);
+        for (const cl of cells(sim, box.lo, box.hi.map((v, d) => v - box.lo[d]))) {
+          const l = hull.toLocal([cl.x, cl.y, cl.z]).map((v, d) => v + hull.com[d]);
+          if (l[1] < -b + wall / 2) continue;
+          des.tanks.forEach((t, k) => { if (l[0] > t[0] - wall / 2 && l[0] < t[1] + wall / 2) sum[k] += cl.rho; });
+        }
+        return sum;
+      };
+      if (q.get('dump')) { log(`  before the tanks are filled: ${JSON.stringify(inTanks())}`); const box = world.bodyBox(hull, 3); picture(sim, box.lo.map(Math.floor), box.hi.map((v, d) => Math.ceil(v - box.lo[d]))); }
+      sim.editLiquid(des.tanks.map((t) => ({ type: 'box', center: [o[0] + (t[0] + t[1]) / 2, o[1] + floor + des.depth / 2, o[2]], half: [(t[1] - t[0]) / 2, des.depth / 2, 1] })), 1);
+      const heel = () => { const up = hull.toWorldDir([0, 1, 0]); return Math.atan2(-up[0], up[1]) * 180 / Math.PI; };
+      const want = rests(hull.mass, hull.com, inTanks().map((area, k) => ({ tank: des.tanks[k], area })));
+      log(`  ${des.name}: hull of ${hull.mass.toFixed(1)}, centre of gravity ${(hull.com[1] + b).toFixed(2)} cells above the keel, water ${inTanks().map((v) => v.toFixed(1)).join(' + ')}; the hydrostatics let it rest at ${want.map((d) => d.toFixed(1)).join(' or ')} degrees`);
+      let lo = Infinity, hi = -Infinity;
+      for (let i = 1; i <= steps; i++) {
+        world.step();
+        await world.forcesReady;
+        lo = Math.min(lo, heel()); hi = Math.max(hi, heel());
+        if (i % every === 0 || i === steps) {
+          log(`    t ${(i * dt).toFixed(0)} s: heel ${heel().toFixed(2)} deg (${lo.toFixed(2)} to ${hi.toFixed(2)} since the last line), water ${inTanks().map((v) => v.toFixed(1)).join(' + ')}${world.coupler ? `, iterations ${(world.coupler.stats.iterations / world.coupler.stats.steps).toFixed(2)}` : ''}`);
+          if (world.coupler) Object.assign(world.coupler.stats, { iterations: 0, steps: 0, unconverged: 0 });
+          if (i < steps) { lo = Infinity; hi = -Infinity; }
+          await pause();
+        }
+      }
+      if (q.get('dump')) { const box = world.bodyBox(hull, 3); picture(sim, box.lo.map(Math.floor), box.hi.map((v, d) => Math.ceil(v - box.lo[d]))); }
+      // (the water as it lies at the end: what is asked is the angle that belongs to it)
+      const now = rests(hull.mass, hull.com, inTanks().map((area, k) => ({ tank: des.tanks[k], area })));
+      const near = now.reduce((x, d) => (Math.abs(d - Math.abs(heel())) < Math.abs(x - Math.abs(heel())) ? d : x), now[0]);
+      const stable = Math.max(...now);
+      if (des.tanks.length === 1) {
+        check(stable > 5, `${des.name}: the hydrostatics make it loll (at ${stable.toFixed(1)} degrees)`);
+        check(Math.abs(Math.abs(heel()) - stable) < 2, `${des.name}: it lolls at ${Math.abs(heel()).toFixed(2)} degrees, within 2 of that`);
+      } else {
+        check(now.length === 1 && now[0] === 0, `${des.name}: the hydrostatics have it upright (${now.map((d) => d.toFixed(1)).join(' or ')})`);
+        check(Math.abs(heel()) < 2, `${des.name}: it floats upright within 2 degrees (${heel().toFixed(2)})`);
+      }
+      check(hi - lo < 1, `${des.name}: ... and has come to rest (${(hi - lo).toFixed(2)} degrees to and fro over the last ${(every * dt).toFixed(0)} s)`);
+      void near;
+      world.removeBodies();
+      sim.dispose();
+    }
+  } else if (kind === 'breach') {
+    // A hole in the floor of a hull that is held in place on a sea at rest: the sea comes in
+    // through it until the levels are the same. Torricelli: the water passes the hole at
+    // sqrt(2 g (difference of the levels)), so the level inside rises as
+    //   h / d = 1 - (1 - t / tf)^2,   tf = (area of the floor / area of the hole) sqrt(2 d / g) / Cd
+    // with d the depth of the floor under the sea and Cd what the jet keeps of the hole's
+    // width (1: all of it; a slot in a thin wall: pi / (pi + 2) = 0.61).
+    //   &hole=  radius of the hole (cells)   &deep=  depth of the keel under the sea
+    const a = dim === 2 ? 30 : 16, b = 12, c = 12, level = 40, deep = num('deep', 11), r = num('hole', 2.5);
+    const shape = openBox(a, b, c, wall);
+    const pose = { shape: 'hull', ...shape, density: 0.5, pos: [0.37, level - deep + b, 0.21] };
+    const scene = { h: 0.05, solids: [], liquid: [], water: [{ box: [-1e6, -1e6, 1e6, 1e6], level }], kinematic: () => [pose], couple: cparams };
+    const world = new World(glc, dim, scene, { params, world: { bodySleepAfter: 1e9 } });
+    const sim = world.sim, hull = world.kin[0], dt = sim.params.dt, g = -world.gravityCells[1];
+    const d = deep - wall;
+    const floorArea = dim === 2 ? 2 * (a - wall) : 4 * (a - wall) * (c - wall), holeArea = dim === 2 ? 2 * r : Math.PI * r * r;
+    const tf = floorArea / holeArea * Math.sqrt(2 * d / g), full = floorArea * d;
+    const inside = () => {
+      const box = world.bodyBox(hull, 2);
+      let sum = 0;
+      for (const cl of cells(sim, box.lo, box.hi.map((v, k) => v - box.lo[k]))) {
+        const l = hull.toLocal([cl.x, cl.y, cl.z]).map((v, k) => v + hull.com[k]);
+        if (shape.shell(l[0], l[1], l[2]) < -wall / 2 && l[1] > -b + wall - 0.5) sum += cl.rho;
+      }
+      return sum;
+    };
+    for (let i = 0; i < 60; i++) { world.step(); await world.forcesReady; }
+    const dry = inside();
+    check(dry < 0.02, `before the hole is made the hull is dry (${dry.toExponential(1)} cells of water in it after a second)`);
+    hull.breach(hull.fromDrawing([0, -b + wall / 2, 0]), r);
+    const steps = num('steps', Math.round(2.2 * tf / dt)), marks = [0.25, 0.5, 0.75, 0.9], at = marks.map(() => null);
+    let last = 0;
+    for (let i = 1; i <= steps; i++) {
+      world.step();
+      await world.forcesReady;
+      if (i % 3) continue;
+      const v = inside() / full, t = i * dt;
+      marks.forEach((m, k) => { if (at[k] === null && v >= m) at[k] = t - 3 * dt * (v - m) / Math.max(v - last, 1e-9); });
+      last = v;
+      if (q.get('v') && i % 30 === 0) log(`    t ${t.toFixed(2)} s: ${(100 * v).toFixed(1)} % (Torricelli with Cd 1: ${(100 * (1 - Math.max(0, 1 - t / tf) ** 2)).toFixed(1)} %)`);
+      if (i % 60 === 0) await pause();
+    }
+    if (q.get('dump')) { const box = world.bodyBox(hull, 3); picture(sim, box.lo.map(Math.floor), box.hi.map((v, k) => Math.ceil(v - box.lo[k]))); }
+    // the Cd that puts Torricelli's curve through each mark
+    const cd = marks.map((m, k) => (at[k] === null ? NaN : (1 - Math.sqrt(1 - m)) * tf / at[k]));
+    log(`  floor ${d} cells under the sea, hole ${holeArea.toFixed(1)} of ${floorArea} cells of floor: with Cd 1 it fills in ${tf.toFixed(2)} s`);
+    log(`  ${marks.map((m, k) => `${100 * m} % after ${at[k] === null ? '-' : at[k].toFixed(2)} s (Cd ${cd[k].toFixed(2)})`).join(', ')}; at the end ${(100 * last).toFixed(1)} %`);
+    // (a jet through a hole is narrower than the hole: Kirchhoff's slot keeps pi / (pi + 2) of its
+    // width, a round sharp-edged hole about as much of its area. Against Cd = 1 the hull fills
+    // 40 to 45 % too slowly.)
+    const Cd = Math.PI / (Math.PI + 2);
+    const t90 = at[3], want = (1 - Math.sqrt(0.1)) * tf / Cd;
+    check(t90 !== null && Math.abs(t90 / want - 1) < 0.25, `it is 90 % full after ${t90 === null ? '-' : t90.toFixed(2)} s, within 25 % of Torricelli's ${want.toFixed(2)} s for a jet that keeps ${Cd.toFixed(2)} of the hole (${t90 === null ? '-' : (100 * (t90 / want - 1)).toFixed(0)} %; ${t90 === null ? '-' : `${t90 > want * Cd ? '+' : ''}${(100 * (t90 / (want * Cd) - 1)).toFixed(0)}`} % against the ${(want * Cd).toFixed(2)} s of a jet as wide as the hole)`);
+    check(Math.abs(last - 1) < 0.05, `... and ends level with the sea (${(100 * last).toFixed(1)} % of the water that takes)`);
+    for (const h of world.kin) h.dispose();
+    sim.dispose();
+  } else if (kind === 'flood') {
+    // A ship in section, four compartments in a row, afloat on a sea over a bed. A hole in the
+    // floor of the foremost one: it floods to the level of the sea and the ship trims by the
+    // bow, to the angle at which what is left of its buoyancy carries it (the hydrostatics of
+    // lost buoyancy). A hole in the next one as well is more than it can take: it goes down and
+    // ends at rest on the bed.
+    if (dim !== 2) throw new Error('the flood case is 2D');
+    const a = 60, b = 12, level = 72, bed = 16, r = num('hole', 2.5), mb = num('ballast', 900);
+    const top = b + 20, floor = -b + wall, wide = (2 * (a - wall) - 3 * wall) / 4;
+    const comps = [0, 1, 2, 3].map((k) => [-a + wall + k * (wide + wall), -a + wall + k * (wide + wall) + wide]);
+    const cavity = ([x0, x1]) => sdBox(dim, [(x0 + x1) / 2, (floor + top) / 2, 0], [(x1 - x0) / 2, (top - floor) / 2, 1]);
+    const outer = sdBox(dim, [0, 0, 0], [a, b, 1]);
+    const spec = { shape: 'hull', sd: sdCut(outer, ...comps.map(cavity)), shell: outer, box: [[-a, -b, -1], [a, b, 1]], density: 0.5,
+      ballast: [{ pos: [0, -b + 2, 0], mass: mb }] };
+    const probe = new Hull(glc, dim, spec);
+    const T0 = probe.mass / (2 * a);
+    probe.dispose();
+    const scene = { h: 0.05, solids: [{ type: 'box', center: [0, bed - 20, 0], half: [400, 20, 1] }], liquid: [],
+      water: [{ box: [-1e6, -1e6, 1e6, 1e6], level }], bodies: [{ ...spec, pos: [0.37, level - T0 + b, 0] }], couple: cparams };
+    const wparams = {};
+    for (const [k, v] of q) if (k.startsWith('w.')) wparams[k.slice(2)] = Number(v);
+    const world = new World(glc, dim, scene, { params, world: wparams });
+    const sim = world.sim, hull = world.bodies[0], dt = sim.params.dt;
+    const inComps = () => {
+      const box = world.bodyBox(hull, 2), sum = comps.map(() => 0);
+      for (const cl of cells(sim, box.lo, box.hi.map((v, d) => v - box.lo[d]))) {
+        const l = hull.toLocal([cl.x, cl.y, cl.z]).map((v, d) => v + hull.com[d]);
+        if (l[1] < floor - 0.5 || l[1] > b) continue;
+        comps.forEach((t, k) => { if (l[0] > t[0] - wall / 2 && l[0] < t[1] + wall / 2) sum[k] += cl.rho; });
+      }
+      return sum;
+    };
+    const trim = () => { const up = hull.toWorldDir([0, 1, 0]); return Math.atan2(-up[0], up[1]) * 180 / Math.PI; };
+    const books = () => { sim.readLedger(); return sim.excessSync() - sim.displaced + sim.absorbed - sim.added + sim.removed + sim.freedMass; };
+    // the hydrostatics of lost buoyancy: with the compartments `open` level with the sea, the
+    // trim (degrees, bow down negative) and the water in them, or null if the rim goes under
+    const afloat = (open) => {
+      const at = (deg) => {
+        const phi = deg * Math.PI / 180;
+        const polys = [rect(-a, a, -b, b, phi), ...open.map((k) => rect(comps[k][0], comps[k][1], floor, top, phi))];
+        const net = (c) => polys.reduce((sum, p, i) => sum + (i ? -1 : 1) * moments(below(p, c)).A, 0);
+        let lo = -a - b, hi = a + b;
+        for (let i = 0; i < 60; i++) { const m = (lo + hi) / 2; if (net(m) < hull.mass) lo = m; else hi = m; }
+        const c = (lo + hi) / 2;
+        // (the rim: the top corners of the hull)
+        const rim = Math.min(...rect(-a, a, b, b, phi).map((p) => p[1]));
+        let x = 0;
+        polys.forEach((p, i) => { const m = moments(below(p, c)); x += (i ? -1 : 1) * m.A * m.c[0]; });
+        const xg = hull.com[0] * Math.cos(phi) - hull.com[1] * Math.sin(phi);
+        return { c, dry: rim > c && Math.abs(net(c) - hull.mass) < 1e-3, lever: x / hull.mass - xg, water: polys.slice(1).map((p) => moments(below(p, c)).A) };
+      };
+      let before = at(0);
+      for (let deg = -0.02; deg > -40; deg -= 0.02) {
+        const now = at(deg);
+        if (!now.dry) return null;
+        if (now.lever * before.lever <= 0) return { deg, water: now.water, c: now.c };
+        before = now;
+      }
+      return null;
+    };
+    let peak = 0;                 // the most liquid stored at once
+    const mass = () => sim.measureSync().mass;
+    // (what the solver loses with bodies afloat in it: about 1e-6 of the liquid per second, see tests/sea.html)
+    const balanced = (what) => {
+      const off = books() - books0, t = world.time;
+      check(Math.abs(off) < (1e-6 + 1e-6 * t) * peak, `${what}: water and ledger are off by ${off.toFixed(2)} cells after ${t.toFixed(0)} s, ${(Math.abs(off) / peak).toExponential(1)} of the ${peak.toFixed(0)} cells stored at the most (allowed: 1e-6 and 1e-6 per second)`);
+    };
+    const run = async (seconds, what) => {
+      let lo = Infinity, hi = -Infinity, top = 0;
+      const n = Math.round(seconds / dt);
+      for (let i = 1; i <= n; i++) {
+        world.step();
+        await world.forcesReady;
+        const sp = hull.asleep ? 0 : Math.max(Math.hypot(...hull.vel), Math.hypot(...hull.omega) * hull.extent) * dt;
+        if (i > n - 120) { lo = Math.min(lo, trim()); hi = Math.max(hi, trim()); top = Math.max(top, sp); }
+        if (i % 300 === 0 || i === n) {
+          peak = Math.max(peak, mass());
+          log(`    ${what}, t ${(i * dt).toFixed(0)} s: trim ${trim().toFixed(2)} deg, keel ${(level - hull.fromDrawing([0, -b, 0])[1]).toFixed(2)} cells under the sea amidships, water ${inComps().map((v) => v.toFixed(0)).join(' ')}, ${hull.asleep ? 'asleep' : `speed ${sp.toFixed(4)} cells/step`}, ${sim.bricks} bricks (${sim.nHeld} held)${world.coupler ? `, iterations ${(world.coupler.stats.iterations / Math.max(world.coupler.stats.steps, 1)).toFixed(2)}` : ''}`);
+          if (world.coupler) Object.assign(world.coupler.stats, { iterations: 0, steps: 0, unconverged: 0 });
+          await pause();
+        }
+      }
+      return { swing: hi - lo, top };
+    };
+    await run(3, 'afloat');
+    const books0 = books();
+    const dry = inComps().reduce((x, y) => x + y, 0);
+    check(dry < 0.05 && Math.abs(trim()) < 0.5, `afloat and dry on an even keel (${dry.toExponential(1)} cells of water in it, trim ${trim().toFixed(2)} degrees)`);
+    // --- one compartment
+    const hole = (k) => hull.breach(hull.fromDrawing([(comps[k][0] + comps[k][1]) / 2, -b + wall / 2, 0]), r);
+    hole(3);
+    const one = await run(num('t1', 40), 'bow compartment open');
+    const want = afloat([3]);
+    log(`  the hydrostatics: ${want ? `trim ${want.deg.toFixed(2)} degrees with ${want.water[0].toFixed(0)} cells of water in the open compartment` : 'it cannot float'}`);
+    check(!!want && Math.abs(trim() - want.deg) < 2, `with the bow compartment open it trims ${trim().toFixed(2)} degrees, within 2 of the ${want ? want.deg.toFixed(2) : '-'} of the hydrostatics`);
+    check(!!want && Math.abs(inComps()[3] / want.water[0] - 1) < 0.1, `... with ${inComps()[3].toFixed(0)} cells of water in it (${want ? want.water[0].toFixed(0) : '-'}); the others dry (${inComps().slice(0, 3).map((v) => v.toFixed(2)).join(' ')})`);
+    check(one.swing < 0.5 && one.top < 0.005, `... and comes to rest (${one.swing.toFixed(2)} degrees to and fro, ${one.top.toFixed(4)} cells per step at most over the last two seconds)`);
+    balanced('so far');
+    // --- two
+    hole(2);
+    check(afloat([2, 3]) === null, 'with the next one open as well the hydrostatics cannot keep it afloat');
+    const two = await run(num('t2', 60), 'two compartments open');
+    const low = Math.min(...[[-a, -b], [a, -b], [-a, b], [a, b]].map(([x, y]) => hull.fromDrawing([x, y, 0])[1]));
+    check(hull.asleep || two.top < 0.005, `it ends at rest (${hull.asleep ? 'asleep' : `${two.top.toFixed(4)} cells per step at most over the last two seconds`})`);
+    check(Math.abs(low - bed) < 0.5, `... on the bed (its lowest corner ${(low - bed).toFixed(2)} cells above it, trim ${trim().toFixed(2)} degrees)`);
+    balanced('at the end');
+    if (q.get('dump')) { const box = world.bodyBox(hull, 3); picture(sim, box.lo.map(Math.floor), box.hi.map((v, d) => Math.ceil(v - box.lo[d]))); }
+    world.removeBodies();
+    sim.dispose();
+  } else if (kind === 'ship') {
+    // Scenario 12 as the app runs it (src/world/scenes.js), with the two holes sooner: a ship
+    // with three compartments on a sea over a bed. With her bow compartment open she trims by
+    // the head to where the hydrostatics of lost buoyancy put her; with the one amidships open
+    // as well the water comes over the bulkhead into the last one, and she ends on the bed.
+    if (dim !== 3) throw new Error('the ship case is 3D: &dim=3');
+    const t1 = num('first', 3), t2 = num('second', 16), tEnd = num('end', 46);
+    const scene = WORLD_SCENES.ship.build({ first: t1, second: t2 });
+    scene.couple = cparams;
+    const { level, ship } = scene.marks;
+    const world = new World(glc, dim, scene, { params });
+    const sim = world.sim, hull = world.hulls[0], dt = sim.params.dt;
+    const [lo, hi] = ship.box, G = hull.com;
+    // the hull in points half a cell apart: material (-1) or the compartment it is the hollow of
+    const st = 0.5, dv = st ** 3, pts = [];
+    for (let x = lo[0] + st / 2; x < hi[0]; x += st) {
+      for (let y = lo[1] + st / 2; y < hi[1]; y += st) {
+        for (let z = lo[2] + st / 2; z < hi[2]; z += st) {
+          if (ship.shell(x, y, z) > 0) continue;
+          pts.push([x, y, z, ship.sd(x, y, z) <= 0 ? -1 : ship.comps.findIndex(([x0, x1]) => x >= x0 - 1e-9 && x <= x1 + 1e-9)]);
+        }
+      }
+    }
+    // The hydrostatics of lost buoyancy. The sea stands at y = w + t (x - G.x) in her drawing
+    // (t = tan of the trim, bow down positive); the compartments `open` carry nothing. For each
+    // trim the level at which her weight is carried, and the lever of the buoyancy about G; she
+    // floats where that lever passes through zero. Returns the trim (degrees), the water in the
+    // open compartments, and how far the sea stands over the rim of each closed one.
+    const afloat = (open) => {
+      const at = (w, t) => {
+        let V = 0, M = 0;
+        const water = ship.comps.map(() => 0);
+        for (const p of pts) {
+          const u = Math.min(Math.max((w + t * (p[0] - G[0]) - p[1]) / st + 0.5, 0), 1);
+          if (p[3] >= 0 && open.includes(p[3])) { water[p[3]] += dv * u; continue; }
+          V += dv * u;
+          M += dv * u * ((p[0] - G[0]) + t * (p[1] - G[1]));
+        }
+        return { V, M, water };
+      };
+      let last = null;
+      for (let deg = -1; deg <= 50; deg += 0.5) {
+        const t = Math.tan(deg * Math.PI / 180);
+        let a = lo[1], b = hi[1] + 60;
+        if (at(b, t).V < hull.mass) return null;
+        for (let k = 0; k < 28; k++) { const m = 0.5 * (a + b); if (at(m, t).V < hull.mass) a = m; else b = m; }
+        const now = { deg, w: 0.5 * (a + b), ...at(0.5 * (a + b), t) };
+        if (last && last.M < 0 && now.M >= 0) {
+          const f = last.M / (last.M - now.M), d = last.deg + f * 0.5, w = last.w + f * (now.w - last.w), tt = Math.tan(d * Math.PI / 180);
+          const over = ship.comps.map(([x0, x1], k) => (open.includes(k) ? null : Math.max(w + tt * (x0 - ship.wall - G[0]), w + tt * (x1 + ship.wall - G[0])) - hi[1]));
+          return { deg: d, w, water: at(w, tt).water, over, floods: over.some((o) => o !== null && o > 0) };
+        }
+        // (on an even keel with nothing open the lever is zero from the start)
+        if (!last && now.M >= 0 && !open.length) return { deg: 0, w: now.w, water: now.water, over: [], floods: false };
+        last = now;
+      }
+      return null;
+    };
+    const inComps = () => {
+      const box = world.bodyBox(hull, 2), sum = ship.comps.map(() => 0);
+      for (const cl of cells(sim, box.lo, box.hi.map((v, d) => v - box.lo[d]))) {
+        const l = hull.toLocal([cl.x, cl.y, cl.z]).map((v, d) => v + G[d]);
+        if (ship.shell(l[0], l[1], l[2]) > 0 || ship.sd(l[0], l[1], l[2]) < 0) continue;
+        const k = ship.comps.findIndex(([x0, x1]) => l[0] >= x0 && l[0] <= x1);
+        if (k >= 0) sum[k] += cl.rho;
+      }
+      return sum;
+    };
+    // (bow down positive, as the hydrostatics count it)
+    const trim = () => -Math.asin(hull.toWorldDir([1, 0, 0])[1]) * 180 / Math.PI;
+    const books = () => { sim.readLedger(); return sim.excessSync() - sim.displaced + sim.absorbed - sim.added + sim.removed + sim.freedMass; };
+    let peak = 0, books0 = 0, most = 0;
+    const balanced = (what) => {
+      const off = books() - books0, t = world.time;
+      check(Math.abs(off) < (1e-6 + 1e-6 * t) * peak, `${what}: water and ledger are off by ${off.toFixed(2)} cells after ${t.toFixed(0)} s, ${(Math.abs(off) / peak).toExponential(1)} of the ${peak.toFixed(0)} cells stored at the most (allowed: 1e-6 and 1e-6 per second)`);
+    };
+    const run = async (until, what) => {
+      let top = 0, n = 0;
+      while (world.time < until - 1e-9) {
+        world.step();
+        await world.forcesReady;
+        n++;
+        const sp = hull.asleep ? 0 : Math.max(Math.hypot(...hull.vel), Math.hypot(...hull.omega) * hull.extent) * dt;
+        if (world.time > until - 2) top = Math.max(top, sp);
+        most = Math.max(most, sim.bricks);
+        if (n % 240 === 0 || world.time >= until - 1e-9) {
+          peak = Math.max(peak, sim.measureSync().mass);
+          log(`    ${what}, t ${world.time.toFixed(0)} s: trim ${trim().toFixed(2)} deg, keel ${(level - hull.fromDrawing([G[0], -ship.b, 0])[1]).toFixed(2)} cells under the sea below her centre of mass, ${hull.asleep ? 'asleep' : `speed ${sp.toFixed(4)} cells/step`}, ${sim.bricks} bricks (${sim.nHeld} held)${world.coupler ? `, iterations ${(world.coupler.stats.iterations / Math.max(world.coupler.stats.steps, 1)).toFixed(2)}` : ''}`);
+          if (world.coupler) Object.assign(world.coupler.stats, { iterations: 0, steps: 0, unconverged: 0 });
+          await pause();
+        }
+      }
+      return { top };
+    };
+    await run(t1 - 0.5, 'afloat');
+    books0 = books();
+    const even = afloat([]);
+    const dry = inComps().reduce((x, y) => x + y, 0);
+    const keel = () => level - hull.fromDrawing([G[0], -ship.b, 0])[1];
+    check(dry < 0.5 && Math.abs(trim()) < 0.5, `afloat and dry on an even keel (${dry.toExponential(1)} cells of water in her, trim ${trim().toFixed(2)} degrees)`);
+    check(!!even && Math.abs(keel() - (even.w - lo[1])) < 0.5, `... drawing ${keel().toFixed(2)} cells (her weight in water: ${even ? (even.w - lo[1]).toFixed(2) : '-'})`);
+    // --- the bow compartment (the scene makes the hole)
+    const one = await run(t2 - 0.5, 'bow compartment open');
+    const want = afloat([2]);
+    log(`  the hydrostatics: ${want ? `trim ${want.deg.toFixed(2)} degrees by the bow with ${want.water[2].toFixed(0)} cells of water in the open compartment, the sea ${want.over.filter((o) => o !== null).map((o) => (-o).toFixed(1)).join(' and ')} cells below the rims of the others` : 'she cannot float'}`);
+    check(hull.holes === 1, `the scene has made one hole (${hull.holes || 0})`);
+    check(!!want && !want.floods && Math.abs(trim() - want.deg) < 2, `with her bow compartment open she trims ${trim().toFixed(2)} degrees by the bow, within 2 of the ${want ? want.deg.toFixed(2) : '-'} of the hydrostatics`);
+    const w1 = inComps();
+    check(!!want && Math.abs(w1[2] / want.water[2] - 1) < 0.1, `... with ${w1[2].toFixed(0)} cells of water in it (${want ? want.water[2].toFixed(0) : '-'}); the others dry (${w1.slice(0, 2).map((v) => v.toFixed(2)).join(' ')})`);
+    check(hull.asleep || one.top < 0.005, `... and comes to rest (${hull.asleep ? 'asleep' : `${one.top.toFixed(4)} cells per step at most over the last two seconds`})`);
+    balanced('so far');
+    // --- and the one amidships
+    const both = afloat([1, 2]);
+    check(both === null || both.floods, `with the one amidships open as well the hydrostatics cannot keep her afloat (${both ? `the sea would stand ${Math.max(...both.over.filter((o) => o !== null)).toFixed(1)} cells over the rim of her last compartment` : 'her weight is more than she can displace'})`);
+    const two = await run(tEnd, 'two compartments open');
+    const low = Math.min(...hull.samplePoints().map((p) => world.terrain.sd(p)));
+    const deck = Math.max(...hull.samplePoints().map((p) => p[1]));
+    check(hull.holes === 2, `the scene has made the second hole (${hull.holes || 0})`);
+    check(hull.asleep || two.top < 0.005, `she ends at rest (${hull.asleep ? 'asleep' : `${two.top.toFixed(4)} cells per step at most over the last two seconds`})`);
+    check(Math.abs(low) < 0.5 && deck < level - 4, `... on the bed (her lowest point ${low.toFixed(2)} cells above it, her highest ${(level - deck).toFixed(1)} cells under the sea, trim ${trim().toFixed(2)} degrees)`);
+    balanced('at the end');
+    log(`  ${most} bricks stored at the most (${(most * 512 / 1e6).toFixed(2)} million cells)`);
+    world.removeBodies();
+    sim.dispose();
+  } else {
+    throw new Error('unknown case ' + kind);
+  }
+} catch (e) {
+  failed++;
+  log('ERROR ' + (e.stack || e));
+}
+log(failed ? `${failed} check(s) failed` : 'all checks passed');
+if (failed) window.__error = `${failed} check(s) failed`;
+window.__done = true;
+</script>

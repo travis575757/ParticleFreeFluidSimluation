@@ -1,4 +1,6 @@
 // World scenes: ground, liquid, sources and drains in cells; x and z horizontal, y up.
+import { sdBox, sdCut, sdIntersect, sdPlane, integrateShape, floatDraught } from './hull.js';
+
 const clamp = (x, a, b) => Math.min(Math.max(x, a), b);
 const ss = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
 const box = (lo, hi, vel = [0, 0, 0]) => ({ type: 'box', center: lo.map((v, d) => (v + hi[d]) / 2), half: lo.map((v, d) => (hi[d] - v) / 2), vel });
@@ -426,6 +428,112 @@ export const WORLD_SCENES = {
         world: { focusRadius: 48 },
         camera: { target: [xl - 40, 50, zs(xl - 40)], dist: 520, yaw: 0.5, pitch: 0.5 },
         marks: { lake, pond, xs, xl, zs },
+      };
+    },
+  },
+  // 12. A ship off an island, three compartments open at the top. A hole below the waterline
+  //     of the foremost one floods it and the ship goes down by the bow; a second hole
+  //     amidships is more than she can carry, and she ends on the sea bed.
+  ship: {
+    title: 'Holed ship off an island',
+    blurb: 'A ship with three compartments lies off an island. After five seconds a hole opens under her bow and she settles by the head; a second one amidships sinks her. The Hole tool makes more (or sooner). Her hull is a distance field in a texture; she and the water in her are solved together.',
+    build({ first = 5, second = 30 } = {}) {
+      const level = 40.25, bed = 6;
+      const height = (x, z) => {
+        const r = Math.hypot(x - 110, z + 120);
+        // the sea bed, rising to an island with a hill on it
+        const island = (level + 3 - bed) * (1 - ss(70, 190, r)) + 26 * (1 - ss(0, 80, r));
+        return bed + island + 1.5 * Math.sin(x / 23 + 1) * Math.sin(z / 31) * ss(60, 200, r);
+      };
+      const ship = shipShape(3);
+      const body = shipBody(3, ship, { draught: 10 });
+      const at = [-60, 60];
+      // a hole through the side at the drawing's (x, y), on the side z > 0
+      const side = (x, y) => {
+        let z = 0;
+        while (z < ship.c && ship.shell(x, y, z) < -ship.wall / 2) z += 0.05;
+        return [x, y, z];
+      };
+      const hole = (at, where, radius) => ({ at, run: (world) => { const b = world.hulls[0]; if (b) world.breachAt(b.fromDrawing(where), radius, 2); } });
+      return {
+        h: 0.1,
+        terrain: { origin: [-260, -300], spacing: 2, n: [261, 261], height },
+        water: [{ box: [-1e6, -1e6, 1e6, 1e6], level }],
+        swell: { params: { depth: level - bed } },
+        liquid: [],
+        // (off the foot of the island's slope: over it her bow takes the ground as she trims)
+        bodies: [{ ...body, pos: [at[0], level - body.draught + ship.b, at[1]], quat: quatY(0.5) }],
+        events: [hole(first, side(22, -ship.b + ship.wall + 1.5), 2.5), hole(second, side(0, -ship.b + ship.wall + 1.5), 3)],
+        camera: { target: [at[0], level - 4, at[1]], dist: 165, yaw: 0.2, pitch: 0.55 },
+        marks: { level, bed, ship },
+      };
+    },
+  },
+};
+
+// ---- hulls --------------------------------------------------------------------------------
+// The drawing of a ship: bow towards +x, y up, the origin in the middle of the box around her.
+// 3D: a flat-bottomed hull with round bilges and a pointed bow, open at the top, divided by
+// two bulkheads. 2D: her section along the keel, with three bulkheads.
+export function shipShape(dim, o = {}) {
+  const wall = o.wall ?? 3;
+  if (dim === 2) {
+    const a = o.a ?? 60, b = o.b ?? 12, n = o.compartments ?? 4;
+    const top = b + 20, floor = -b + wall, wide = (2 * (a - wall) - (n - 1) * wall) / n;
+    const comps = Array.from({ length: n }, (_, k) => [-a + wall + k * (wide + wall), -a + wall + k * (wide + wall) + wide]);
+    const outer = sdBox(2, [0, 0, 0], [a, b, 1]);
+    const cavity = ([x0, x1]) => sdBox(2, [(x0 + x1) / 2, (floor + top) / 2, 0], [(x1 - x0) / 2, (top - floor) / 2, 1]);
+    return { sd: sdCut(outer, ...comps.map(cavity)), shell: outer, box: [[-a, -b, -1], [a, b, 1]], a, b, c: 1, wall, comps, floor };
+  }
+  const a = o.a ?? 36, b = o.b ?? 8, c = o.c ?? 12, bow = o.bow ?? 20, n = o.compartments ?? 3;
+  const l = Math.hypot(c, bow);
+  const taper = [sdPlane([a, 0, 0], [c / l, 0, bow / l]), sdPlane([a, 0, 0], [c / l, 0, -bow / l])];
+  const outer = sdIntersect(sdBox(3, [0, 0, 0], [a, b, c], 2), ...taper);
+  // (the same with the top far above: what is cut out of the hull stays open upwards)
+  const tall = sdIntersect(sdBox(3, [0, 20, 0], [a, b + 20, c], 2), ...taper);
+  const inner = (x, y, z) => tall(x, y, z) + wall;
+  const long = (2 * (a - wall) - (n - 1) * wall) / n;
+  const comps = Array.from({ length: n }, (_, k) => [-a + wall + k * (long + wall), -a + wall + k * (long + wall) + long]);
+  const cavity = ([x0, x1]) => sdIntersect(inner, sdBox(3, [(x0 + x1) / 2, 20, 0], [(x1 - x0) / 2, 60, c + 8]));
+  return { sd: sdCut(outer, ...comps.map(cavity)), shell: outer, box: [[-a, -b, -c], [a, b, c]], a, b, c, wall, comps, floor: -b + wall };
+}
+
+/**
+ * The body of a ship that floats `draught` cells deep on an even keel: material of `density`
+ * and ballast low in her, under the middle of what she displaces.
+ */
+export function shipBody(dim, ship, { draught, density = 0.5 }) {
+  const [lo, hi] = ship.box;
+  const under = integrateShape(dim, (x, y, z) => Math.max(ship.shell(x, y, z), y - lo[1] - draught), lo, hi, 1);
+  const material = integrateShape(dim, ship.sd, lo, hi, 1);
+  const ballast = Math.max(under.volume - density * material.volume, 0);
+  // (ballast and material together have their centre over that of the water displaced)
+  const x = ballast > 0 ? (under.volume * under.center[0] - density * material.volume * material.center[0]) / ballast : 0;
+  const mass = density * material.volume + ballast;
+  return { shape: 'hull', sd: ship.sd, shell: ship.shell, box: ship.box, density, ballast: [{ pos: [x, lo[1] + 2, 0], mass: ballast }],
+    draught: floatDraught(dim, ship.shell, ship.box, mass) };
+}
+
+// ---- 2D scenes (world2d.html) ---------------------------------------------------------------
+export const WORLD_SCENES_2D = {
+  // 11. The same ship in section, afloat on a sea over a bed.
+  flood: {
+    title: 'Flooding compartments',
+    blurb: 'A ship in section, four compartments in a row. After three seconds a hole opens in the floor of the foremost one: it fills to the level of the sea and the ship trims by the bow. Click on her hull to make more holes: with two compartments open she goes down and comes to rest on the bed.',
+    build({ first = 3, second = Infinity } = {}) {
+      const level = 72, bed = 16;
+      const ship = shipShape(2);
+      const body = shipBody(2, ship, { draught: 10.3 });
+      const mid = (k) => [(ship.comps[k][0] + ship.comps[k][1]) / 2, -ship.b + ship.wall / 2, 0];
+      return {
+        h: 0.05,
+        solids: [{ type: 'box', center: [0, bed - 500, 0], half: [4000, 500, 1] }],
+        water: [{ box: [-1e6, -1e6, 1e6, 1e6], level }],
+        liquid: [],
+        bodies: [{ ...body, pos: [0.37, level - body.draught + ship.b, 0] }],
+        events: [3, 2].map((k, i) => ({ at: i ? second : first, run: (world) => { const b = world.hulls[0]; if (b) world.breachAt(b.fromDrawing(mid(k)), 2.5, 2); } })),
+        view: { center: [0, level - 22], width: 260 },
+        marks: { level, bed, ship },
       };
     },
   },

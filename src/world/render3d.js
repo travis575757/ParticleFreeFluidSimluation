@@ -21,7 +21,6 @@
 // one cell from its neighbours: inside a brick the GPU's own filtering then gives a continuous
 // trilinear density from two fetches.
 import { header, prims, TERRAIN, FAR as FAR_FIELD, SWELL, BRICK, MAX_PRIMS, MAX_WATER } from '../shaders/common.js';
-import { packPrims } from '../sim.js';
 
 export { Camera } from '../render3d.js';
 
@@ -96,8 +95,8 @@ uniform float uTerMax;        // highest point of the ground
 ${TERRAIN}
 ${FAR_FIELD}
 ${SWELL}
-${prims('S')}
-uniform float uKind[${MAX_PRIMS}];    // per primitive: 0 fixed obstacle, 1 scripted body, 2..5 rigid body colours, 6 rock (as the ground where it is steep)
+${prims('S', true)}
+uniform float uKind[${MAX_PRIMS}];    // per primitive: 0 fixed obstacle, 1 scripted body, 2..5 rigid body colours, 6 rock (as the ground where it is steep), 7 hull
 const float FAR = 20000.0;
 
 // slot of brick b, -1 if it is not stored (the top level of the page table wraps: the answer
@@ -581,6 +580,7 @@ vec3 shadeOpaque(vec3 p, float idx, float t) {
       : kind < 3.5 ? vec3(0.90, 0.33, 0.35)
       : kind < 4.5 ? vec3(0.42, 0.78, 0.50)
       : kind < 5.5 ? vec3(0.68, 0.55, 0.93)
+      : kind > 6.5 ? vec3(0.46, 0.21, 0.16)
       : vec3(0.17, 0.155, 0.14) * (0.8 + 0.4 * fract(sin(floor(p.y / 5.0 + 0.6 * sin(p.x * 0.05) + 0.6 * sin(p.z * 0.07)) * 12.9898) * 43758.5453));
   }
   float dif = max(dot(n, uLight), 0.0) * groundShadow(p + n * 0.3);
@@ -617,7 +617,10 @@ void main() {
     vec2 op2 = traceOpaque(ph, rr);
     float tEnd2 = op2.x > 0.0 ? op2.x : 400.0;
     float te = crossing(ph, rr, 0.05, tEnd2, true, 0.0, none, noLines);
-    float thick = te >= 0.0 ? te : tEnd2;
+    // (liquid that ends within two cells of what the ray lands on reaches it: in the cells the
+    // ground cuts the density is below the threshold, and where bricks that are stored lie next
+    // to water that is not, the sea bed showed their outlines)
+    float thick = te >= 0.0 && te < tEnd2 - 2.0 ? te : tEnd2;
     if (te >= 0.0 && rr.y < 0.0 && uHfMap.w > 0.5) {
       // Out of the back of a crest of the height field, with its water below: the ray goes into
       // that next, and what it lands on is seen through it. (One stretch of water is all that
@@ -680,7 +683,7 @@ void main() {
       uVol: this.vol, uVolInv: [1 / this.vol.w, 1 / this.vol.h], uVolRow: this.perRow,
       uS1: sim.R.s[1], uS2: sim.R.s[2],
       uTerMax: world.terrain ? world.terrain.max : 0,
-      ...packPrims(world.solidPrims(), 'S', 3),
+      ...sim._prims(world.solidPrims(), 'S'),
       uKind: kinds,
       _rows: rows,
     };

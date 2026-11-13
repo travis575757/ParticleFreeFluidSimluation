@@ -514,14 +514,63 @@ float sdTerrain(vec3 x) {
 //   A = (centre.xyz, type)   type: 1 ball, 2 box; negative = inverted (container)
 //   B = (half.xyz | radius, corner rounding)
 //   R = world->local rotation, V = linear velocity, W = angular velocity
-export function prims(P) {
+//
+// With `hulls`, a third kind (src/world/hull.js): a distance field sampled on a lattice in the
+// frame of the body, for shapes no formula describes (a hull with its compartments, holed).
+//   A = (centre.xyz, type)   type: 3 the material, 4 the shell (the body with its hollows filled)
+//   B = (half extents of the lattice, which of the MAX_HULLS textures)
+// The texture holds the lattice row by row, in 3D slice after slice in tiles; r = material,
+// g = shell, both in cells. Beyond the lattice the distance is a lower bound (the material
+// keeps HULL_MARGIN cells from the faces of the lattice).
+export const MAX_HULLS = 2;
+export const HULL_MARGIN = 2;
+function hullCode(P) {
+  return `
+uniform sampler2D u${P}H0;
+uniform sampler2D u${P}H1;
+uniform ivec4 u${P}HN[${MAX_HULLS}];    // samples along x, y, z; slices in a row of the texture
+vec2 hull${P}At(int h, ivec3 i) {
+  ivec4 n = u${P}HN[h];
+#if DIM == 2
+  ivec2 t = i.xy;
+#else
+  ivec2 t = ivec2(i.x + (i.z % n.w) * n.x, i.y + (i.z / n.w) * n.y);
+#endif
+  return h == 0 ? texelFetch(u${P}H0, t, 0).rg : texelFetch(u${P}H1, t, 0).rg;
+}
+float sd${P}Hull(vec3 p, vec4 B, int ch) {
+  int h = int(B.w + 0.5);
+  vec3 q = clamp(p, -B.xyz, B.xyz);
+  float away = length(p - q);
+  if (away > 3.0) return away + float(${HULL_MARGIN});
+  ivec3 n = u${P}HN[h].xyz;
+  vec3 u = (q + B.xyz) * (float(n.x - 1) / (2.0 * B.x));
+#if DIM == 2
+  ivec3 i = ivec3(clamp(ivec2(floor(u.xy)), ivec2(0), n.xy - 2), 0);
+  vec2 f = u.xy - vec2(i.xy);
+  float d = mix(mix(hull${P}At(h, i)[ch], hull${P}At(h, i + ivec3(1, 0, 0))[ch], f.x),
+                mix(hull${P}At(h, i + ivec3(0, 1, 0))[ch], hull${P}At(h, i + ivec3(1, 1, 0))[ch], f.x), f.y);
+#else
+  ivec3 i = clamp(ivec3(floor(u)), ivec3(0), n - 2);
+  vec3 f = u - vec3(i);
+  float d = mix(mix(mix(hull${P}At(h, i)[ch], hull${P}At(h, i + ivec3(1, 0, 0))[ch], f.x),
+                    mix(hull${P}At(h, i + ivec3(0, 1, 0))[ch], hull${P}At(h, i + ivec3(1, 1, 0))[ch], f.x), f.y),
+                mix(mix(hull${P}At(h, i + ivec3(0, 0, 1))[ch], hull${P}At(h, i + ivec3(1, 0, 1))[ch], f.x),
+                    mix(hull${P}At(h, i + ivec3(0, 1, 1))[ch], hull${P}At(h, i + ivec3(1, 1, 1))[ch], f.x), f.y), f.z);
+#endif
+  return away > 0.0 ? max(away + float(${HULL_MARGIN}), d - away) : d;
+}
+`;
+}
+
+export function prims(P, hulls = false) {
   return `
 uniform int u${P}N;
 uniform vec4 u${P}A[${MAX_PRIMS}];
 uniform vec4 u${P}B[${MAX_PRIMS}];
 uniform mat3 u${P}R[${MAX_PRIMS}];
 uniform vec3 u${P}V[${MAX_PRIMS}];
-uniform vec3 u${P}W[${MAX_PRIMS}];
+uniform vec3 u${P}W[${MAX_PRIMS}];${hulls ? hullCode(P) : ''}
 float sd${P}Prim(int i, vec3 x) {
   vec4 A = u${P}A[i];
   vec4 B = u${P}B[i];
@@ -531,7 +580,9 @@ float sd${P}Prim(int i, vec3 x) {
 #endif
   float d;
   if (abs(A.w) < 1.5) {
-    d = length(p) - B.x;
+    d = length(p) - B.x;${hulls ? `
+  } else if (abs(A.w) > 2.5) {
+    d = sd${P}Hull(p, B, abs(A.w) > 3.5 ? 1 : 0);` : ''}
   } else {
     vec3 q = abs(p) - B.xyz + B.w;
 #if DIM == 2

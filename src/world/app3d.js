@@ -59,7 +59,10 @@ function frameCamera() {
 
 function loadScene(keepCamera = false) {
   if (world) world.dispose();
-  const scene = WORLD_SCENES[state.scene].build();
+  // &first=, &second=: when the ship scene makes its holes (seconds)
+  const when = {};
+  for (const k of ['first', 'second']) if (q.has(k)) when[k] = Number(q.get(k));
+  const scene = WORLD_SCENES[state.scene].build(when);
   // &until=seconds: the sources stop then
   if (q.has('until')) for (const e of scene.emitters) e.until = Number(q.get('until'));
   world = new World(glc, 3, scene, { params: state.overrides });
@@ -90,6 +93,7 @@ function actionPoint() {
   const ray = pointerRay();
   const h = pointer.hit;
   const lift = state.tool === 'pour' ? state.brush * 1.5 : 0;
+  if (state.tool === 'hole' && h && h.solid > 0) return v3.add(ray.origin, v3.mul(ray.dir, h.solid));
   if (h && h.liquid > 0) return v3.add(v3.add(ray.origin, v3.mul(ray.dir, h.liquid)), [0, lift, 0]);
   if (h && h.solid > 0) return v3.add(v3.add(ray.origin, v3.mul(ray.dir, h.solid)), [0, lift + state.brush * 0.5, 0]);
   const { fwd } = camera.basis();
@@ -108,8 +112,25 @@ canvas.addEventListener('pointerdown', (ev) => {
   pointer.orbit = !pointer.pan && (ev.button !== 0 || state.tool === 'orbit' || ev.shiftKey);
   canvas.style.cursor = pointer.orbit || pointer.pan ? 'grabbing' : 'crosshair';
   if (state.tool === 'crate' && !pointer.orbit && !pointer.pan) dropCrate();
+  if (state.tool === 'hole' && !pointer.orbit && !pointer.pan) holeAtPointer();
   ev.preventDefault();
 });
+
+const holeRadius = () => Math.max(2.5, state.brush / 2);
+/**
+ * A hole through the hull under the pointer: a ball centred half a wall inside the surface the
+ * pointer's ray meets (so that it comes out on the other side of the plating).
+ */
+async function holeAtPointer() {
+  const ray = pointerRay();
+  let h = null;
+  for (let k = 0; k < 30 && !h; k++) {
+    h = await renderer.pick(world, ray.origin, ray.dir).catch(() => null);
+    if (!h) await new Promise((r) => setTimeout(r, 16));
+  }
+  if (!h || !(h.solid > 0)) return null;
+  return world.breachAt(v3.add(ray.origin, v3.mul(ray.dir, h.solid + 1.5)), holeRadius(), 1);
+}
 
 /** A crate above the point under the pointer (one per click, while there is room in the table of solids). */
 function dropCrate() {
@@ -199,6 +220,7 @@ function buildPanel() {
     ['pour', 'Pour', 'Hold to add liquid under the pointer'],
     ['drain', 'Drain', 'Hold to remove liquid'],
     ['crate', 'Crate', 'Click to drop a crate (its size follows the brush; up to twelve solids in a scene)'],
+    ['hole', 'Hole', 'Click on a ship to make a hole through her hull (half the brush across, at least 2.5 cells)'],
   ], state.tool, (v) => { state.tool = v; canvas.style.cursor = v === 'orbit' ? 'grab' : 'crosshair'; });
   P.slider('brush', 'Brush size (cells)', { min: 3, max: 16, step: 1, value: state.brush }, (v) => { state.brush = v; });
   P.note('Right-drag or Shift-drag orbits, middle-drag or Ctrl-drag moves the view, the wheel zooms.');
@@ -240,7 +262,7 @@ function buildPanel() {
 
   P.section('Keys', { collapsible: true, open: false });
   const keys = P.note('');
-  keys.innerHTML = '<kbd>Space</kbd> pause · <kbd>R</kbd> restart · <kbd>.</kbd> single step · <kbd>B</kbd> bricks · <kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd> scenes';
+  keys.innerHTML = '<kbd>Space</kbd> pause · <kbd>R</kbd> restart · <kbd>.</kbd> single step · <kbd>B</kbd> bricks · <kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd>, <kbd>-</kbd> scenes';
   return P;
 }
 
@@ -258,6 +280,7 @@ window.addEventListener('keydown', (ev) => {
   else if (ev.key === '.') { state.paused = true; syncPause(); stepOnce(); }
   else if (ev.key === 'b' || ev.key === 'B') { state.overlay = !state.overlay; panel.controls.bricks.checked = state.overlay; }
   else if (ev.key === '0') { const k = Object.keys(WORLD_SCENES)[9]; if (k) { state.scene = k; panel.controls.scene.value = k; loadScene(); } }
+  else if (ev.key === '-') { const k = Object.keys(WORLD_SCENES)[10]; if (k) { state.scene = k; panel.controls.scene.value = k; loadScene(); } }
   else if (/^[1-9]$/.test(ev.key)) {
     const k = Object.keys(WORLD_SCENES)[Number(ev.key) - 1];
     if (k) { state.scene = k; panel.controls.scene.value = k; loadScene(); }
@@ -362,7 +385,7 @@ function tick() {
       applyPointer();
     }
     const showBrush = pointer.pos && state.tool !== 'orbit' && (pointer.inside || pointer.down);
-    renderer.render(world, camera, { overlay: state.overlay, mist: state.mist, swell: state.swell, cursor: showBrush ? [...pointer.pos, state.brush] : null });
+    renderer.render(world, camera, { overlay: state.overlay, mist: state.mist, swell: state.swell, cursor: showBrush ? [...pointer.pos, state.tool === 'hole' ? holeRadius() : state.brush] : null });
     if (frame % 6 === 0) {
       // the totals of the sources and drains follow the same report the storage counters come from
       if (glc.readback !== 'scrambled') {
@@ -392,7 +415,7 @@ try {
   loadScene();
   fitCanvas();
   panel = buildPanel();
-  window.app = { state, camera, loadScene, stepOnce, renderer, get world() { return world; } };
+  window.app = { state, camera, loadScene, stepOnce, renderer, holeAtPointer, get world() { return world; } };
   requestAnimationFrame(tick);
 } catch (e) {
   fail(String(e.message || e).startsWith('World mode') ? e.message : 'This demo needs WebGL2 with float render targets.\n\n' + String(e.stack || e.message || e));

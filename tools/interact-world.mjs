@@ -1,5 +1,6 @@
-// Drives the World app with synthetic mouse input: bricks appear where the water goes, the
-// books balance, pour / drain / push act where the pointer is, the camera moves, every scene runs.
+// Drives the World apps with synthetic mouse input: bricks appear where the water goes, the
+// books balance, pour / drain / push / crate / hole act where the pointer is, the camera moves,
+// every scene runs; and the world in section (world2d.html).
 //   node tools/interact.mjs world [--shots dir] [--browser chrome|firefox|librewolf] [--pref name=value ...]
 import { startServer } from './serve.mjs';
 import { launch, browserArgs } from './browser.mjs';
@@ -216,6 +217,85 @@ try {
   check('a crate dropped on the lake of a height field floats', Math.abs(fl.y - line) < 0.5 && fl.v < 1 && Math.abs(fl.off) < 1e-5 * fl.water && fl.refused === 0,
     `14 s later ${(fl.y - line).toFixed(2)} cells above its float line, ${fl.asleep ? 'asleep' : `moving at ${fl.v.toFixed(2)} cells/s`}; books off by ${fl.off.toFixed(2)} of ${(fl.water / 1e3).toFixed(0)} k cells`);
   await shot('crate_lake');
+
+  // the hole tool: a click on the side of the ship, under water, lets the sea into the
+  // compartment behind it (before the scene makes its own first hole, at 5 s)
+  await page.goto(`http://localhost:${port}/world3d.html?scene=ship&capture`, { waitUntil: 'load' });
+  await page.waitForFunction(() => window.world?.time > 0.4 || window.__error, { timeout: 120000 });
+  await tool('hole');
+  // (a point on the side of her aft compartment, 3 cells above her keel, on the side the camera sees)
+  const side = await page.evaluate(() => {
+    const w = window.world, b = w.hulls[0], ship = w.scene.marks.ship, cam = window.app.camera.basis().pos;
+    const x = (ship.comps[0][0] + ship.comps[0][1]) / 2;
+    for (const z of [ship.c, -ship.c]) {
+      const p = b.fromDrawing([x, -ship.b + ship.wall + 2, z]), n = b.toWorldDir([0, 0, Math.sign(z)]);
+      if (n[0] * (cam[0] - p[0]) + n[1] * (cam[1] - p[1]) + n[2] * (cam[2] - p[2]) > 0) return p;
+    }
+    return null;
+  });
+  const sp = await screen(side);
+  await page.mouse.move(...at(...sp));
+  await sleep(200);
+  await page.mouse.click(...at(...sp));
+  await page.waitForFunction(() => window.world.hulls[0].holes > 0 || window.world.time > 3 || window.__error, { timeout: 120000 });
+  const holed = await page.evaluate(() => ({ holes: window.world.hulls[0].holes || 0, t: window.world.time }));
+  await page.waitForFunction(() => window.world.time > 4.6 || window.__error, { timeout: 300000 });
+  const sh = await page.evaluate(async () => {
+    const w = window.world, b = w.hulls[0];
+    return { trim: Math.asin(b.toWorldDir([1, 0, 0])[1]) * 180 / Math.PI, holes: b.holes || 0, off: await w.balanceSettled(), stored: w.sim.books.stored,
+      shown: document.querySelector('#panel').innerText.match(/Bodies awake\s*([^\n]+)/)?.[1] || '' };
+  });
+  check('hole tool holes the ship where she is clicked', holed.holes === 1 && sh.holes === 1 && sh.trim > 1 && Math.abs(sh.off) < 1e-4 * sh.stored,
+    `${holed.holes} hole at ${holed.t.toFixed(1)} s; at 4.6 s she trims ${sh.trim.toFixed(1)} degrees by the stern; books off by ${sh.off.toFixed(2)} of ${(sh.stored / 1e3).toFixed(0)} k cells`);
+  await shot('hole');
+
+  // the world in section: the same tool on the ship of scenario 11 (before the scene's own hole, at 3 s)
+  await page.goto(`http://localhost:${port}/world2d.html?capture`, { waitUntil: 'load' });
+  await page.waitForFunction(() => window.world?.time > 0.3 || window.__error, { timeout: 120000 });
+  check('the world in section starts', !(await page.evaluate(() => window.__error)), await page.evaluate(() => window.__error || ''));
+  const box2 = await (await page.$('#view')).boundingBox();
+  // where a point of the world is on the page
+  const screen2 = (p) => page.evaluate((p, b) => {
+    const v = window.app.view, cpp = v.width / b.width;
+    return [b.x + 0.5 * b.width + (p[0] - v.center[0]) / cpp, b.y + 0.5 * b.height - (p[1] - v.center[1]) / cpp];
+  }, p, box2);
+  const floor2 = await page.evaluate(() => {
+    const w = window.world, b = w.hulls[0], ship = w.scene.marks.ship;
+    return b.fromDrawing([(ship.comps[0][0] + ship.comps[0][1]) / 2, -ship.b + ship.wall / 2, 0]);
+  });
+  await page.mouse.click(...(await screen2(floor2)));
+  await page.waitForFunction(() => window.world.time > 2.8 || window.__error, { timeout: 300000 });
+  const fl2 = await page.evaluate(() => {
+    const w = window.world, b = w.hulls[0], up = b.toWorldDir([0, 1, 0]);
+    return { holes: b.holes || 0, trim: Math.atan2(-up[0], up[1]) * 180 / Math.PI, off: w.balance(), stored: w.sim.books.stored, bricks: w.sim.bricks,
+      shown: document.querySelector('#panel').innerText.match(/Hull\s*([^\n]+)/)?.[1] || '' };
+  });
+  check('a click on her floor holes the ship in section', fl2.holes === 1 && fl2.trim > 1 && Math.abs(fl2.off) < 1e-4 * fl2.stored,
+    `${fl2.holes} hole; at 2.8 s she trims ${fl2.trim.toFixed(1)} degrees by the stern (shown: ${fl2.shown}); ${fl2.bricks} bricks, books off by ${fl2.off.toFixed(2)} of ${fl2.stored.toFixed(0)} cells`);
+  const c0 = await page.evaluate(() => window.app.view.center.slice());
+  const mid2 = [box2.x + 0.5 * box2.width, box2.y + 0.3 * box2.height];
+  await drag(mid2, [mid2[0] + 80, mid2[1] + 40], 8, 'right');
+  const c1 = await page.evaluate(() => window.app.view.center.slice());
+  check('right-drag moves the view', Math.hypot(c1[0] - c0[0], c1[1] - c0[1]) > 5, `centre ${c0.map((v) => v.toFixed(0))} -> ${c1.map((v) => v.toFixed(0))}`);
+  const w0 = await page.evaluate(() => window.app.view.width);
+  await page.mouse.move(...mid2);
+  await page.mouse.wheel({ deltaY: -400 });
+  await sleep(50);
+  const w1 = await page.evaluate(() => window.app.view.width);
+  check('wheel zooms the view', w1 < w0 * 0.9, `${w0.toFixed(0)} -> ${w1.toFixed(0)} cells across`);
+  // pour above her, then drain it again
+  const seg2 = (name) => page.evaluate((n) => { [...document.querySelectorAll('.seg button')].find((b) => b.dataset.v === n).click(); }, name);
+  await seg2('pour');
+  const above = await screen2([floor2[0], floor2[1] + 30, 0]);
+  const a0 = await page.evaluate(() => window.world.sim.added);
+  await drag(above, [above[0] + 4, above[1]], 4, 'left', 400);
+  await sleep(200);
+  const a1 = await page.evaluate(() => window.world.sim.added);
+  check('pour tool adds liquid in section', a1 > a0 + 20, `${(a1 - a0).toFixed(0)} cells of liquid`);
+  await page.waitForFunction(() => window.world.time > 6 || window.__error, { timeout: 300000 });
+  const end2 = await page.evaluate(() => ({ err: window.__error || '', holes: window.world.hulls[0].holes || 0, off: window.world.balance(), stored: window.world.sim.books.stored }));
+  check('the scene makes its own hole and keeps its books', !end2.err && end2.holes === 2 && Math.abs(end2.off) < 1e-4 * end2.stored, end2.err || `${end2.holes} holes at 6 s, books off by ${end2.off.toFixed(2)} of ${end2.stored.toFixed(0)} cells`);
+  await shot('section');
   check('no page errors', errors.length === 0, errors.slice(0, 3).join(' | '));
 } catch (e) {
   console.log('FAIL  harness error: ' + (e.stack || e.message));

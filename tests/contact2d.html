@@ -13,6 +13,7 @@
 // mean kinetic energy, the largest liquid speed, the smallest gap between two solids and the
 // share of steps spent in contact.
 //   &trace=i0,i1[,body]  per-step force, acceleration, velocity, position, identified added mass
+//   &couple=1            bodies and liquid solved together (src/couple.js; &c.<name>= its parameters)
 //   &who=K               per body, the maxima over the last K steps
 //   &map=1               where the liquid still moves at the end
 //   &piston=v,n[,vx]     instead of all the above: body 0 is pushed through the liquid at a
@@ -72,7 +73,10 @@ const spec = raw.map(([shape, x, y, a, b, density, angle]) => (shape === 'ball'
 try {
   const glc = new GLContext(document.getElementById('c'), { preserveDrawingBuffer: true });
   const scene = buildScene({ liquid: [{ type: 'box', c: [0.5, level / 2], half: [0.5, level / 2] }], bodies: spec }, N);
-  const runner = new Runner(glc, 2, scene, overrides);
+  // &couple=1: bodies and liquid solved together (src/couple.js); &c.<name>=: its parameters
+  const cp = {};
+  for (const [k, v] of q) if (k.startsWith('c.')) cp[k.slice(2)] = Number(v);
+  const runner = new Runner(glc, 2, scene, overrides, { couple: q.get('couple') === '1' ? cp : false });
   const sim = runner.sim;
   const h = sim.params.h;
   const dt = sim.params.dt;
@@ -118,11 +122,19 @@ try {
   for (let i = 1; i <= steps; i++) {
     runner.step();
     await runner.forcesReady;
+    // (solved together, nothing above waits for the browser: let the page breathe now and then)
+    if (runner.coupler && i % 20 === 0) await new Promise((r) => setTimeout(r, 0));
     for (const b of runner.bodies) {
       const v2 = b.vel[0] ** 2 + b.vel[1] ** 2;
       acc.v = Math.max(acc.v, Math.sqrt(v2) * h);
       acc.w = Math.max(acc.w, Math.abs(b.omega[2]));
       acc.ke += 0.5 * b.density * b.volume * (v2 + b.inertia[2] * b.omega[2] ** 2) * h * h;   // per unit liquid density and depth
+    }
+    if (q.get('ctrace') && runner.coupler) {
+      // &ctrace=i0,i1: per step, how much the bodies' velocities changed in each iteration (cells/s), and body 0's added mass
+      const [i0, i1] = q.get('ctrace').split(',').map(Number);
+      const b = runner.bodies[0], m = b.density * b.volume;
+      if (i >= i0 && i <= i1) console.log(`  step ${i}: changes ${runner.coupler.changes.map((v) => v.toExponential(1)).join(' ')}  ${runner.bodies.map((o) => `v ${o.vel[0].toFixed(3)} ${o.vel[1].toFixed(3)} w ${o.omega[2].toFixed(4)} y ${o.pos[1].toFixed(4)}`).join(' | ')}  gap ${gap().toFixed(4)} contacts ${runner.coupler.contacts.length}  wet ${(b.wet ?? 0).toFixed(2)}  A/m ${b.addedMatrix ? Array.from(b.addedMatrix).map((v) => (v / m).toFixed(2)).join(' ') : '-'}`);
     }
     if (q.get('trace')) {
       // &trace=i0,i1[,body]: per step, in units of g: liquid force (as used), the body's actual
@@ -159,7 +171,9 @@ try {
       console.log(`t ${String((i * dt).toFixed(1)).padStart(6)} s  bodies: speed <= ${acc.v.toFixed(4)} m/s  spin <= ${acc.w.toFixed(3)} rad/s  mean KE ${(acc.ke / acc.n).toExponential(2)}` +
         `   liquid: speed ${(s.maxSpeed * h).toFixed(4)} m/s  res ${s.residual.toExponential(1)}  mass ${((s.massRatio - 1) * 1e6).toFixed(0)} ppm` +
         `   gap >= ${acc.gap.toFixed(2)} cells, in contact ${(100 * acc.touch / acc.n).toFixed(0)} %` +
-        `   y ${runner.bodies.map((b) => ((b.pos[1] - scene.margin) / scene.L).toFixed(3)).join(' ')}`);
+        `   y ${runner.bodies.map((b) => ((b.pos[1] - scene.margin) / scene.L).toFixed(3)).join(' ')}` +
+        (runner.coupler ? `   iterations ${(runner.coupler.stats.iterations / runner.coupler.stats.steps).toFixed(2)} (most ${runner.coupler.stats.most}), not converged ${runner.coupler.stats.unconverged}` : ''));
+      if (runner.coupler) Object.assign(runner.coupler.stats, { iterations: 0, steps: 0, most: 0, unconverged: 0 });
       acc = { v: 0, w: 0, gap: Infinity, touch: 0, n: 0, ke: 0 };
     }
   }
