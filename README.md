@@ -9,6 +9,11 @@ in 2D and 3D. The whole solver runs on the GPU as WebGL2 shader passes over floa
 (about 190–215 passes per time step). JavaScript only sequences the passes, integrates the
 few rigid bodies and sums a small reduced texture for the on-screen statistics.
 
+> **Written with Claude Fable 5.2.** The code, the tests and this README were written by
+> [Claude Fable 5.2](https://www.anthropic.com/claude/fable), Anthropic's model, working as
+> the main agent in Claude Code: it read the paper, built and measured each stage, and
+> committed it, directed and reviewed stage by stage by the repository's owner.
+
 A third app, **World** (`world3d.html`, and `world2d.html` in section), runs the same passes
 on an unbounded grid of which only the 8×8×8 bricks around the liquid are stored, over a
 height-map terrain: twelve scenes, from a waterfall and a sea without shores to a river
