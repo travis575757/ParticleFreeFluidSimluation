@@ -23,7 +23,8 @@ export function startServer(port = 8080) {
     let rel = decodeURIComponent(new URL(req.url, 'http://x').pathname);
     if (rel.endsWith('/')) rel += 'index.html';
     const file = path.normalize(path.join(ROOT, rel));
-    if (!file.startsWith(ROOT)) { res.writeHead(403); res.end('forbidden'); return; }
+    // (ROOT itself or below it: a folder beside it whose name merely begins the same way is not)
+    if (file !== ROOT && !file.startsWith(ROOT + path.sep)) { res.writeHead(403); res.end('forbidden'); return; }
     fs.readFile(file, (err, data) => {
       if (err) { res.writeHead(404); res.end('not found: ' + rel); return; }
       res.writeHead(200, {
